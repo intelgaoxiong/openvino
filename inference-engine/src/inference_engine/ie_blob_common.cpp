@@ -14,6 +14,10 @@ Blob::Ptr Blob::createROI(const ROI&) const {
     IE_THROW(NotImplemented) << "createROI is not implemented for current type of Blob";
 }
 
+void Blob::updatePreProcDesc(const struct PreProcPara& desc) {
+    IE_THROW(NotImplemented) << "updatePreProcDesc is not implemented for current type of Blob";
+}
+
 Blob::Ptr make_shared_blob(const Blob::Ptr& inputBlob, const ROI& roi) {
     return inputBlob->createROI(roi);
 }

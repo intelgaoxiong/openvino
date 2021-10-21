@@ -96,6 +96,8 @@ public:
 
     Blob::Ptr createROI(const ROI& roi) const override;
 
+    void updatePreProcDesc(const struct PreProcPara& desc) override;
+
 protected:
     /**
      * @brief Constructs a compound blob with specified descriptor
@@ -172,6 +174,8 @@ public:
     virtual const Blob::Ptr& uv() const noexcept;
 
     Blob::Ptr createROI(const ROI& roi) const override;
+
+    void updatePreProcDesc(const struct PreProcPara& desc) override;
 };
 
 /**
@@ -266,6 +270,8 @@ public:
     const Blob::Ptr& v() const noexcept;
 
     Blob::Ptr createROI(const ROI& roi) const override;
+
+    void updatePreProcDesc(const struct PreProcPara& desc) override;
 };
 
 /**

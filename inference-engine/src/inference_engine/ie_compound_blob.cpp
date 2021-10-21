@@ -356,6 +356,10 @@ Blob::Ptr CompoundBlob::createROI(const ROI& roi) const {
     return std::make_shared<CompoundBlob>(std::move(roiBlobs));
 }
 
+void CompoundBlob::updatePreProcDesc(const struct PreProcPara& desc) {
+    IE_THROW() << "[NOT_IMPLEMENTED] updatePreProcDesc is not implemented for current type of Blob";
+}
+
 const std::shared_ptr<IAllocator>& CompoundBlob::getAllocator() const noexcept {
     static std::shared_ptr<IAllocator> _allocator = nullptr;
     return _allocator;
@@ -406,6 +410,10 @@ Blob::Ptr NV12Blob::createROI(const ROI& roi) const {
     const auto uvRoiBlob = uv()->createROI(uvROI);
 
     return std::make_shared<NV12Blob>(yRoiBlob, uvRoiBlob);
+}
+
+void NV12Blob::updatePreProcDesc(const struct PreProcPara& desc) {
+    IE_THROW() << "[NOT_IMPLEMENTED] updatePreProcDesc is not implemented for current type of Blob";
 }
 
 I420Blob::I420Blob(const Blob::Ptr& y, const Blob::Ptr& u, const Blob::Ptr& v)
@@ -460,6 +468,10 @@ Blob::Ptr I420Blob::createROI(const ROI& roi) const {
     const auto vRoiBlob = v()->createROI(uvROI);
 
     return std::make_shared<I420Blob>(yRoiBlob, uRoiBlob, vRoiBlob);
+}
+
+void I420Blob::updatePreProcDesc(const struct PreProcPara& desc) {
+    IE_THROW() << "[NOT_IMPLEMENTED] updatePreProcDesc is not implemented for current type of Blob";
 }
 
 BatchedBlob::BatchedBlob(const std::vector<Blob::Ptr>& blobs)

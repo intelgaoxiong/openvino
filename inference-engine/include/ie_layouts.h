@@ -348,6 +348,34 @@ struct ROI {
     }
 };
 
+#ifndef POINTS_NUM_FOR_PERSPECTIVE_TRANS
+#define POINTS_NUM_FOR_PERSPECTIVE_TRANS (5)
+#endif
+
+struct Point {
+    int32_t x = 0;
+    int32_t y = 0;
+
+    Point() = default;
+
+    Point(int32_t x, int32_t y) :
+        x(x), y(y) {
+    }
+};
+
+struct PreProcPara {
+    int aspect_ratio = 0;
+    int align_center = 0;
+
+    int en_perspective = 0;
+    Point src_points[POINTS_NUM_FOR_PERSPECTIVE_TRANS];
+    Point dst_points[POINTS_NUM_FOR_PERSPECTIVE_TRANS];
+
+    int en_keep_input_size = 0;
+
+    PreProcPara() = default;
+};
+
 /**
  * @brief Creates a TensorDesc object for ROI.
  *

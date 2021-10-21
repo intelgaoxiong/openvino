@@ -219,6 +219,8 @@ public:
      */
     virtual Blob::Ptr createROI(const ROI& roi) const;
 
+    virtual void updatePreProcDesc(const struct PreProcPara& desc);
+
 protected:
     /**
      * @brief The tensor descriptor of the given blob.
