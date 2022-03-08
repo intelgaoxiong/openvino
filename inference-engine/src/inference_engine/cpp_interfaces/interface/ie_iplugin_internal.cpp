@@ -169,6 +169,11 @@ std::shared_ptr<IExecutableNetworkInternal> IInferencePlugin::ImportNetwork(cons
     return ImportNetwork(blobFile, config);
 }
 
+std::shared_ptr<IExecutableNetworkInternal> IInferencePlugin::ImportNetwork(uint8_t *modelBuffer, size_t modelLen,
+                                                                            const std::map<std::string, std::string>& config) {
+    IE_THROW(NotImplemented);
+}
+
 std::shared_ptr<IExecutableNetworkInternal> IInferencePlugin::ImportNetwork(std::istream& networkModel,
                                                                             const std::map<std::string, std::string>& config) {
     IE_THROW(NotImplemented);

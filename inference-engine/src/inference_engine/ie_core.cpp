@@ -1016,6 +1016,14 @@ ExecutableNetwork Core::ImportNetwork(const std::string& modelFileName, const st
     return { exec, exec };
 }
 
+ExecutableNetwork Core::ImportNetwork(uint8_t *modelBuffer, size_t modelLen, const std::string& deviceName,
+                                      const std::map<std::string, std::string>& config) {
+    OV_ITT_SCOPED_TASK(itt::domains::IE, "Core::ImportNetwork");
+    auto parsed = parseDeviceNameIntoConfig(deviceName, config);
+    auto exec = _impl->GetCPPPluginByName(parsed._deviceName).ImportNetwork(modelBuffer, modelLen, parsed._config);
+    return { exec, exec };
+}
+
 ExecutableNetwork Core::ImportNetwork(std::istream& networkModel, const std::string& deviceName,
                                       const std::map<std::string, std::string>& config) {
     OV_ITT_SCOPED_TASK(itt::domains::IE, "Core::ImportNetwork");
