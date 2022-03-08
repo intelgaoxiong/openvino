@@ -65,6 +65,10 @@ public:
      */
     void allocate() noexcept override;
 
+    void allocate_cacheable() noexcept override;
+    bool flush() noexcept override;
+    bool invalidate() noexcept override;
+
     /**
      * @brief No operation is performed. Compound blob does not allocate/deallocate any data
      * @return Returns `false`

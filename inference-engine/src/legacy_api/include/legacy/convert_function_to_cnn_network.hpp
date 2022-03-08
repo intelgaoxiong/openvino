@@ -43,6 +43,10 @@ public:
         return const_cast<void*>(_constOp->get_data_ptr());
     }
 
+    void* alloc_cacheable(size_t size) noexcept override { return nullptr; }
+    bool flush(void* handle, const size_t size) noexcept override { return false; }
+    bool invalidate(void* handle, const size_t size) noexcept override { return false; }
+
     bool free(void*) noexcept override {  // NOLINT
         return true;
     }

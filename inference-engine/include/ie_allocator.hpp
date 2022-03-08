@@ -59,6 +59,10 @@ public:
      */
     virtual bool free(void* handle) noexcept = 0;
 
+    virtual void* alloc_cacheable(size_t size) noexcept = 0;
+    virtual bool flush(void* handle, const size_t size) noexcept = 0;
+    virtual bool invalidate(void* handle, const size_t size) noexcept = 0;
+
 protected:
      ~IAllocator() = default;
 };

@@ -322,6 +322,10 @@ size_t CompoundBlob::element_size() const noexcept {
 
 void CompoundBlob::allocate() noexcept {}
 
+void CompoundBlob::allocate_cacheable() noexcept {}
+bool CompoundBlob::flush() noexcept {}
+bool CompoundBlob::invalidate() noexcept {}
+
 bool CompoundBlob::deallocate() noexcept {
     return false;
 }

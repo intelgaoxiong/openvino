@@ -177,6 +177,10 @@ public:
      */
     virtual void allocate() noexcept = 0;
 
+    virtual void allocate_cacheable() noexcept = 0;
+    virtual bool flush() noexcept = 0;
+    virtual bool invalidate() noexcept = 0;
+
     /**
      * @brief Releases previously allocated data.
      *
@@ -359,6 +363,10 @@ public:
      * Abstract method.
      */
     void allocate() noexcept override = 0;
+
+    void allocate_cacheable() noexcept override = 0;
+    bool flush() noexcept override = 0;
+    bool invalidate() noexcept override = 0;
 
     /**
      * @brief Releases previously allocated data.
@@ -623,6 +631,31 @@ public:
             [allocator](void* rawHandle) {
                 allocator->free(rawHandle);
             });
+    }
+
+    void allocate_cacheable() noexcept override {
+        const auto allocator = getAllocator();
+        const auto rawHandle = allocator->alloc_cacheable(size() * sizeof(T));
+
+        if (rawHandle == nullptr) {
+            return;
+        }
+
+        _handle.reset(
+            rawHandle,
+            [allocator](void* rawHandle) {
+                allocator->free(rawHandle);
+            });
+    }
+
+    bool flush() noexcept override {
+        const auto allocator = getAllocator();
+        return allocator->flush(getHandle(), size() * sizeof(T));
+    }
+
+    bool invalidate() noexcept override {
+        const auto allocator = getAllocator();
+        return allocator->invalidate(getHandle(), size() * sizeof(T));
     }
 
     /**

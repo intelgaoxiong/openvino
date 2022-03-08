@@ -24,6 +24,10 @@ public:
         }
     }
 
+    void* alloc_cacheable(size_t size) noexcept override { return nullptr; }
+    bool flush(void* handle, const size_t size) noexcept override { return false; }
+    bool invalidate(void* handle, const size_t size) noexcept override { return false; }
+
     bool free(void* handle) noexcept override {
         try {
             delete[] reinterpret_cast<char*>(handle);
