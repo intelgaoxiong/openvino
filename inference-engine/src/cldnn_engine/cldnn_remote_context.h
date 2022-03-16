@@ -103,6 +103,9 @@ public:
         , TpublicAPI(desc) {}
 
     void allocate() noexcept override { _impl.allocate(); }
+    void allocate_cacheable() noexcept override {}
+    bool flush() noexcept override { return false; }
+    bool invalidate() noexcept override { return false; }
     bool deallocate() noexcept override { return _impl.deallocate(); }
     InferenceEngine::ParamMap getParams() const override { return _impl.getParams(); }
     std::string getDeviceName() const noexcept override { return _impl.getDeviceName(); }
@@ -193,6 +196,9 @@ public:
     * @return Handle to the allocated resource
     */
     void* alloc(size_t size) noexcept override { return nullptr; }
+    void* alloc_cacheable(const size_t size) noexcept override { return nullptr; }
+    bool flush(void* handle, const size_t size) noexcept override { return false; }
+    bool invalidate(void* handle, const size_t size) noexcept override { return false; }
     /**
     * @brief Releases handle and all associated memory resources which invalidates the handle.
     * @return false if handle cannot be released, otherwise - true.
