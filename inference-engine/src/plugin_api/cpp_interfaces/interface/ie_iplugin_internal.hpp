@@ -237,6 +237,10 @@ public:
                                                                       const std::shared_ptr<RemoteContext>& context,
                                                                       const std::map<std::string, std::string>& config);
 
+    virtual std::shared_ptr<IExecutableNetworkInternal> ImportNetwork(uint8_t *modelBuffer, size_t modelLen,
+                                                                      const std::shared_ptr<RemoteContext>& context,
+                                                                      const std::map<std::string, std::string>& config);
+
     /**
      * @brief Sets pointer to ICore interface
      * @param core Pointer to Core interface

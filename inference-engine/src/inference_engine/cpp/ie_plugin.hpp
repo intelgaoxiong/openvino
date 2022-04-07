@@ -103,6 +103,12 @@ public:
         PLUGIN_CALL_STATEMENT(return {_so, _ptr->ImportNetwork(networkModel, context, config)});
     }
 
+    details::SOPointer<IExecutableNetworkInternal> ImportNetwork(uint8_t *modelBuffer, size_t modelLen,
+                                                                 const std::shared_ptr<RemoteContext>& context,
+                                                                 const std::map<std::string, std::string>& config) {
+        PLUGIN_CALL_STATEMENT(return {_so, _ptr->ImportNetwork(modelBuffer, modelLen, context, config)});
+    }
+
     Parameter GetMetric(const std::string& name, const std::map<std::string, Parameter>& options) const {
         PLUGIN_CALL_STATEMENT(return _ptr->GetMetric(name, options));
     }

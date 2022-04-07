@@ -185,6 +185,12 @@ std::shared_ptr<IExecutableNetworkInternal> IInferencePlugin::ImportNetwork(std:
    IE_THROW(NotImplemented);
 }
 
+std::shared_ptr<IExecutableNetworkInternal> IInferencePlugin::ImportNetwork(uint8_t *modelBuffer, size_t modelLen,
+                                                                            const std::shared_ptr<RemoteContext>& context,
+                                                                            const std::map<std::string, std::string>& config) {
+   IE_THROW(NotImplemented);
+}
+
 void IInferencePlugin::SetCore(ICore* core) {
     IE_ASSERT(core != nullptr);
     _core = core;

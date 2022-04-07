@@ -205,6 +205,10 @@ public:
                                     const RemoteContext::Ptr& context,
                                     const std::map<std::string, std::string>& config = {});
 
+    ExecutableNetwork ImportNetwork(uint8_t *modelBuffer, size_t modelLen,
+                                    const RemoteContext::Ptr& context,
+                                    const std::map<std::string, std::string>& config = {});
+
     /**
      * @brief Query device if it supports specified network with specified configuration
      *

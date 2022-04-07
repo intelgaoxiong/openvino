@@ -1071,6 +1071,24 @@ ExecutableNetwork Core::ImportNetwork(std::istream& networkModel,
     return { exec, exec };
 }
 
+ExecutableNetwork Core::ImportNetwork(uint8_t *modelBuffer, size_t modelLen,
+                                      const RemoteContext::Ptr& context,
+                                      const std::map<std::string, std::string>& config) {
+    OV_ITT_SCOPED_TASK(itt::domains::IE, "Core::ImportNetwork");
+
+    if (context == nullptr) {
+        IE_THROW() << "Remote context is null";
+    }
+
+    std::string deviceName_ = context->getDeviceName();
+    DeviceIDParser device(deviceName_);
+    std::string deviceName = device.getDeviceName();
+
+    auto parsed = parseDeviceNameIntoConfig(deviceName, config);
+    auto exec = _impl->GetCPPPluginByName(deviceName).ImportNetwork(modelBuffer, modelLen, context, parsed._config);
+    return { exec, exec };
+}
+
 QueryNetworkResult Core::QueryNetwork(const CNNNetwork& network, const std::string& deviceName,
                                       const std::map<std::string, std::string>& config) const {
     return _impl->QueryNetwork(network, deviceName, config);
