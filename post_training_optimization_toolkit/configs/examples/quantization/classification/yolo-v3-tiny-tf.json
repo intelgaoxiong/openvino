@@ -1,0 +1,33 @@
+{
+    "model": {
+        "name": "yolo-v3-tf",
+        "model": "yolo-v3-tiny-tf.xml",
+        "weights": "yolo-v3-tiny-tf.bin"
+
+    },
+    "engine": {
+        "config": "./configs/examples/accuracy_checker/yolo-v3-tiny-tf.yaml"
+    },
+    "compression": {
+        "target_device": "CPU",
+        "algorithms": [
+            {
+                "name": "DefaultQuantization",
+                "params": {
+                    "preset": "accuracy",
+                    "stat_subset_size": 200,
+                    "weights": {
+                        "bits": 8,
+                        "mode": "symmetric",
+                        "granularity": "perchannel"
+                    },
+                    "activations": {
+                        "bits": 8,
+                        "mode": "asymmetric",
+                        "granularity": "pertensor"
+                    }
+                }
+            }
+        ]
+    }
+}
