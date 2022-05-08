@@ -24,6 +24,7 @@ if(ENABLE_PYTHON)
     add_custom_target(${TARGET_NAME} ALL
         COMMAND ${CMAKE_COMMAND} -E make_directory ${PYTHON_BRIDGE_OUTPUT_DIRECTORY}/tools
         COMMAND ${CMAKE_COMMAND} -E copy_directory ${OpenVINO_MAIN_SOURCE_DIR}/tools/benchmark ${PYTHON_BRIDGE_OUTPUT_DIRECTORY}/tools/benchmark
+	COMMAND ${CMAKE_COMMAND} -E copy ${OpenVINO_MAIN_SOURCE_DIR}/tools/benchmark_app.py ${PYTHON_BRIDGE_OUTPUT_DIRECTORY}/..
     )
 
     ie_cpack_add_component(python_tools_${PYTHON_VERSION})
@@ -45,6 +46,10 @@ if(ENABLE_PYTHON)
             DESTINATION python/${PYTHON_VERSION}/openvino/tools
             USE_SOURCE_PERMISSIONS
             COMPONENT python_tools_${PYTHON_VERSION})
+
+    install(FILES benchmark_app.py
+	    DESTINATION python/${PYTHON_VERSION}
+	    COMPONENT python_tools_${PYTHON_VERSION})
     
     ie_cpack(python_tools python_tools_${PYTHON_VERSION})
 endif()
