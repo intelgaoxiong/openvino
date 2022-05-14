@@ -1,0 +1,121 @@
+{
+  "control": {
+    "mode": "bypass",
+    "rows": 3,
+    "cols": 3,
+    "maxFps": 25,
+    "timeout": 50000
+  },
+  "scenes": {
+    "video": {
+      "pipelineLaunch": "../hvasample/FullPipe",
+      "displayNum": 10,
+      "pipelineNum": 10,
+      "hvaConfig": {
+        "Detection": {
+          "Model": "/home/aaeon4/work/networks/yolo-v2-tiny-ava-0001.blob",
+          "InferReqNumber": "13",
+          "Threshold": "0.61"
+        },
+        "Tracking": {
+          "GAPI-OT": "OFF",
+          "GAPI-BackendType": "VPU"
+        }, 
+        "Classification": {
+          "Model": "/home/aaeon4/work/networks/resnet-50-pytorch.blob",
+          "InferReqNumber": "13",
+          "ReclassifyInterval": "8"
+        },
+        "Decode": [
+          {
+            "Video": "/home/aaeon4/work/networks/inputs/sample_video_original.h264",
+            "Codec": "h264",
+            "MaxFPS": 30
+          },
+          {
+            "Video": "/home/aaeon4/work/networks/inputs/sample_video_original.h264",
+            "Codec": "h264",
+            "MaxFPS": 30
+          },
+          {
+            "Video": "/home/aaeon4/work/networks/inputs/sample_video_original.h264",
+            "Codec": "h264",
+            "MaxFPS": 30
+          },
+          {
+            "Video": "/home/aaeon4/work/networks/inputs/sample_video_original.h264",
+            "Codec": "h264",
+            "MaxFPS": 30
+          },
+          {
+            "Video": "/home/aaeon4/work/networks/inputs/sample_video_original.h264",
+            "Codec": "h264",
+            "MaxFPS": 30
+          },
+          {
+            "Video": "/home/aaeon4/work/networks/inputs/sample_video_original.h264",
+            "Codec": "h264",
+            "MaxFPS": 30
+          },
+          {
+            "Video": "/home/aaeon4/work/networks/inputs/sample_video_original.h264",
+            "Codec": "h264",
+            "MaxFPS": 30
+          },
+          {
+            "Video": "/home/aaeon4/work/networks/inputs/sample_video_original.h264",
+            "Codec": "h264",
+            "MaxFPS": 30
+          },
+          {
+            "Video": "/home/aaeon4/work/networks/inputs/sample_video_original.h264",
+            "Codec": "h264",
+            "MaxFPS": 30
+          },
+          {
+            "Video": "/home/aaeon4/work/networks/inputs/sample_video_original.h264",
+            "Codec": "h264",
+            "MaxFPS": 30
+          }
+        ],
+        "GUI": {
+          "Socket": "/tmp/gstreamer_ipc_second.sock"
+        },
+        "FRC": {
+          "DropEveryXFrame": 2,
+          "DropXFrame": 1
+        }
+      }
+    },
+    "environment": [
+    {
+      "key": "LIBVA_DRIVERS_PATH",
+      "value": "/opt/intel/vpu_accelerator_samples/bypass/vaapi_bypass/lib"
+    },
+    {
+      "key": "GST_PLUGIN_PATH",
+      "value": "/opt/intel/openvino_2021.3.394/data_processing/gstreamer/lib:/opt/intel/openvino_2021.3.394/data_processing/gstreamer/lib/gstreamer-1.0"
+    },
+    {
+      "key": "CONFIG_PATH",
+      "value": "/opt/intel/vpu_accelerator_samples/bypass/vaapi_bypass/connection.cfg"
+    },
+    {
+      "key": "GST_VAAPI_ALL_DRIVERS",
+      "value": "1"
+    },
+    {
+      "key": "BYPASS_BATCH_MODE",
+      "value": "1"
+    },
+    {
+      "key": "LIBVA_DRIVER_NAME",
+      "value": "hddl_bypass"
+    },
+    {
+      "key": "LD_LIBRARY_PATH",
+      "value": "/opt/intel/vpu_accelerator_samples/bypass/hvasample/vas/lib/intel64:/opt/intel/vpu_accelerator_samples/install_dependencies/openvino/opencv/lib:/opt/intel/vpu_accelerator_samples/install_dependencies/openvino/deployment_tools/ngraph/lib:/opt/intel/vpu_accelerator_samples/install_dependencies/openvino/deployment_tools/inference_engine/external/hddl/lib:/opt/intel/vpu_accelerator_samples/install_dependencies/openvino/deployment_tools/inference_engine/external/gna/lib:/opt/intel/vpu_accelerator_samples/install_dependencies/openvino/deployment_tools/inference_engine/external/mkltiny_lnx/lib:/opt/intel/vpu_accelerator_samples/install_dependencies/openvino/deployment_tools/inference_engine/external/tbb/lib:/opt/intel/vpu_accelerator_samples/install_dependencies/openvino/deployment_tools/inference_engine/lib/intel64:/opt/intel/vpu_accelerator_samples/bypass/hvasample/../../hddlunite/lib:/opt/intel/vpu_accelerator_samples/bypass/hvasample/../vaapi_bypass/lib:/opt/intel/openvino_2021.3.394/data_processing/gstreamer/lib:/opt/intel/openvino_2021.3.394/data_processing/gstreamer/lib/gstreamer-1.0:/opt/intel/vpu_accelerator_samples/bypass/hvasample/../hvasample/lib:/opt/intel/vpu_accelerator_samples/bypass/hvasample/../hvasample/vas/lib/intel64:/opt/intel/vpu_accelerator_samples/bypass/hvasample/../hvasample/vas_gapi/lib"
+    }
+    ]
+  }
+}

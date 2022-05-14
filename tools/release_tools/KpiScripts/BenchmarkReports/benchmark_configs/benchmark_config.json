@@ -1,0 +1,26 @@
+{
+    "params":
+    {
+        "nireq":"8"
+    },
+
+    "paths":    
+    {
+        "ov_path":"/home/kmb/release_prc/",
+        "blob_files_path":"/home/kmb/xing/om-vpu-models-scale-ww46/"
+    },
+
+    "configFile":
+    {
+        "VPUX" :
+        {
+            "LOG_LEVEL" : "LOG_NONE",
+            "VPUX_INFERENCE_SHAVES" : "8",
+            "VPUX_COMPILER_TYPE" : "MCM",
+            "VPUX_INFERENCE_TIMEOUT": "60000",
+            "VPUX_EXECUTOR_STREAMS": "2"
+        }
+    },
+
+    "hardware" : "device"
+}

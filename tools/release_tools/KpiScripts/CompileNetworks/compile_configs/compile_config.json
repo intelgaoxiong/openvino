@@ -1,0 +1,19 @@
+{   
+    "attrs":
+    {
+        "d":    "VPUX.3700",
+        "ip":   "U8",
+        "op":   "FP32"
+    },
+
+    "paths":    
+    {
+        "ov_path":"/home/kmb/release_prc",
+        "ir_files_path":"/home/kmb/openvino_kmb_2021.4_extras/models/"
+    },
+
+    "compiler":
+    {
+        "compilerType": "MCM"
+    }
+}
