@@ -1,0 +1,9 @@
+sudo modprobe i2c-i801
+sudo modprobe gpio_pca953x
+sudo modprobe mxlk
+sudo modprobe xlink
+sudo modprobe xlink-smbus
+sudo modprobe intel_tsens_host
+sudo modprobe ina2xx
+sudo modprobe hddl-device-server
+sudo modprobe emc2103

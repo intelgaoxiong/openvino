@@ -12,16 +12,23 @@ usage() {
     echo "  -h                       Print the help message"
     echo "  -d DEST_RELEASE_DIR      Specify the release destination directory"
     echo "  -s SOURCE_RELEASE_DIR    Specify the release source directory"
-    echo "  -m MODE                  Choose release or replace libs, replace default"
+    echo "  -m MODE                  Choose release or replace libs, replace[default]"
     echo "  -i INSTALL_DIR           Specify the build install diretory if the mode is release"
+    echo "  -p PLATFORM              Specify the platform, intel64 or aarch64, intel64[default]"
+    echo "  -v Validation            If run cross validation and benchmark of unis networks, 1 or 0, 0[default]"
     echo
     exit 1
 }
 
-src_dir="${PWD}"
-dst_dir="${HOME}/release_prc"
-install_dir="${PWD}/install"
+today=`date --date='TZ="Asia/Beijing"' +%m%d`
+
+src_dir="${PWD}/../.."
+dst_dir="${HOME}/openvino_kmb_2021.4.${today}"
+install_dir="${PWD}/../../install"
 mode="replace"
+platform="intel64"
+validation="0"
+root_passwd="123456"
 
 # parse command line options
 while [[ $# -gt 0 ]]
@@ -41,6 +48,14 @@ case "$1" in
     ;;
     -i | --install)
     install_dir="$2"
+    shift
+    ;;
+    -v | --validation)
+    validation="$2"
+    shift
+    ;;
+    -p | --platform)
+    platform="$2"
     shift
     ;;
     -h | --help)
@@ -94,8 +109,8 @@ headers=(
 
 DEPLOY_TOOLS_PATH=${dst_dir}/deployment_tools
 DEPLOY_PYTHON_PATH=${dst_dir}/python
-SRC_PYTHON_PATH=${src_dir}/bin/intel64/Release/lib/python_api
-SRC_LIB_PATH=${src_dir}/bin/intel64/Release/lib
+SRC_PYTHON_PATH=${src_dir}/bin/${platform}/Release/lib/python_api
+SRC_LIB_PATH=${src_dir}/bin/${platform}/Release/lib
 DST_LIB_PATH=${DEPLOY_TOOLS_PATH}/inference_engine/lib/intel64
 SRC_HEADER_PATH=${src_dir}
 DST_HEADER_PATH=${DEPLOY_TOOLS_PATH}/inference_engine/include
@@ -157,16 +172,43 @@ release() {
     mkdir -p ${DST_DEMO_BIN_PATH}
     cp -a ${SRC_LIB_PATH}/../benchmark_app ${DST_DEMO_BIN_PATH}
     cp -a ${SRC_LIB_PATH}/../compile_tool ${DST_DEMO_BIN_PATH}
+    # cp dl_streamer, licensing, documentation
+    echo "$HOME/openvino_kmb_2021.4_extras is extra tools which store some const directories for pack and validation, such as dl_streamer, documentation,licensing, unis models and etc."
+    cp -a ${HOME}/openvino_kmb_2021.4_extras/dl_streamer ${dst_dir}
+    cp -a ${HOME}/openvino_kmb_2021.4_extras/licensing ${dst_dir}
+    cp -a ${HOME}/openvino_kmb_2021.4_extras/documentation ${dst_dir}
+}
+
+vali_unis() {
+    echo "Validate cross check of unis network before release, please confirm $HOME/openvino_kmb_2021.4_extras/models exist."
+    mkdir -p ${dst_dir}/temp
+    echo $root_passwd | sudo -S python3 vali_main.py ${dst_dir}
+    echo $root_passwd | sudo -S mv ./CompilingResults_MCM.xlsx ${dst_dir}/temp
+    echo $root_passwd | sudo -S mv ./singleImgComparison.xlsx ${dst_dir}/temp
+    echo "See compile result: at ${dst_dir}/temp/CompilingResults_MCM.xlsx."
+    echo "See cross check result: at ${dst_dir}/temp/singleImgComparison.xlsx."
 }
 
 # choose and run different mode
 if [[ ${mode} == "replace" ]];then
     echo "Run replace mode..."
     replace
+    if [[ ${validation} == "1" ]];then
+        vali_unis   
+    fi
     echo "Replace complete!"
 else
     echo "Run release mode..."
     release
+    # generate archive
+    generate_archive=$(basename $dst_dir).tar.gz 
+    cd ${dst_dir}/..
+    tar -czf ${generate_archive} $(basename $dst_dir)
+    cd -
+    echo "Generate release package ${dst_dir}.tar.gz."
+    if [[ ${validation} == "1" ]];then
+        vali_unis   
+    fi
     echo "Release Complete!"
 fi
 
