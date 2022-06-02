@@ -353,12 +353,12 @@ struct ROI {
 #endif
 
 struct Point {
-    int32_t x = 0;
-    int32_t y = 0;
+    float x = 0.0f;
+    float y = 0.0f;
 
     Point() = default;
 
-    Point(int32_t x, int32_t y) :
+    Point(float x, float y) :
         x(x), y(y) {
     }
 };
