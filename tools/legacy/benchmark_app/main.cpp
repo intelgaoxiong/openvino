@@ -624,6 +624,27 @@ int main(int argc, char* argv[]) {
         // wait the latest inference executions
         inferRequestsQueue.waitAll();
 
+        ConstOutputsDataMap outputInfo = exeNetwork.GetOutputsInfo();
+        for (const auto& output : outputInfo) {
+            const auto outputBlobName = output.first;
+            for (size_t requestId = 0; requestId < nireq; requestId++) {
+                Blob::Ptr outputBlob = inferRequestsQueue.requests.at(requestId)->getBlob(outputBlobName.c_str());
+                if (!outputBlob) {
+                    throw std::logic_error("Cannot get output blob from inferRequest");
+                }
+
+                std::string outFilePath = outputBlobName + "_"+ std::to_string(requestId) + ".dat";
+                std::ofstream outFile(outFilePath, std::ios::binary);
+                if (outFile.is_open()) {
+                    outFile.write(outputBlob->buffer(), outputBlob->byteSize());
+                } else {
+                    slog::warn << "Failed to open '" << outFilePath << "'" << slog::endl;
+                }
+                outFile.close();
+            }
+        }
+        printf("file dump end\n");
+
         double latency = getMedianValue<double>(inferRequestsQueue.getLatencies());
         double totalDuration = inferRequestsQueue.getDurationInMilliseconds();
         double fps = (FLAGS_api == "sync") ? batchSize * 1000.0 / latency : batchSize * 1000.0 * iteration / totalDuration;
