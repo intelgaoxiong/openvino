@@ -409,8 +409,13 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
         } else if (input_name.find("inputs_embeds") != std::string::npos) {
             // NB: VLMs case, model accepts inputs_embeds[BATCH, SEQ_LEN, EMB_SIZE]
             NPUW_ASSERT(input.get_partial_shape().size() == 3u);
-            NPUW_ASSERT(input.get_partial_shape()[2].is_static());
-            new_shape = ov::PartialShape({1, input_size, input.get_partial_shape()[2]});
+            // NPUW_ASSERT(input.get_partial_shape()[2].is_static());
+            if (!input.get_partial_shape()[2].is_static()) {
+                // Hard coding for MiniCPM o2.6
+                new_shape = ov::PartialShape({1, input_size, 3584});
+            } else {
+                new_shape = ov::PartialShape({1, input_size, input.get_partial_shape()[2]});
+            }
         } else if (input_name.find("attention_mask") != std::string::npos) {
             new_shape = ov::PartialShape({1, kvcache_size});
         } else if (input_name.find("position_ids") != std::string::npos) {
@@ -610,13 +615,13 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     m_cfg.update(any_copy(npuw_llm_props));
 
-    LOG_DEBUG("1. Creating kvcache model as clone of passed one.");
+    printf("1. Creating kvcache model as clone of passed one.\n");
     auto kvcache_model = model->clone();
-    LOG_DEBUG("2. Transform kvcache model from stateful to stateless.");
+    printf("2. Transform kvcache model from stateful to stateless.\n");
     ov::pass::StatefulToStateless().run_on_model(kvcache_model);
-    LOG_DEBUG("   ...also convert BF16 to FP16");
+    printf("   ...also convert BF16 to FP16\n");
     ov::pass::ConvertPrecision(ov::element::bf16, ov::element::f16).run_on_model(kvcache_model);
-    LOG_DEBUG("3. Creating prefill model as clone of transformed kvcache one.");
+    printf("3. Creating prefill model as clone of transformed kvcache one.\n");
     auto prefill_model = kvcache_model->clone();
     prefill_model->set_friendly_name(kvcache_model->get_friendly_name() + "_prefill");
 
@@ -627,20 +632,20 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     const uint32_t min_response_len = align_to(m_cfg.get<::intel_npu::NPUW_LLM_MIN_RESPONSE_LEN>(), 64u);
 
     m_kvcache_desc = KVCacheDesc{max_prompt_len, max_prompt_len + min_response_len, 0u, seq_len_dim};
-    LOG_DEBUG("4. Make prefill model with static shapes");
+    printf("4. Make prefill model with static shapes\n");
     reshape_to_static(prefill_model, m_kvcache_desc.max_prompt_size, m_kvcache_desc.max_prompt_size, axes);
-    LOG_DEBUG("5. Make kvcache model with static shapes");
+    printf("5. Make kvcache model with static shapes\n");
     reshape_to_static(kvcache_model, 1u, m_kvcache_desc.total_size, axes);
 
     const bool optimize_v_tensors = m_cfg.get<::intel_npu::NPUW_LLM_OPTIMIZE_V_TENSORS>();
     if (optimize_v_tensors) {
-        LOG_DEBUG("6. Check and apply opt layout");
+        printf("6. Check and apply opt layout\n");
         LOG_BLOCK();
         if (optimize_value_tensors(kvcache_model)) {
             NPUW_ASSERT(optimize_value_tensors(prefill_model));
             m_kvcache_desc.v_tensors_transposed = true;
         } else {
-            LOG_DEBUG("vtensors optimisation not applied");
+            printf("vtensors optimisation not applied\n");
         }
     } else {
         LOG_DEBUG("6. Check and apply opt layout --- SKIPPED");
@@ -682,15 +687,52 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     merge_config_with(prefill_config, prefill_config_addition_value);
     merge_config_with(generate_config, generate_config_addition_value);
 
+    printf("Start to compile kv cache\n");
+    for (const auto& pair : generate_config) {
+        std::cout << "Key: " << pair.first << ", Value: ";
+        
+        // Check the type of the value and print accordingly
+        if (pair.second.is<int>()) {
+            std::cout << pair.second.as<int>();
+        } else if (pair.second.is<float>()) {
+            std::cout << pair.second.as<float>();
+        } else if (pair.second.is<std::string>()) {
+            std::cout << pair.second.as<std::string>();
+        } else {
+            std::cout << "[Unprintable Type]";
+        }
+        
+        std::cout << std::endl;
+    }
+
     m_kvcache_compiled = std::dynamic_pointer_cast<ov::npuw::CompiledModel>(
         ov::npuw::ICompiledModel::create(kvcache_model, plugin, generate_config));
     NPUW_ASSERT(m_kvcache_compiled && "Can't create ov::npuw::CompiledModel for passed kvcache "
                                       "model and its config, please check passed config.");
+    printf("kv cache done\n");
+
+    printf("Start to compile prefill\n");
+    for (const auto& pair : prefill_config) {
+        std::cout << "Key: " << pair.first << ", Value: ";
+        
+        // Check the type of the value and print accordingly
+        if (pair.second.is<int>()) {
+            std::cout << pair.second.as<int>();
+        } else if (pair.second.is<float>()) {
+            std::cout << pair.second.as<float>();
+        } else if (pair.second.is<std::string>()) {
+            std::cout << pair.second.as<std::string>();
+        } else {
+            std::cout << "[Unprintable Type]";
+        }
+        
+        std::cout << std::endl;
+    }
     m_prefill_compiled = std::dynamic_pointer_cast<ov::npuw::CompiledModel>(
         ov::npuw::ICompiledModel::create(prefill_model, plugin, prefill_config));
     NPUW_ASSERT(m_prefill_compiled && "Can't create ov::npuw::CompiledModel for passed prefill "
                                       "model and its config, please check passed config.");
-
+    printf("prefill done\n");
     implement_properties();
     LOG_DEBUG("Done");
 }
