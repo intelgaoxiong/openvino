@@ -219,6 +219,8 @@ void ov::npuw::LLMInferRequest::populate_chunk_prefill_attention_mask(ov::SoPtr<
                                                                      int64_t max_prompt_size,
                                                                      int64_t prefilled_prompts,
                                                                      int64_t current_prompts_len) {
+    fill_tensor<int64_t>(attention_mask, 0);
+
     auto* attention_mask_data = attention_mask->data<int64_t>();
 
     // Set the attention mask to 1 for tokens that have been prefilled
