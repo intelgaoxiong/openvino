@@ -875,6 +875,8 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
         for (const auto& [input_name, input_port] : in_ports) {
             auto in_tensor = m_prefill_requests[prefill_model_index]->get_tensor(input_port);
         }
+        std::cout << "infer prefill: " << chunk_id << ", current_prompts_len: " << current_prompts_len
+                  << ", total prompts: " << input_prompt_len << std::endl;
         m_prefill_requests[prefill_model_index]->infer();
         // Record the last chunk model index that has been used for inference
         m_last_infer_chunk_idx = prefill_model_index;

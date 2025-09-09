@@ -5,16 +5,23 @@
 #include "just_sync_infer_request.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <future>
 #include <map>
 #include <memory>
 #include <string>
 #include <utility>
 
+#ifdef NPUW_WITH_SYCL
+#    include <sycl/sycl.hpp>
+#endif
+
 #include "compiled_model.hpp"
+#include "llama.esimd.h"
 #include "logging.hpp"
 #include "openvino/core/except.hpp"
 #include "openvino/core/parallel.hpp"
+#include "openvino/core/type/element_type.hpp"
 #include "openvino/runtime/iasync_infer_request.hpp"
 #include "plugin.hpp"
 #include "util.hpp"
@@ -258,6 +265,46 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
                 continue;
             }
         }  // if(replaced_by)
+
+        if (comp_model_desc.is_sdpa) {
+#ifdef NPUW_WITH_SYCL
+            LOG_INFO("SDPA detected, pre-allocating internal buffers...");
+            LOG_BLOCK();
+
+            auto past_k = comp_model_desc.compiled_model->inputs()[0];
+            auto past_v = comp_model_desc.compiled_model->inputs()[1];
+            auto query = comp_model_desc.compiled_model->inputs()[2];
+            auto mask = comp_model_desc.compiled_model->inputs()[3];
+            auto present_k = comp_model_desc.compiled_model->inputs()[4];
+            auto present_v = comp_model_desc.compiled_model->inputs()[5];
+
+            auto token_len = query.get_shape()[2];
+            std::cout << "Token len: " << token_len << std::endl;
+            auto history_len = past_k.get_shape()[2];
+            std::cout << "History len: " << history_len << std::endl;
+
+            auto q_head_num = query.get_shape()[1];
+            auto kv_head_num = past_k.get_shape()[1];
+
+            SetupLlamaEsimdEnvironment();
+
+            int batch = token_len;
+            int kv_len = batch + history_len;
+
+            selector = sycl::default_selector_v;
+            q = sycl::queue(selector);
+
+            const int hidden_dim = 128;
+
+            q_buffer = sycl::malloc_device(batch * q_head_num * hidden_dim * sizeof(float), q);
+            k_buffer = sycl::malloc_device(kv_len * kv_head_num * hidden_dim * sizeof(sycl::half), q);
+            v_buffer = sycl::malloc_device(kv_len * kv_head_num * hidden_dim * sizeof(sycl::half), q);
+            mask_buffer = sycl::malloc_device(batch * kv_len * sizeof(float), q);
+            sdp_out_buffer = sycl::malloc_device(batch * q_head_num * hidden_dim * sizeof(float), q);
+#else
+            LOG_WARN("SDPA detected but SYCL support is not available!");
+#endif
+        }
 
         // Special cases are handled -- so nothing to do here
         const bool is_piped = is_pipelined(i);
@@ -632,6 +679,7 @@ void ov::npuw::JustInferRequest::recreate_subrequests(std::size_t idx) {
 }
 
 void ov::npuw::JustInferRequest::run_subrequest_for_success(std::size_t idx, bool& failover) {
+    std::cout << "JustInferRequest::run_subrequest_for_success[" << idx << "]..." << std::endl;
     failover = false;
     auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
     auto real_idx = comp_model_desc.replaced_by.value_or(idx);
@@ -668,14 +716,17 @@ void ov::npuw::JustInferRequest::run_subrequest_for_success(std::size_t idx, boo
         try {
             LOG_DEBUG("Trying to run subrequest[" << idx << "]...");
             LOG_BLOCK();
+            std::cout << "unsafe_run_this_prep_next[" << idx << "]..." << std::endl;
             unsafe_run_this_prep_next(idx, next_prepared);
             job_done = true;
             LOG_DEBUG("Done: " << idx << "(exec subrequest)");
         } catch (const std::exception& ex) {
             LOG_ERROR("Subgraph [" << idx << "] - FAILED to run infer request:" << std::endl << ex.what());
+            std::cout << "Subgraph [" << idx << "] - FAILED to run infer request:" << std::endl << ex.what();
             should_recreate = true;
         } catch (...) {
             LOG_ERROR("Subgraph [" << idx << "] - FAILED to run infer request: REASON UNKNOWN");
+            std::cout << "Subgraph [" << idx << "] - FAILED to run infer request: REASON UNKNOWN" << std::endl;
             should_recreate = true;
         }
         if (should_recreate) {
@@ -701,14 +752,218 @@ void ov::npuw::JustInferRequest::run_subrequest_for_success(std::size_t idx, boo
     }
 }
 
+#ifdef NPUW_WITH_SYCL
+std::vector<sycl::half> reorderTensorData(const sycl::half* data,
+                                          const std::vector<size_t>& originalShape,
+                                          const std::vector<size_t>& order) {
+    size_t totalSize = 1;
+    for (size_t dim : originalShape) {
+        totalSize *= dim;
+    }
+
+    std::vector<sycl::half> tempData(totalSize);
+
+    // 计算新索引
+    std::vector<size_t> strides(originalShape.size(), 1);
+    for (int i = originalShape.size() - 2; i >= 0; --i) {
+        strides[i] = strides[i + 1] * originalShape[i + 1];
+    }
+
+    std::vector<size_t> newStrides(order.size(), 1);
+    for (int i = order.size() - 2; i >= 0; --i) {
+        newStrides[i] = newStrides[i + 1] * originalShape[order[i + 1]];
+    }
+
+    for (size_t index = 0; index < totalSize; ++index) {
+        size_t originalIndex = index;
+        size_t newIndex = 0;
+        for (size_t i = 0; i < order.size(); ++i) {
+            size_t dimIndex = originalIndex / strides[i];
+            originalIndex %= strides[i];
+            newIndex += dimIndex * newStrides[order[i]];
+        }
+        tempData[newIndex] = data[index];
+    }
+
+    return tempData;  // 返回新的数据缓冲区
+}
+
+std::vector<float> reorderAndConvertTensorData(const sycl::half* data,
+                                               const std::vector<size_t>& originalShape,
+                                               const std::vector<size_t>& order) {
+    size_t totalSize = 1;
+    for (size_t dim : originalShape) {
+        totalSize *= dim;
+    }
+
+    std::vector<float> tempData(totalSize);  // 使用 float 类型来存储转换后的数据
+
+    // 计算新索引
+    std::vector<size_t> strides(originalShape.size(), 1);
+    for (int i = originalShape.size() - 2; i >= 0; --i) {
+        strides[i] = strides[i + 1] * originalShape[i + 1];
+    }
+
+    std::vector<size_t> newStrides(order.size(), 1);
+    for (int i = order.size() - 2; i >= 0; --i) {
+        newStrides[i] = newStrides[i + 1] * originalShape[order[i + 1]];
+    }
+
+    for (size_t index = 0; index < totalSize; ++index) {
+        size_t originalIndex = index;
+        size_t newIndex = 0;
+        for (size_t i = 0; i < order.size(); ++i) {
+            size_t dimIndex = originalIndex / strides[i];
+            originalIndex %= strides[i];
+            newIndex += dimIndex * newStrides[order[i]];
+        }
+        tempData[newIndex] = static_cast<float>(data[index]);  // 转换 fp16 到 fp32
+    }
+
+    return tempData;  // 返回新的数据缓冲区
+}
+
+std::vector<sycl::half> convertF32ToF16(const std::vector<float>& data) {
+    std::vector<sycl::half> convertedData(data.size());
+
+    for (size_t i = 0; i < data.size(); ++i) {
+        convertedData[i] = static_cast<sycl::half>(data[i]);  // 转换 f32 到 f16
+    }
+
+    return convertedData;  // 返回转换后的数据缓冲区
+}
+#endif  // NPUW_WITH_SYCL
+
 void ov::npuw::JustInferRequest::unsafe_during(std::size_t real_idx, const std::function<void()>& f) {
     auto& comp_model_desc = m_npuw_model->m_compiled_submodels[real_idx];
     if (!comp_model_desc.spatial) {
         // Non-spatial execution: trigger request asynchronously, run `f` in this context
         auto& r = m_subrequests[real_idx];
-        r->start_async();
-        f();  // expect noexcept
-        r->wait();
+        if (comp_model_desc.is_sdpa) {
+#ifdef NPUW_WITH_SYCL
+            std::cout << "JustInferRequest::unsafe_during: sdpa exec... " << real_idx << std::endl;
+            std::cout << "Inputs:" << std::endl;
+            for (const auto& input : r->get_inputs()) {
+                std::cout << "Name: " << input.get_any_name() << ", Shape: " << input.get_shape() << std::endl;
+            }
+
+            std::cout << "Outputs:" << std::endl;
+            for (const auto& output : r->get_outputs()) {
+                std::cout << "Name: " << output.get_any_name() << ", Shape: " << output.get_shape() << std::endl;
+            }
+
+            auto past_k = r->get_tensor(r->get_inputs()[0]);
+            auto past_v = r->get_tensor(r->get_inputs()[1]);
+            auto query = r->get_tensor(r->get_inputs()[2]);
+            auto mask = r->get_tensor(r->get_inputs()[3]);
+            auto present_k = r->get_tensor(r->get_inputs()[4]);
+            auto present_v = r->get_tensor(r->get_inputs()[5]);
+
+            auto token_len = query->get_shape()[2];
+            std::cout << "Token len: " << token_len << std::endl;
+            auto history_len = past_k->get_shape()[2];
+            std::cout << "History len: " << history_len << std::endl;
+
+            auto q_head_num = query->get_shape()[1];
+            auto kv_head_num = past_k->get_shape()[1];
+
+            int batch = token_len;
+            int kv_len = batch + history_len;
+            const int context_len = 4096;  // or some appropriate value
+            const int hidden_dim = 128;
+            int embd_len = q_head_num * hidden_dim;
+
+            // load query
+            NPUW_ASSERT(query->get_element_type() == ov::element::f16);
+            auto reorderedQuery = reorderAndConvertTensorData(static_cast<const sycl::half*>(query->data()),
+                                                              query->get_shape(),
+                                                              {0, 2, 1, 3});
+            q.memcpy(q_buffer, reorderedQuery.data(), batch * q_head_num * hidden_dim * sizeof(float)).wait();
+
+            // load past key + present key
+            NPUW_ASSERT(past_k->get_element_type() == ov::element::f16);
+            auto reorderedPastKey =
+                reorderTensorData(static_cast<const sycl::half*>(past_k->data()), past_k->get_shape(), {0, 2, 1, 3});
+            q.memcpy(k_buffer, reorderedPastKey.data(), past_k->get_byte_size()).wait();
+            NPUW_ASSERT(present_k->get_element_type() == ov::element::f16);
+            auto reorderedPresentKey = reorderTensorData(static_cast<const sycl::half*>(present_k->data()),
+                                                         present_k->get_shape(),
+                                                         {0, 2, 1, 3});
+            q.memcpy(static_cast<uint8_t*>(k_buffer) + past_k->get_byte_size(),
+                     reorderedPresentKey.data(),
+                     present_k->get_byte_size())
+                .wait();
+
+            // load past value + present value
+            NPUW_ASSERT(past_v->get_element_type() == ov::element::f16);
+            auto reorderedPastValue =
+                reorderTensorData(static_cast<const sycl::half*>(past_v->data()), past_v->get_shape(), {0, 3, 1, 2});
+            q.memcpy(v_buffer, reorderedPastValue.data(), past_v->get_byte_size()).wait();
+            NPUW_ASSERT(present_v->get_element_type() == ov::element::f16);
+            auto reorderedPresentValue = reorderTensorData(static_cast<const sycl::half*>(present_v->data()),
+                                                           present_v->get_shape(),
+                                                           {0, 3, 1, 2});
+            q.memcpy(static_cast<uint8_t*>(v_buffer) + past_v->get_byte_size(),
+                     reorderedPresentValue.data(),
+                     present_v->get_byte_size())
+                .wait();
+
+            // load mask
+            NPUW_ASSERT(mask->get_element_type() == ov::element::f32);
+            q.memcpy(mask_buffer, mask->data(), mask->get_byte_size()).wait();
+
+            {
+                auto t_start = std::chrono::high_resolution_clock::now();
+                RunGQA(&q,
+                       static_cast<uint8_t*>(q_buffer),
+                       static_cast<uint8_t*>(k_buffer),
+                       static_cast<uint8_t*>(v_buffer),
+                       static_cast<uint8_t*>(mask_buffer),
+                       static_cast<uint8_t*>(sdp_out_buffer),
+                       batch,
+                       kv_len,
+                       context_len,
+                       kv_head_num,
+                       q_head_num,
+                       0,
+                       0);
+
+                f();  // expect noexcept
+
+                q.wait();
+                auto t_end = std::chrono::high_resolution_clock::now();
+
+                double elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+                printf("HFDebug: SDP of (kv: %d, q: %d, %dx%dx%d) takes %f ms \n",
+                       kv_head_num,
+                       q_head_num,
+                       batch,
+                       kv_len,
+                       context_len,
+                       elapsed_time_ms);
+            }
+
+            auto output = r->get_tensor(r->get_outputs()[0]);
+            NPUW_ASSERT(output->get_element_type() == ov::element::f16);
+            auto output_f16 =
+                convertF32ToF16(std::vector<float>(static_cast<const float*>(sdp_out_buffer),
+                                                   static_cast<const float*>(sdp_out_buffer) + batch * embd_len));
+            q.memcpy(static_cast<uint8_t*>(output->data()), output_f16.data(), batch * embd_len * sizeof(sycl::half))
+                .wait();
+#else
+            LOG_WARN("SDPA execution requested but SYCL support is not available!");
+            r->start_async();
+            f();  // expect noexcept
+            r->wait();
+#endif
+        } else {
+            std::cout << "JustInferRequest::unsafe_during: non-sdpa exec... " << real_idx << std::endl;
+            r->start_async();
+            f();  // expect noexcept
+            r->wait();
+        }
+
     } else {
         // Spatial execution... Do the opposite - run f asynchronously, and meanwhile run the
         // spatial inference

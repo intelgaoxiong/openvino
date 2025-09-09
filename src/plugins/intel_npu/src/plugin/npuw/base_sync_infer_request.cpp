@@ -3,6 +3,7 @@
 //
 
 #include "base_sync_infer_request.hpp"
+#include <iostream>
 
 #include "compiled_model.hpp"
 #include "intel_npu/config/npuw.hpp"
@@ -236,6 +237,7 @@ void ov::npuw::IBaseInferRequest::infer() {
         }
         subscribe_subrequest(idx, [](std::exception_ptr) {});
         bool failover = false;
+        std::cout << "IBaseInferRequest::infer() calling run_subrequest_for_success: " << idx << std::endl;
         run_subrequest_for_success(idx, failover);
         failover_happened |= failover;
         complete_subrequest(idx);

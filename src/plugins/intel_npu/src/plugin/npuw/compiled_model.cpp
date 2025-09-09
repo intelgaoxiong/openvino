@@ -3,9 +3,11 @@
 //
 #include "compiled_model.hpp"
 
+#include <cstddef>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "accuracy/comparator.hpp"
 #include "intel_npu/npu_private_properties.hpp"
@@ -158,6 +160,19 @@ std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::ICompiledModel::create(
     }
     LOG_INFO("Done");
     return compiled_model;
+}
+
+#include "openvino/op/ops.hpp"
+bool containsSoftmaxV8WithNonUnitSecondDim(const ov::Model& model) {
+    for (const auto& node : model.get_ops()) {
+        if (node->get_type_info() == ov::op::v8::Softmax::get_type_info_static()) {
+            auto output_shape = node->get_output_shape(0);
+            if (output_shape.size() > 1 && output_shape[output_shape.size() - 2] != 1) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 ov::npuw::ICompiledModel::ICompiledModel(const std::shared_ptr<ov::Model>& model,
@@ -370,6 +385,10 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                 m_compiled_submodels[id].replaced_by = compiled_fcn_iter->second;
                 LOG_INFO("Subgraph[" << id << "] is a function call to [" << compiled_fcn_iter->second << "]");
             }
+
+            if (containsSoftmaxV8WithNonUnitSecondDim(*fcn_template._model) && id != 0) {
+                m_compiled_submodels[id].is_sdpa = true;
+            }
             m_compiled_submodels[id].host_gather = subgraph._host_gather;
             m_compiled_submodels[id].quant_unpack_gather = subgraph._quant_unpack_gather;
             m_compiled_submodels[id].param_base = fcn_template._param_offset;
@@ -409,6 +428,23 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
             // Note: keep here naming as it would be the subgraph
         }  // if(dump)
     }  // for(orderedSubgraphs)
+
+    std::vector<size_t> sdpa_index;
+    for (size_t i = 0; i < m_compiled_submodels.size(); i++) {
+        if (m_compiled_submodels[i].is_sdpa) {
+            sdpa_index.push_back(i);
+        }
+    }
+    std::ostringstream oss;
+    oss << "Subgraph[";
+    for (size_t j = 0; j < sdpa_index.size(); ++j) {
+        oss << sdpa_index[j];
+        if (j < sdpa_index.size() - 1) {
+            oss << ", ";
+        }
+    }
+    oss << "] is marked as SDPA";
+    std::cout << oss.str() << std::endl;
 
     std::map<std::size_t, std::string> forced_sub_devices{};
     std::string fsd_opt = m_cfg.get<::intel_npu::NPUW_SUBMODEL_DEVICE>();
