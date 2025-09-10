@@ -2,16 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-# Find SYCL package
-find_package(IntelSYCL QUIET)
-if(IntelSYCL_FOUND)
-    message(STATUS "SYCL found, enabling SYCL support for NPUW plugin")
-    set(SYCL_ENABLED ON)
-else()
-    message(STATUS "SYCL not found, disabling SYCL support for NPUW plugin")
-    set(SYCL_ENABLED OFF)
-endif()
-
 file(GLOB SOURCES "src/*.cpp" "include/*.hpp")
 file(GLOB_RECURSE NPUW_SOURCES "npuw/*.cpp" "npuw/*.hpp")
 
@@ -63,17 +53,5 @@ cross_compiled_file(${TARGET_NAME}
         NAME        unpack_i4i8 unpack_u4i8 unpack_i4f16 unpack_i4f16_scale unpack_i4f16_z unpack_u4f16 unpack_u4f16_scale_zp unpack_u4f16_asymm_zp unpack_u4f16_z unpack_u4f32 unpack_i8f16 unpack_i8f16_scale unpack_u8f16 to_f16 copy_row_as_column
         NAMESPACE   ov::npuw::util::XARCH
 )
-
-# Add SYCL support if available
-if(SYCL_ENABLED)
-    target_compile_definitions(${TARGET_NAME} PRIVATE NPUW_WITH_SYCL)
-    # Set SYCL compile flags only for the specific file that needs it
-    set_source_files_properties(npuw/just_sync_infer_request.cpp 
-        PROPERTIES 
-        COMPILE_FLAGS "-fsycl" 
-        CMAKE_CXX_COMPILER "${SYCL_COMPILER}")
-    target_include_directories(${TARGET_NAME} PRIVATE ${SYCL_INCLUDE_DIR})
-    target_link_libraries(${TARGET_NAME} PRIVATE ${SYCL_LIBRARY})
-endif()
 
 ov_add_api_validator_post_build_step(TARGET ${NPU_PLUGIN_TARGET})
