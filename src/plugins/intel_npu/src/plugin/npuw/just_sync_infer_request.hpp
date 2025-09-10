@@ -133,17 +133,6 @@ protected:
 
     // Cached check if we do FOLDing and need to update closures in the repeating blocks
     bool m_closure_update_required = false;
-
-#ifdef NPUW_WITH_SYCL
-    void* q_buffer = nullptr;
-    void* k_buffer = nullptr;
-    void* v_buffer = nullptr;
-    void* mask_buffer = nullptr;
-    void* sdp_out_buffer = nullptr;
-
-    sycl::default_selector selector;
-    sycl::queue q;
-#endif
 };
 
 }  // namespace npuw

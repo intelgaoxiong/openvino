@@ -1375,7 +1375,12 @@ std::string ov::npuw::CompiledModel::funcall_mem_device(const std::size_t idx) c
     }
 
     auto& comp_model_desc = m_compiled_submodels[idx];
-    return *comp_model_desc.device_it;
+
+    if (comp_model_desc.is_sdpa) {
+        return "GPU";
+    } else {
+        return *comp_model_desc.device_it;
+    }
 }
 
 void ov::npuw::CompiledModel::remove_long_output_names(const std::shared_ptr<ov::Model>& model) {
@@ -1489,15 +1494,23 @@ bool ov::npuw::CompiledModel::compile_for_device(std::size_t id, const std::stri
         return false;
     }
 
+    std::string device = device_to_try;
+    if (m_compiled_submodels[id].is_sdpa) {
+        device = "GPU";
+        std::cout << "Subgraph[" << id << "] is marked as SDPA, forcing GPU device for compilation" << std::endl;
+    } else {
+        std::cout << "Subgraph[" << id << "] is not marked as SDPA, using " << device << " for compilation" << std::endl;
+    }
+
     try {
-        m_compiled_submodels[id].compiled_model = compile_submodel(m_compiled_submodels[id].model, device_to_try);
+        m_compiled_submodels[id].compiled_model = compile_submodel(m_compiled_submodels[id].model, device);
     } catch (const std::exception& ex) {
         LOG_ERROR("Subgraph [" << id << "] Failed to compile: " << std::endl << ex.what());
-        dump_on_fail(id, device_to_try, ex.what());
+        dump_on_fail(id, device, ex.what());
         return false;
     } catch (...) {
         LOG_ERROR("Subgraph [" << id << "] Failed to compile: Unknown error");
-        dump_on_fail(id, device_to_try, "Unknown error");
+        dump_on_fail(id, device, "Unknown error");
         return false;
     }
     // Reached this point - all ok, stop the search
@@ -1843,13 +1856,11 @@ void ov::npuw::CompiledModel::implement_properties() {
                           BIND(npuw::accuracy::check, NPUW_ACC_CHECK),
                           BIND(npuw::accuracy::threshold, NPUW_ACC_THRESH),
                           BIND(npuw::accuracy::reference_device, NPUW_ACC_DEVICE),
-#ifdef NPU_PLUGIN_DEVELOPER_BUILD
                           BIND(npuw::dump::full, NPUW_DUMP_FULL),
                           BIND(npuw::dump::subgraphs, NPUW_DUMP_SUBS),
                           BIND(npuw::dump::subgraphs_on_fail, NPUW_DUMP_SUBS_ON_FAIL),
                           BIND(npuw::dump::inputs_outputs, NPUW_DUMP_IO),
                           BIND(npuw::dump::io_iters, NPUW_DUMP_IO_ITERS)
-#endif
     });
 #undef BIND
 }
