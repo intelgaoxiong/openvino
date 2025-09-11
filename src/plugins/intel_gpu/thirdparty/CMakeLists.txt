@@ -161,7 +161,8 @@ if(ENABLE_ONEDNN_FOR_GPU)
                              "${CMAKE_CURRENT_SOURCE_DIR}/onednn_gpu/src/gpu/intel/jit/ngen"
                              "${CMAKE_CURRENT_SOURCE_DIR}/onednn_gpu/src/gpu/intel/jit/config"
                              "${CMAKE_CURRENT_SOURCE_DIR}/onednn_gpu/src/gpu/intel/gemm/jit/include"
-                             "${CMAKE_CURRENT_SOURCE_DIR}/onednn_gpu/third_party/ngen")
+                             "${CMAKE_CURRENT_SOURCE_DIR}/onednn_gpu/third_party/ngen"
+                             "${CMAKE_CURRENT_SOURCE_DIR}/onednn_gpu/third_party")
         set(LIB_DEFINITIONS ENABLE_ONEDNN_FOR_GPU
                             DNNL_DLL
                             DNNL_DLL_EXPORTS
