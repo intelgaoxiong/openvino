@@ -163,6 +163,8 @@ std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::ICompiledModel::create(
 }
 
 #include "openvino/op/ops.hpp"
+#include "openvino/pass/pattern/matcher.hpp"
+#include "openvino/pass/pattern/op/wrap_type.hpp"
 bool containsSoftmaxV8WithNonUnitSecondDim(const ov::Model& model) {
     for (const auto& node : model.get_ops()) {
         if (node->get_type_info() == ov::op::v8::Softmax::get_type_info_static()) {
@@ -170,6 +172,15 @@ bool containsSoftmaxV8WithNonUnitSecondDim(const ov::Model& model) {
             if (output_shape.size() > 1 && output_shape[output_shape.size() - 2] != 1) {
                 return true;
             }
+        }
+    }
+    return false;
+}
+
+bool containsSDPA(const ov::Model& model) {
+    for (const auto& node : model.get_ops()) {
+        if (node->get_type_info() == ov::op::v13::ScaledDotProductAttention::get_type_info_static()) {
+            return true;
         }
     }
     return false;
@@ -264,6 +275,164 @@ void reshape_sdpa_to_dynamic(std::shared_ptr<ov::Model> model) {
         }
 #endif
     }
+}
+
+class MergeSDPA : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("npuw::patterns::MergeSDPA");
+    MergeSDPA() {
+        using namespace ov::pass::pattern;
+
+        auto matmul1 = wrap_type<ov::op::v0::MatMul>({any_input(), any_input()});
+        auto add = wrap_type<ov::op::v1::Add>({matmul1, any_input()});
+        auto softmax = wrap_type<ov::op::v8::Softmax>({add});
+        auto matmul2 = wrap_type<ov::op::v0::MatMul>({softmax, any_input()});
+
+        auto callback = [=](ov::pass::pattern::Matcher& m) {
+            auto& node_to_output = m.get_pattern_value_map();
+
+            auto matched_node_matmul1 = node_to_output.at(matmul1).get_node_shared_ptr();
+            auto matched_node_add = node_to_output.at(add).get_node_shared_ptr();
+            auto matched_node_softmax = node_to_output.at(softmax).get_node_shared_ptr();
+            auto matched_node_matmul2 = node_to_output.at(matmul2).get_node_shared_ptr();
+
+            // Get inputs for SDPA
+            const auto query = matched_node_matmul1->input_value(0);
+            const auto key = matched_node_matmul1->input_value(1);
+            const auto atten_mask = matched_node_add->input_value(1);
+
+            // Determine which input of matmul2 is the value
+            auto matmul2_input_0 = matched_node_matmul2->input_value(0);
+            auto matmul2_input_1 = matched_node_matmul2->input_value(1);
+
+            ov::Output<ov::Node> value;
+            if (matmul2_input_0.get_node_shared_ptr() == matched_node_softmax) {
+                // Standard case: softmax_output × value
+                value = matmul2_input_1;
+            } else if (matmul2_input_1.get_node_shared_ptr() == matched_node_softmax) {
+                // Swapped case: value × softmax_output
+                value = matmul2_input_0;
+            } else {
+                // Neither input is softmax - pattern doesn't match expected structure
+                return false;
+            }
+
+            // Validate shapes for SDPA compatibility
+            auto query_shape = query.get_partial_shape();
+            auto key_shape = key.get_partial_shape();
+            auto value_shape = value.get_partial_shape();
+
+            if (!query_shape.rank().is_static() || !key_shape.rank().is_static() || !value_shape.rank().is_static()) {
+                return false;
+            }
+
+            auto q_rank = query_shape.rank().get_length();
+            auto k_rank = key_shape.rank().get_length();
+            auto v_rank = value_shape.rank().get_length();
+
+            if (q_rank < 3 || k_rank < 3 || v_rank < 3) {
+                return false;
+            }
+
+            // For SDPA, we need:
+            // Query: [..., seq_q, head_dim]
+            // Key:   [..., seq_k, head_dim]
+            // Value: [..., seq_k, value_dim]
+
+            auto query_head_dim = query_shape[q_rank - 1];
+            auto key_head_dim = key_shape[k_rank - 1];
+            auto key_seq_len = key_shape[k_rank - 2];
+            auto value_seq_len = value_shape[v_rank - 2];
+            auto value_dim = value_shape[v_rank - 1];
+
+            // Check if head dimensions match between query and key (when static)
+            if (query_head_dim.is_static() && key_head_dim.is_static() &&
+                query_head_dim.get_length() != key_head_dim.get_length()) {
+                return false;
+            }
+
+            // Prepare the value tensor for SDPA
+            ov::Output<ov::Node> final_value = value;
+
+            // Check if Value needs to be transposed
+            // For dynamic shapes, we need to check the pattern differently
+            // Expected: [..., seq_k, value_dim] but got [..., value_dim, seq_k]
+
+            bool needs_transpose = false;
+
+            if (key_seq_len.is_static() && value_seq_len.is_static() && value_dim.is_static()) {
+                // Static shape case
+                auto expected_seq_len = key_seq_len.get_length();
+                auto actual_seq_len = value_seq_len.get_length();
+                auto actual_value_dim = value_dim.get_length();
+
+                // If value dimensions are swapped (seq and dim are transposed)
+                if (actual_value_dim == expected_seq_len && actual_seq_len != expected_seq_len) {
+                    needs_transpose = true;
+                }
+            } else {
+                // Dynamic shape case - use heuristic based on typical patterns
+                // If Query head_dim matches Key head_dim, and Value's last dim matches Query head_dim
+                // but Value's second-to-last dim doesn't match Key's second-to-last dim,
+                // then Value likely needs transposition
+
+                if (query_head_dim.is_static() && key_head_dim.is_static() && value_dim.is_static()) {
+                    auto q_head_dim_val = query_head_dim.get_length();
+                    auto k_head_dim_val = key_head_dim.get_length();
+                    auto v_dim_val = value_dim.get_length();
+
+                    // If Query and Key head dimensions match, and Value's last dimension matches this
+                    if (q_head_dim_val == k_head_dim_val && v_dim_val == q_head_dim_val) {
+                        // Check if Value's sequence dimension is different from Key's
+                        // This suggests Value might be transposed
+                        if (!key_seq_len.same_scheme(value_seq_len)) {
+                            needs_transpose = true;
+                        }
+                    }
+                } else {
+                    // Fallback: assume transpose is needed for typical SDPA pattern
+                    // This is based on the common pattern where Value comes as [batch, heads, head_dim, seq_len]
+                    // but SDPA expects [batch, heads, seq_len, head_dim]
+                    needs_transpose = true;
+                }
+            }
+
+            if (needs_transpose) {
+                // Need to transpose the last two dimensions of value
+                // Create transpose node to swap last two dimensions
+                std::vector<int64_t> transpose_order;
+                for (int64_t i = 0; i < v_rank - 2; i++) {
+                    transpose_order.push_back(i);
+                }
+                // Swap the last two dimensions
+                transpose_order.push_back(v_rank - 1);  // was last, now second-to-last
+                transpose_order.push_back(v_rank - 2);  // was second-to-last, now last
+
+                auto transpose_const = std::make_shared<ov::op::v0::Constant>(ov::element::i64,
+                                                                              ov::Shape{transpose_order.size()},
+                                                                              transpose_order);
+
+                auto transpose_op = std::make_shared<ov::op::v1::Transpose>(value, transpose_const);
+                final_value = transpose_op->output(0);
+            }
+
+            const auto causal = false;
+            const auto op =
+                std::make_shared<ov::op::v13::ScaledDotProductAttention>(query, key, final_value, atten_mask, causal);
+
+            ov::replace_node(matched_node_matmul2, op);
+            return true;
+        };
+        register_matcher(std::make_shared<ov::pass::pattern::Matcher>(matmul2, "MergeSDPA"), std::move(callback));
+    }
+};
+
+void merge_sdpa(std::shared_ptr<ov::Model> model) {
+    ov::pass::GraphRewrite rewr;
+    rewr.add_matcher<MergeSDPA>();
+    rewr.run_on_model(model);
+
+    model->validate_nodes_and_infer_types();
 }
 
 ov::npuw::ICompiledModel::ICompiledModel(const std::shared_ptr<ov::Model>& model,
@@ -471,13 +640,17 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                         compiled::Spatial(fcn_template._spatial.value(), fcn_template._model);
                 }
                 LOG_INFO("Subgraph[" << id << "] is a function body for " << subgraph._funcall);
+                std::cout << "Subgraph[" << id << "] is a function body for " << subgraph._funcall << std::endl;
             } else {
                 // ...and refer to it in other calls
                 m_compiled_submodels[id].replaced_by = compiled_fcn_iter->second;
                 LOG_INFO("Subgraph[" << id << "] is a function call to [" << compiled_fcn_iter->second << "]");
+                std::cout << "Subgraph[" << id << "] is a function call to [" << compiled_fcn_iter->second << "]"
+                          << std::endl;
             }
 
-            if (containsSoftmaxV8WithNonUnitSecondDim(*fcn_template._model) && id != 0) {
+            if ((containsSoftmaxV8WithNonUnitSecondDim(*fcn_template._model) && id != 0) ||
+                containsSDPA(*fcn_template._model)) {
                 m_compiled_submodels[id].is_sdpa = true;
             }
             m_compiled_submodels[id].host_gather = subgraph._host_gather;
@@ -505,6 +678,7 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
 
             if (m_compiled_submodels[real_id].is_sdpa) {
                 reshape_sdpa_to_dynamic(m_compiled_submodels[real_id].model);
+                merge_sdpa(m_compiled_submodels[real_id].model);
             }
         }
 
