@@ -163,25 +163,22 @@ void ov::npuw::LLMInferRequest::init_lora_states() {
 
 std::string ov::npuw::LLMInferRequest::init_pre_alloc_device() {
     bool pre_alloc_on_npu = false;
-    const auto& prefill_compiled = m_npuw_llm_compiled_model->m_prefill_compiled;
-    for (std::size_t idx = 0; idx < prefill_compiled->m_compiled_submodels.size(); ++idx) {
-        if (prefill_compiled->submodel_device(idx) == "NPU") {
+    const auto& kvcache_compiled = m_npuw_llm_compiled_model->m_kvcache_compiled;
+    for (std::size_t idx = 0; idx < kvcache_compiled->m_compiled_submodels.size(); ++idx) {
+        if (kvcache_compiled->submodel_device(idx) == "NPU") {
             pre_alloc_on_npu = true;
             break;
         }
     }
-    m_pre_alloc_device = pre_alloc_on_npu ? "NPU" : "CPU";
 
-    std::cout << "m_pre_alloc_device: " << m_pre_alloc_device << std::endl;
-
-    return m_pre_alloc_device;
+    return pre_alloc_on_npu ? "NPU" : "CPU";
 }
 
 void ov::npuw::LLMInferRequest::bind_past_kv() {
     // Only reuse KV cache related tensors (past_key_values)
     for (const auto& [input_name, input_port] : m_prefill_in_ports) {
         // Only process KV cache inputs (past_key_values)
-        if (input_name.find("past_key_values") == std::string::npos) {
+        if (input_name.find(layer_names::past_key_values) == std::string::npos) {
             continue;
         }
 
@@ -201,7 +198,7 @@ void ov::npuw::LLMInferRequest::bind_past_kv() {
 
         // Record that we have already bind past_kv, will need data copy when update past kv in infer requests to
         // ensure correct data layout
-        m_past_kv_binded = true;
+        m_past_kv_bound = true;
     }
 }
 
@@ -454,7 +451,7 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
                 auto prefill_past_kv = m_prefill_request->get_tensor(m_prefill_in_ports.at(input_name));
                 ov::SoPtr<ov::ITensor> tmp_dense_kv_tensor;
                 ov::SoPtr<ov::ITensor> prefill_past_kv_chunks;
-                if (m_past_kv_binded) {
+                if (m_past_kv_bound) {
                     tmp_dense_kv_tensor = ov::npuw::util::allocMem(prefill_past_kv->get_element_type(),
                                                                    prefill_past_kv->get_shape(),
                                                                    m_pre_alloc_device,
