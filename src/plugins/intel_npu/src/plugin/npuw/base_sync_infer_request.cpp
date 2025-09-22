@@ -239,12 +239,33 @@ std::vector<ov::ProfilingInfo> ov::npuw::IBaseInferRequest::get_profiling_info()
     return info;
 }
 
+void printStatistics(const std::vector<double>& times, const std::string& name) {
+    if (!times.empty()) {
+        double min_value = *std::min_element(times.begin(), times.end());
+        double max_value = *std::max_element(times.begin(), times.end());
+        double sum = std::accumulate(times.begin(), times.end(), 0.0);
+        double average = sum / times.size();
+
+        std::cout << name << " - Min: " << min_value << ", Max: " << max_value << ", Avg: " << average << ", Total: " << sum << std::endl;
+    } else {
+        std::cout << name << " empty!!" << std::endl;
+    }
+}
+
 void ov::npuw::IBaseInferRequest::infer() {
     m_now_idx.reset();
     prepare_for_infer();
     bool failover_happened = false;
     double sdpa_time = 0.0;
     double gemm_time = 0.0;
+    std::vector<double> prefill_sub_times;
+    std::vector<double> kvcache_sub_times;
+    std::vector<double> llm_head_sub_times;
+    bool is_prefill = m_num_submodels == 72;
+    bool is_kvcache = m_num_submodels == 36;
+    bool is_llm_head = m_num_submodels == 1;
+
+    // std::cout << "is_prefill: " << is_prefill << " is_kvcache: " << is_kvcache << " is_llm_head: " << is_llm_head << std::endl;
     auto t_start = std::chrono::high_resolution_clock::now();
     for (std::size_t idx = 0u; idx < m_num_submodels; idx++) {
         m_now_idx = idx;
@@ -272,6 +293,15 @@ void ov::npuw::IBaseInferRequest::infer() {
 
             gemm_time += elapsed_time_ms;
         }
+
+        if (is_kvcache) {
+            kvcache_sub_times.push_back(elapsed_time_ms);
+        }
+
+        if (is_llm_head) {
+            llm_head_sub_times.push_back(elapsed_time_ms);
+        }
+
         failover_happened |= failover;
         complete_subrequest(idx);
         if (m_npuw_model->m_acc_check) {
@@ -283,10 +313,26 @@ void ov::npuw::IBaseInferRequest::infer() {
     auto t_end = std::chrono::high_resolution_clock::now();
 
     double elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    std::cout << "IBaseInferRequest::infer() time: " << elapsed_time_ms << std::endl;
-    std::cout << "IBaseInferRequest::infer() sdpa time: " << sdpa_time << std::endl;
-    std::cout << "IBaseInferRequest::infer() gemm time: " << gemm_time << std::endl;
+    if (is_prefill) {
+        std::cout << "[Prefill] IBaseInferRequest::infer() time: " << elapsed_time_ms << std::endl;
+        std::cout << "[Prefill] IBaseInferRequest::infer() sdpa time: " << sdpa_time << std::endl;
+        std::cout << "[Prefill] IBaseInferRequest::infer() gemm time: " << gemm_time << std::endl;
+    }
 
+    if (is_kvcache) {
+        printStatistics(kvcache_sub_times, "[KVCache]");
+
+        printStatistics(m_step1_times, "[KVCache step1]");
+        printStatistics(m_step2_times, "[KVCache step2]");
+        printStatistics(m_step3_times, "[KVCache step3]");
+        printStatistics(m_step4_infer_times, "[KVCache step4 infer]");
+        printStatistics(m_step4_f_times, "[KVCache step4 f]");
+    }
+
+    if (is_llm_head) {
+        printStatistics(llm_head_sub_times, "[LLM Head]");
+    }
+    
     // Increment counter regardless if dumps etc are enabled or not.
     m_run_iter++;
 
