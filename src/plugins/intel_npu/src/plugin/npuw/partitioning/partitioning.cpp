@@ -2759,8 +2759,12 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
         LOG_INFO("Dumped the model in the current directory.");
     }
 
-    if (ens.groups.empty()) {
+    auto output_num = model->get_output_size();
+    std::cout << "ens.groups: " << ens.groups.size() << " output_num: " << output_num << std::endl;
+
+    if (ens.groups.empty() || output_num == 1) {
         LOG_INFO("Fall-back to single-model inference.");
+        std::cout << "Fall-back to single-model inference." << std::endl;
         // So far we have 1 subgraph which is the whole network
         Subgraph subgraph;
         subgraph._parameters = model->get_parameters();
