@@ -772,6 +772,8 @@ void ov::npuw::JustInferRequest::recreate_subrequests(std::size_t idx) {
 }
 
 void ov::npuw::JustInferRequest::run_subrequest_for_success(std::size_t idx, bool& failover) {
+    bool is_prefill = m_num_submodels == 72;
+
     failover = false;
     auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
     auto real_idx = comp_model_desc.replaced_by.value_or(idx);
@@ -781,6 +783,7 @@ void ov::npuw::JustInferRequest::run_subrequest_for_success(std::size_t idx, boo
     bool dump_in = false;
     bool next_prepared = false;
     while (!job_done) {
+        auto t_start = std::chrono::high_resolution_clock::now();
         bool should_recreate = false;
         if (m_subrequest_devices[real_idx] != *m_npuw_model->m_compiled_submodels[real_idx].device_it) {
             // This may happen when there's multiple NPUW's infer
@@ -790,15 +793,32 @@ void ov::npuw::JustInferRequest::run_subrequest_for_success(std::size_t idx, boo
                                               << *m_npuw_model->m_compiled_submodels[real_idx].device_it << " device.");
             recreate_subrequests(real_idx);
         }
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        if (is_prefill && !comp_model_desc.attention) {
+            m_step1_times.push_back(elapsed_time_ms);
+        }
 
         // Feeding the global Parameters is now part of the common
         // execution pipeline: See how it is done in
         // `unsafe_run_this_prep_next()`.  Now we only need to bind
         // the subrequest' outputs to global Results, if relevant.
+        t_start = std::chrono::high_resolution_clock::now();
         bind_global_results(idx);
+        t_end = std::chrono::high_resolution_clock::now();
+        elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        if (is_prefill && !comp_model_desc.attention) {
+            m_step2_times.push_back(elapsed_time_ms);
+        }
 
+        t_start = std::chrono::high_resolution_clock::now();
         if (comp_model_desc.replaced_by) {
             function_prologue(idx);
+        }
+        t_end = std::chrono::high_resolution_clock::now();
+        elapsed_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        if (is_prefill && !comp_model_desc.attention) {
+            m_step3_times.push_back(elapsed_time_ms);
         }
         if (!dump_in) {
             dump_in = true;
@@ -851,15 +871,27 @@ void ov::npuw::JustInferRequest::run_subrequest_for_success(std::size_t idx, boo
 }
 
 void ov::npuw::JustInferRequest::unsafe_during(std::size_t real_idx, std::size_t idx, const std::function<void()>& f) {
+    bool is_prefill = m_num_submodels == 72;
+
     auto& comp_model_desc = m_npuw_model->m_compiled_submodels[real_idx];
     if (!comp_model_desc.spatial) {
         // Normal: trigger request asynchronously, run `f` in this context
         // FIXME: dynamic could hit here too, but it has special logic
         // around execution which makes it harder to run than a plain start_async()
         auto& r = m_subrequests[real_idx];
+        auto infer_start = std::chrono::high_resolution_clock::now();
         r->start_async();
+        auto f_start = std::chrono::high_resolution_clock::now();
         f();  // expect noexcept
+        auto f_end = std::chrono::high_resolution_clock::now();
         r->wait();
+        auto infer_end = std::chrono::high_resolution_clock::now();
+        double elapsed_time_ms = std::chrono::duration<double, std::milli>(infer_end - infer_start).count();
+        double f_time_ms = std::chrono::duration<double, std::milli>(f_end - f_start).count();
+        if (is_prefill && !comp_model_desc.attention) {
+            m_step4_infer_times.push_back(elapsed_time_ms);
+            m_step4_f_times.push_back(f_time_ms);
+        }
     } else {
         // Spatial... Do the opposite - run f
         // asynchronously, and meanwhile run the spatial inference
