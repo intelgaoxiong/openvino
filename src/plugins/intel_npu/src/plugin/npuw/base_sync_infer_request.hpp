@@ -152,6 +152,12 @@ protected:
     // Common functionality - shared for subclasses
     const std::size_t m_num_submodels;
 
+    std::vector<double> m_step1_times;
+    std::vector<double> m_step2_times;
+    std::vector<double> m_step3_times;
+    std::vector<double> m_step4_infer_times;
+    std::vector<double> m_step4_f_times;
+
     TensorPtr allocMem(const ov::element::Type type, const ov::Shape& shape, const std::string& device);
     TensorPtr allocOut(const ov::Output<const ov::Node>& node, const std::string& device);
     virtual void alloc_io();
