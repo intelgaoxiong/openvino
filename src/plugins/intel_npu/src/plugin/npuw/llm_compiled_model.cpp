@@ -622,7 +622,7 @@ std::optional<ov::Any> pop_option(ov::AnyMap& config, const std::string& option_
 
 ov::AnyMap get_baseline_common_config(const std::optional<NPUDesc>& npudesc) {
     ov::AnyMap config = {
-        {"NPU_COMPILATION_MODE_PARAMS", "compute-layers-with-higher-precision=Sqrt,Power,ReduceMean,Add_RMSNorm"},
+        {"NPU_COMPILATION_MODE_PARAMS", "compute-layers-with-higher-precision=Sqrt,Power,ReduceMean,Add_RMSNorm, enable-output-ensurance=false"},
         {"NPUW_DEVICES", "NPU"},
         {"NPU_USE_NPUW", "YES"},
         {"NPUW_FOLD", "YES"},
