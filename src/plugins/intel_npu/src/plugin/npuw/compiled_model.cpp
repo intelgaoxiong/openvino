@@ -474,6 +474,8 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
 
         LOG_INFO("Compiling Subgraph[" << id << "]: " << m_compiled_submodels[real_id].model->get_friendly_name()
                                        << "...");
+        std::cout << "Compiling Subgraph[" << id << "]: " << m_compiled_submodels[real_id].model->get_friendly_name()
+                  << "..." << std::endl;
         if (!compile_for_success(id)) {
             OPENVINO_THROW("Failed to compile ",
                            m_compiled_submodels[real_id].model->get_friendly_name(),
@@ -1458,9 +1460,16 @@ bool ov::npuw::CompiledModel::compile_for_device(std::size_t id, const std::stri
     }
 
     try {
-        m_compiled_submodels[id].compiled_model = compile_submodel(m_compiled_submodels[id].model, device_to_try);
+        auto device = device_to_try;
+        std::cout << "Subgraph [" << id << "] start to compile on " << device << std::endl;
+        if (m_compiled_submodels[id].attention.has_value()) {
+            device = "GPU";
+            std::cout << "Subgraph [" << id << "] is attention, compile on " << device << std::endl;
+        }
+        m_compiled_submodels[id].compiled_model = compile_submodel(m_compiled_submodels[id].model, device);
     } catch (const std::exception& ex) {
         LOG_ERROR("Subgraph [" << id << "] Failed to compile: " << std::endl << ex.what());
+        std::cout << "Subgraph [" << id << "] Failed to compile: " << std::endl << ex.what();
         dump_on_fail(id, device_to_try, ex.what());
         return false;
     } catch (...) {
