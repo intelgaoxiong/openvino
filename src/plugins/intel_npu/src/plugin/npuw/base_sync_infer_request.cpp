@@ -275,7 +275,7 @@ void ov::npuw::IBaseInferRequest::infer() {
     std::vector<double> prefill_sub_times;
     std::vector<double> kvcache_sub_times;
     std::vector<double> llm_head_sub_times;
-    bool is_prefill = m_num_submodels == 72;
+    bool is_prefill = m_num_submodels >= 72;
     bool is_kvcache = m_num_submodels == 36;
     bool is_llm_head = m_num_submodels == 1;
 
@@ -295,6 +295,7 @@ void ov::npuw::IBaseInferRequest::infer() {
         }
         subscribe_subrequest(idx, [](std::exception_ptr) {});
         bool failover = false;
+        auto t_start = std::chrono::high_resolution_clock::now();
         m_profile[profile_tag(idx)].record([&]() {
             run_subrequest_for_success(idx, failover);
         });

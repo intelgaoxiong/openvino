@@ -772,7 +772,7 @@ void ov::npuw::JustInferRequest::recreate_subrequests(std::size_t idx) {
 }
 
 void ov::npuw::JustInferRequest::run_subrequest_for_success(std::size_t idx, bool& failover) {
-    bool is_prefill = m_num_submodels == 72;
+    bool is_prefill = m_num_submodels >= 72;
 
     failover = false;
     auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
@@ -871,7 +871,7 @@ void ov::npuw::JustInferRequest::run_subrequest_for_success(std::size_t idx, boo
 }
 
 void ov::npuw::JustInferRequest::unsafe_during(std::size_t real_idx, std::size_t idx, const std::function<void()>& f) {
-    bool is_prefill = m_num_submodels == 72;
+    bool is_prefill = m_num_submodels >= 72;
 
     auto& comp_model_desc = m_npuw_model->m_compiled_submodels[real_idx];
     if (!comp_model_desc.spatial) {
