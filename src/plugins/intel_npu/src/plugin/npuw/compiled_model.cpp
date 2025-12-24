@@ -401,8 +401,6 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                 }
 
                 if (fcn_template._moe_experts) {
-                    std::cout << "Creating compiled::MoEExperts for Subgraph[" << id << "] (function "
-                              << subgraph._funcall << ")" << std::endl;
                     m_compiled_submodels[id].moe_experts = compiled::MoEExperts(fcn_template._moe_experts.value());
 
                     // Set the model to compile from MoEExperts
@@ -410,8 +408,6 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                 }
 
                 if (fcn_template._moe_experts_downstream) {
-                    std::cout << "Creating compiled::MoEDownstream for Subgraph[" << id << "] (function "
-                              << subgraph._funcall << ")" << std::endl;
                     m_compiled_submodels[id].moe_experts_downstream =
                         compiled::MoEDownstream(fcn_template._moe_experts_downstream.value());
 
@@ -421,7 +417,6 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                 }
 
                 LOG_INFO("Subgraph[" << id << "] is a function body for " << subgraph._funcall);
-                std::cout << "Subgraph[" << id << "] is a function body for " << subgraph._funcall << std::endl;
             } else {
                 // ...and refer to it in other calls
                 m_compiled_submodels[id].replaced_by = compiled_fcn_iter->second;
@@ -526,8 +521,6 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
 
         LOG_INFO("Compiling Subgraph[" << id << "]: " << m_compiled_submodels[real_id].model->get_friendly_name()
                                        << "...");
-        std::cout << "Compiling Subgraph[" << id << "]: " << m_compiled_submodels[real_id].model->get_friendly_name()
-                  << std::endl;
         if (!compile_for_success(id)) {
             OPENVINO_THROW("Failed to compile ",
                            m_compiled_submodels[real_id].model->get_friendly_name(),
@@ -535,7 +528,6 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                            dev_list_str,
                            "]");
         }
-        std::cout << "Compilation done" << std::endl;
 
         if (m_acc_check) {
             if (submodel_device(real_id) != m_ref_device) {
@@ -563,12 +555,9 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
         }
     }
 
-    std::cout << "All submodels compiled" << std::endl;
     // Finalize memory in closures and weight banks
     finalize_weights_bank();
-    std::cout << "Weights bank finalized" << std::endl;
     detach_memory();
-    std::cout << "detach_memory done" << std::endl;
 
     // Print stats report when possible
     {
