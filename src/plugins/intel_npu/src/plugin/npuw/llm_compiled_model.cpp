@@ -24,6 +24,7 @@
 #include "openvino/runtime/properties.hpp"
 #include "partitioning/patterns/pre_compute.hpp"
 #include "partitioning/patterns/sdpa.hpp"
+#include "passes/device_routed_moe_transform.hpp"
 #include "serialization.hpp"
 #include "transformations/convert_precision.hpp"
 #include "util.hpp"
@@ -1787,10 +1788,12 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         LOG_INFO("MoE architecture optimization for GENERATE stage: HOST_ROUTED (host-side expert routing)");
         merge_config_with(generate_config, expert_opts);
     } else if (generate_moe_hint == ::intel_npu::npuw::llm::MoEHint::DEVICE_ROUTED) {
-        NPUW_ASSERT(false && "MoE DEVICE_ROUTED for GENERATE is not yet implemented! "
-                             "DEVICE_ROUTED will use in-graph gather-based expert selection to avoid "
-                             "graph splitting and reduce host-device communication overhead. "
-                             "This feature is planned for future releases.");
+        LOG_INFO(
+            "MoE architecture optimization for GENERATE stage: DEVICE_ROUTED (device-side dynamic expert selection)");
+        LOG_INFO("  - Using Gather-based expert weight selection with TopK indices");
+        LOG_INFO("  - Avoiding graph splitting, reducing host-device communication");
+        // DEVICE_ROUTED transformation will be applied in the graph transformation phase
+        // No specific config needed here - the transformation is handled by DeviceRoutedMoETransform pass
     } else if (generate_moe_hint == ::intel_npu::npuw::llm::MoEHint::DENSE) {
         LOG_INFO("MoE architecture optimization for GENERATE stage: DENSE (all experts active)");
         // DENSE mode requires CPU-only device due to extremely long NPU compilation time and high resource consumption
@@ -1864,6 +1867,18 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             rewr2.run_on_model(model_variant);
         }
         rewr2.run_on_model(prefill_model);
+    }
+
+    // Apply MoE DEVICE_ROUTED transformation if enabled
+    if (generate_moe_hint == ::intel_npu::npuw::llm::MoEHint::DEVICE_ROUTED) {
+        LOG_INFO("Applying DEVICE_ROUTED MoE transformation to generate models...");
+        ov::npuw::pass::DeviceRoutedMoETransform moe_transform;
+
+        for (auto& model_variant : generate_model_variants) {
+            moe_transform.run_on_model(model_variant);
+            LOG_DEBUG("  Applied DEVICE_ROUTED transformation to generate variant");
+        }
+        LOG_INFO("DEVICE_ROUTED MoE transformation completed");
     }
 
     // Compile multiple generate model variants with different sizes
