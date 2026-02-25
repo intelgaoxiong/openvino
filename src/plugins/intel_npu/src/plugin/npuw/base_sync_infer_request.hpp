@@ -214,7 +214,12 @@ protected:
     ov::npuw::perf::Profile<MS> m_profile;
     mutable ov::npuw::perf::Profile<B> m_footprint;  // mutable due to lazy I/O allocation in get_tensor()
 
+    // Per-function-body profiling: aggregates execution time/count across all
+    // sublayer calls that share the same function body (resolved via replaced_by).
+    ov::npuw::perf::Profile<MS> m_funcbody_profile;
+
     std::string profile_tag(std::size_t idx) const;
+    std::string funcbody_tag(std::size_t real_idx) const;
 
     // Various name/dump formatting methods
     // TODO: These methods should probably go to CompiledModel

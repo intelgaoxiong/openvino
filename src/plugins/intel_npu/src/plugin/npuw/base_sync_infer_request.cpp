@@ -31,6 +31,9 @@ ov::npuw::IBaseInferRequest::IBaseInferRequest(const std::shared_ptr<ov::npuw::C
 
     m_footprint.report_on_die = ov::npuw::profiling_enabled();
     m_footprint.area = m_npuw_model->m_name + "/memory";
+
+    m_funcbody_profile.report_on_die = ov::npuw::profiling_enabled();
+    m_funcbody_profile.area = m_npuw_model->m_name + "/funcbody";
 }
 
 ov::npuw::IBaseInferRequest::RqPtrs ov::npuw::IBaseInferRequest::create_infer_requests(std::size_t id,
@@ -290,6 +293,15 @@ std::string ov::npuw::IBaseInferRequest::profile_tag(std::size_t idx) const {
     return *proto_comp_model_desc.device_it;
 }
 
+std::string ov::npuw::IBaseInferRequest::funcbody_tag(std::size_t real_idx) const {
+    // Build a unique, human-readable tag for a function body:
+    //   "Subgraph_<zero-padded-real_idx>(<device>)"
+    // Multiple sublayer calls (different idx) that share the same real_idx
+    // will all use the same tag and therefore accumulate into one metric entry.
+    const auto& proto_comp_model_desc = m_npuw_model->m_compiled_submodels[real_idx];
+    return "Subgraph" + subgr_path_suffix(real_idx) + "(" + *proto_comp_model_desc.device_it + ")";
+}
+
 void ov::npuw::IBaseInferRequest::infer() {
     m_now_idx.reset();
     prepare_for_infer();
@@ -301,9 +313,22 @@ void ov::npuw::IBaseInferRequest::infer() {
         }
         subscribe_subrequest(idx, [](std::exception_ptr) {});
         bool failover = false;
-        m_profile[profile_tag(idx)].record([&]() {
-            run_subrequest_for_success(idx, failover);
-        });
+        // Inner lambda: record device-level timing as before.
+        auto do_infer = [&]() {
+            m_profile[profile_tag(idx)].record([&]() {
+                run_subrequest_for_success(idx, failover);
+            });
+        };
+        // Outer lambda: if this sublayer is a function call (replaced_by is set),
+        // also accumulate its time into the per-function-body profile.
+        // Multiple sublayer calls sharing the same real_idx (function body) accumulate
+        // under the same key, giving total call count and latency per function body.
+        const auto& cmd = m_npuw_model->m_compiled_submodels[idx];
+        if (cmd.replaced_by.has_value()) {
+            m_funcbody_profile[funcbody_tag(cmd.replaced_by.value())].record(do_infer);
+        } else {
+            do_infer();
+        }
         failover_happened |= failover;
         complete_subrequest(idx);
         if (m_npuw_model->m_acc_check) {
