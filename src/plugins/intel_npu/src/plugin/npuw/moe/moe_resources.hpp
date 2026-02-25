@@ -47,10 +47,15 @@ struct MoEResources {
     // Used to select optimal chunk size for token batches
     std::vector<size_t> sorted_chunk_sizes;
 
-    // Infer requests for different chunk sizes
+    // Infer requests for different chunk sizes (buffer A - slot 0)
     // Map: chunk_size -> infer_request
     // Reused across experts by unpacking different weights
     std::map<size_t, ov::SoPtr<ov::IAsyncInferRequest>> chunk_infer_requests;
+
+    // Second set of infer requests for double-buffer async pipeline (buffer B - slot 1)
+    // Ping-pong partner of chunk_infer_requests: while NPU executes a chunk on slot-0,
+    // the CPU prepares the next chunk on slot-1 and vice versa.
+    std::map<size_t, ov::SoPtr<ov::IAsyncInferRequest>> chunk_infer_requests_b;
 
     // Output accumulation buffer
     // Shape: [num_active_experts, 1, input_token_count, expert_hidden_dim]

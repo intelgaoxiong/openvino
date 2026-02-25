@@ -42,10 +42,10 @@ void MoEResources::initialize_expert_iterative_mode(
         }
 
         try {
-            auto infer_request = compiled_model->create_infer_request();
-            chunk_infer_requests[chunk_size] = std::move(infer_request);
+            chunk_infer_requests[chunk_size] = compiled_model->create_infer_request();
+            chunk_infer_requests_b[chunk_size] = compiled_model->create_infer_request();
             sorted_chunk_sizes.push_back(chunk_size);
-            LOG_DEBUG("  Created chunk infer request for chunk_size=" << chunk_size);
+            LOG_DEBUG("  Created chunk infer requests (A+B) for chunk_size=" << chunk_size);
         } catch (const std::exception& ex) {
             OPENVINO_THROW("MoE chunk infer request creation failed for chunk_size=", chunk_size, ": ", ex.what());
         }

@@ -276,6 +276,21 @@ private:
     void run_expert_iterative(size_t idx, size_t real_idx, const std::vector<size_t>& selected_experts);
 
     /**
+     * @brief Execute expert iterative mode inference with a double-buffer async pipeline.
+     *
+     * Overlaps CPU work (unpack + gather) for chunk N+1 with NPU inference for chunk N
+     * using start_async / wait ping-pong on two request slots per chunk size.
+     *
+     * Enable at runtime by setting the env var NPUW_MOE_ASYNC to any non-empty value:
+     *   export NPUW_MOE_ASYNC=1
+     *
+     * @param idx       Function call index
+     * @param real_idx  Submodel index
+     * @param selected_experts List of selected expert IDs
+     */
+    void run_expert_iterative_async(size_t idx, size_t real_idx, const std::vector<size_t>& selected_experts);
+
+    /**
      * @brief Execute batch experts inference (deprecated)
      * @deprecated Use run_expert_batch() instead
      */

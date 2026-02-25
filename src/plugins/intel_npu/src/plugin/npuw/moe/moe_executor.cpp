@@ -4,6 +4,8 @@
 
 #include "moe_executor.hpp"
 
+#include <cstdlib>
+
 #include "../compiled_model.hpp"  // For CompiledModel::CompiledModelDesc
 #include "../logging.hpp"
 #include "moe_infer_utils.hpp"
@@ -256,7 +258,11 @@ void MoEExecutor::run(size_t real_idx, size_t idx) {
         });
     } else {
         m_profile->iterative["Total Expert Iterative"].record([&]() {
-            run_expert_iterative(idx, real_idx, selected_experts);
+            if (std::getenv("NPUW_MOE_ASYNC")) {
+                run_expert_iterative_async(idx, real_idx, selected_experts);
+            } else {
+                run_expert_iterative(idx, real_idx, selected_experts);
+            }
         });
     }
 
@@ -511,6 +517,203 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx, const std::v
         }
         LOG_DEBUG("    Expert[" << expert_id << "] completed");
     }
+}
+
+void MoEExecutor::run_expert_iterative_async(size_t idx, size_t real_idx, const std::vector<size_t>& selected_experts) {
+    LOG_DEBUG("\n[EXPERT_ITERATIVE_ASYNC] Double-buffer async pipeline");
+
+    const auto input_token_count = m_config.input_token_count;
+    const auto& io = m_moe_io[idx];
+
+    if (!m_resources.expert_output_accumulator) {
+        OPENVINO_THROW("MoE: Expert output accumulator is null");
+    }
+    std::memset(m_resources.expert_output_accumulator->data(),
+                0,
+                m_resources.expert_output_accumulator->get_byte_size());
+
+    if (!m_config.router_scores_idx.has_value()) {
+        OPENVINO_THROW("MoE: Router scores index not available");
+    }
+    if (!m_config.expert_input_param_idx.has_value()) {
+        OPENVINO_THROW("MoE: Expert input parameter index not available");
+    }
+
+    auto router_source = io.router_scores;
+    auto expert_input_source = io.expert_input;
+
+    auto any_model = m_config.compiled_models.begin()->second;
+    auto output_shape = any_model->outputs()[0].get_shape();
+    const size_t embed_dim = (output_shape.size() == 4) ? output_shape[3] : output_shape[1];
+
+    // --- Per-call unpack cache ---
+    // Tracks which expert_id is currently loaded in each request within this call.
+    // Declared LOCAL (not member) so it resets between sublayer invocations: different
+    // sublayers (different idx) have different closure weights, so cross-call reuse of
+    // unpack state would silently write wrong weights to the infer request.
+    // Within a single call, the cache is still effective: if an expert has more than 2
+    // chunks (causing the same request to be revisited via ping-pong), the second visit
+    // correctly skips re-unpacking.
+    std::map<ov::IAsyncInferRequest*, size_t> req_last_expert;
+
+    // --- Ping-pong slot selection ---
+    // Alternates between slot-0 (chunk_infer_requests) and slot-1
+    // (chunk_infer_requests_b) on every call for a given chunk_size,
+    // ensuring we never write into the currently in-flight request.
+    // Both maps are populated during initialize_expert_iterative_mode.
+    // LOCAL: both slots are idle at the start of every call (scatter_in_flight flushes
+    // at call end), so slot state does not need to persist across invocations.
+    std::map<size_t, int> ping_pong_slot;  // 0 = A (chunk_infer_requests), 1 = B (chunk_infer_requests_b)
+    auto pick_request = [&](size_t chunk_size) -> RqPtr {
+        int& slot = ping_pong_slot[chunk_size];  // default-initialised to 0
+        slot ^= 1;
+        return (slot == 0) ? m_resources.chunk_infer_requests.at(chunk_size)
+                           : m_resources.chunk_infer_requests_b.at(chunk_size);
+    };
+
+    // --- In-flight state ---
+    // Captures everything needed to scatter the result of the running NPU chunk.
+    struct InFlightChunk {
+        RqPtr request;
+        size_t selected_chunk_size;  // key into compiled_models for output port
+        size_t expert_id;
+        size_t processed_tokens_start;
+        size_t current_chunk_size;
+        // Pointers into stable containers; validity is guaranteed by the
+        // flush-before-overwrite pattern (see scatter_in_flight usage below).
+        const std::vector<size_t>* tokens_for_expert;
+        const std::vector<size_t>* expert_slots;
+    };
+    std::optional<InFlightChunk> in_flight;
+
+    // Flush helper: wait for NPU completion then scatter into the accumulator.
+    // Resets in_flight to nullopt so repeated calls are safe no-ops.
+    auto scatter_in_flight = [&]() {
+        if (!in_flight) {
+            return;
+        }
+        m_profile->iterative["Async Wait"].record([&]() {
+            in_flight->request->wait();
+        });
+        const auto& out_port = m_config.compiled_models.at(in_flight->selected_chunk_size)->outputs()[0];
+        auto out_tensor = in_flight->request->get_tensor(out_port);
+        m_profile->iterative["Scatter Output"].record([&]() {
+            ov::npuw::moe::scatter_expert_outputs(out_tensor,
+                                                  m_resources.expert_output_accumulator,
+                                                  *in_flight->tokens_for_expert,
+                                                  in_flight->processed_tokens_start,
+                                                  in_flight->current_chunk_size,
+                                                  embed_dim,
+                                                  input_token_count,
+                                                  *in_flight->expert_slots);
+        });
+        in_flight.reset();
+    };
+
+    // expert_slots_current is refreshed once per expert.  The pointer stored in
+    // in_flight always refers to this vector.  We call scatter_in_flight() at the
+    // START of each expert iteration (before overwriting the vector) to guarantee
+    // the pointer is valid whenever scatter_in_flight() reads it.
+    std::vector<size_t> expert_slots_current;
+
+    for (size_t expert_id : selected_experts) {
+        const auto& tokens_for_expert = m_expert_to_tokens.at(expert_id);
+        const size_t total_tokens = tokens_for_expert.size();
+
+        LOG_DEBUG("\n  [ASYNC] Expert[" << expert_id << "] total_tokens=" << total_tokens);
+
+        // Flush the last chunk of the PREVIOUS expert before we overwrite
+        // expert_slots_current.  (If this is the first expert, in_flight is empty
+        // and this is a no-op.)
+        scatter_in_flight();
+
+        // Precompute per-token expert-slot indices to avoid hot-path map lookups
+        // inside scatter_expert_outputs.
+        expert_slots_current.resize(total_tokens);
+        for (size_t i = 0; i < total_tokens; ++i) {
+            size_t token_id = tokens_for_expert[i];
+            const auto& eids = m_token_to_experts.at(token_id);
+            auto it = std::find(eids.begin(), eids.end(), expert_id);
+            if (it == eids.end()) {
+                OPENVINO_THROW("MoE: Token should have this expert");
+            }
+            expert_slots_current[i] = std::distance(eids.begin(), it);
+        }
+
+        size_t processed_tokens = 0;
+        while (processed_tokens < total_tokens) {
+            const size_t remaining_tokens = total_tokens - processed_tokens;
+
+            // 1. Select chunk size
+            size_t selected_chunk_size = 0;
+            m_profile->iterative["Select Chunk Size"].record([&]() {
+                selected_chunk_size = select_chunk_size(remaining_tokens);
+            });
+            const size_t current_chunk_size = std::min(selected_chunk_size, remaining_tokens);
+
+            // 2. Pick the write-side request (ping-pong ensures it is not in-flight)
+            RqPtr next_req = pick_request(selected_chunk_size);
+
+            const auto& compiled_model = m_config.compiled_models.at(selected_chunk_size);
+            const auto& router_iport = compiled_model->inputs()[m_config.router_scores_idx.value()];
+            const auto& input_iport = compiled_model->inputs()[m_config.expert_input_param_idx.value()];
+            auto router_dest = next_req->get_tensor(router_iport);
+            auto input_dest = next_req->get_tensor(input_iport);
+
+            // 3. CPU: unpack weights if this (request, expert) pair is stale for this call.
+            //    req_last_expert is LOCAL per call: different sublayers (idx) carry different
+            //    closure weights, so we must not reuse unpack state across sublayer boundaries.
+            auto* req_raw = next_req.operator->();
+            auto expert_it = req_last_expert.find(req_raw);
+            if (expert_it == req_last_expert.end() || expert_it->second != expert_id) {
+                m_profile->iterative["Unpack Closure"].record([&]() {
+                    unpack_single_expert_closure(idx, next_req, expert_id);
+                });
+                req_last_expert[req_raw] = expert_id;
+            }
+
+            // 4. CPU: gather inputs.
+            //    *** Overlaps with the previous NPU infer (still running) ***
+            m_profile->iterative["Gather Router Scores"].record([&]() {
+                ov::npuw::moe::gather_router_scores(router_source,
+                                                    router_dest,
+                                                    expert_id,
+                                                    tokens_for_expert,
+                                                    processed_tokens,
+                                                    current_chunk_size);
+            });
+            m_profile->iterative["Gather Expert Input"].record([&]() {
+                ov::npuw::moe::gather_expert_inputs(expert_input_source,
+                                                    input_dest,
+                                                    tokens_for_expert,
+                                                    processed_tokens,
+                                                    current_chunk_size);
+            });
+
+            // 5. Wait for the previous NPU chunk + scatter its output.
+            //    Done AFTER gather so that CPU work above overlaps with NPU work.
+            scatter_in_flight();
+
+            // 6. Launch this chunk asynchronously on the NPU.
+            m_profile->iterative["Async Start"].record([&]() {
+                next_req->start_async();
+            });
+
+            in_flight = InFlightChunk{next_req,
+                                      selected_chunk_size,
+                                      expert_id,
+                                      processed_tokens,
+                                      current_chunk_size,
+                                      &tokens_for_expert,
+                                      &expert_slots_current};
+
+            processed_tokens += current_chunk_size;
+        }
+        LOG_DEBUG("    [ASYNC] Expert[" << expert_id << "] all chunks launched");
+    }
+
+    // Flush the very last in-flight chunk.
+    scatter_in_flight();
 }
 
 void MoEExecutor::set_router_scores(size_t idx,
