@@ -211,6 +211,19 @@ private:
     void unpack_single_expert_closure(size_t idx, RqPtr request, size_t expert_id);
 
     /**
+     * @brief Select the best chunk size for a given number of remaining tokens.
+     *
+     * Applies the following strategy (sorted_chunk_sizes is in descending order):
+     *   - remaining <= smallest  → use smallest chunk
+     *   - remaining >= largest   → use largest chunk
+     *   - otherwise              → use smallest chunk that is >= remaining
+     *
+     * @param remaining_tokens Tokens left to process in the current expert
+     * @return Selected chunk size (one of the keys in sorted_chunk_sizes)
+     */
+    size_t select_chunk_size(size_t remaining_tokens) const;
+
+    /**
      * @brief Unpack multiple experts' closure (batch expert mode)
      * @param idx Function call index
      * @param request Target infer request

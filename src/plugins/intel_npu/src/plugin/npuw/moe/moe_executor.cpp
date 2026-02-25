@@ -342,6 +342,31 @@ void MoEExecutor::run_expert_batch(size_t idx, size_t real_idx, const std::vecto
     });
 }
 
+size_t MoEExecutor::select_chunk_size(size_t remaining_tokens) const {
+    if (m_resources.sorted_chunk_sizes.empty()) {
+        OPENVINO_THROW("MoE: Sorted chunk sizes cannot be empty");
+    }
+
+    const size_t smallest_chunk = m_resources.sorted_chunk_sizes.back();
+    const size_t largest_chunk = m_resources.sorted_chunk_sizes.front();
+
+    if (remaining_tokens <= smallest_chunk) {
+        return smallest_chunk;
+    }
+    if (remaining_tokens >= largest_chunk) {
+        return largest_chunk;
+    }
+    // Find smallest chunk >= remaining_tokens.
+    // sorted_chunk_sizes is in descending order, so iterate from the back.
+    for (auto it = m_resources.sorted_chunk_sizes.rbegin(); it != m_resources.sorted_chunk_sizes.rend(); ++it) {
+        if (*it >= remaining_tokens) {
+            return *it;
+        }
+    }
+    // Unreachable: the largest_chunk >= remaining_tokens case is handled above.
+    return largest_chunk;
+}
+
 void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx, const std::vector<size_t>& selected_experts) {
     LOG_DEBUG("\n[EXPERT_ITERATIVE] Processing multiple tokens by iterating through experts");
 
@@ -404,37 +429,11 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx, const std::v
         while (processed_tokens < total_tokens) {
             size_t remaining_tokens = total_tokens - processed_tokens;
 
-            // Chunk selection strategy:
-            // - remaining_tokens <= smallest chunk → use smallest chunk
-            // - remaining_tokens >= largest chunk → use largest chunk
-            // - otherwise → use smallest chunk that is >= remaining_tokens
-            // Pre-sorted in descending order: [256, 128, 64, 32, 16]
-            if (m_resources.sorted_chunk_sizes.empty()) {
-                OPENVINO_THROW("MoE: Sorted chunk sizes cannot be empty");
-            }
-
-            size_t selected_chunk_size;
-            size_t smallest_chunk = m_resources.sorted_chunk_sizes.back();
-            size_t largest_chunk = m_resources.sorted_chunk_sizes.front();
-
-            if (remaining_tokens <= smallest_chunk) {
-                // Use smallest chunk
-                selected_chunk_size = smallest_chunk;
-            } else if (remaining_tokens >= largest_chunk) {
-                // Use largest chunk
-                selected_chunk_size = largest_chunk;
-            } else {
-                // Find smallest chunk >= remaining_tokens
-                // Since sorted descending, iterate from end to find first >= remaining_tokens
-                selected_chunk_size = smallest_chunk;  // Default to smallest
-                for (auto it = m_resources.sorted_chunk_sizes.rbegin(); it != m_resources.sorted_chunk_sizes.rend();
-                     ++it) {
-                    if (*it >= remaining_tokens) {
-                        selected_chunk_size = *it;
-                        break;
-                    }
-                }
-            }
+            // Select the best-fit chunk size for the remaining tokens.
+            size_t selected_chunk_size = 0;
+            m_profile->iterative["Select Chunk Size"].record([&]() {
+                selected_chunk_size = select_chunk_size(remaining_tokens);
+            });
 
             // Actual tokens to process in this iteration
             size_t current_chunk_size = std::min(selected_chunk_size, remaining_tokens);
