@@ -328,8 +328,8 @@ bool ov::npuw::util::OptimizeValueTensors::run_on_model(const std::shared_ptr<ov
     }
 
     TransposeValueTensors::Context ctx;
-    rewr.add_matcher<TransposeValueTensors_MHA>(std::ref(ctx));
-    rewr.add_matcher<TransposeValueTensors_GQA>(std::ref(ctx));
+    // rewr.add_matcher<TransposeValueTensors_MHA>(std::ref(ctx));
+    // rewr.add_matcher<TransposeValueTensors_GQA>(std::ref(ctx));
     rewr.run_on_model(model);
 
     ov::pass::Validate().run_on_model(model);
