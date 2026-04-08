@@ -19,7 +19,7 @@ INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_MM_GATED, bool, true, ov::intel_npu::npuw::partit
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_SLICE_OUT, bool, false, ov::intel_npu::npuw::partitioning, slice_out, "NPUW_SLICE_OUT", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_HOST_GATHER, bool, true, ov::intel_npu::npuw::partitioning, host_gather, "NPUW_HOST_GATHER", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_SPATIAL, bool, false, ov::intel_npu::npuw::partitioning, spatial, "NPUW_SPATIAL", ROOT, EXPOSED, CACHED, ALL)
-INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_F16IC, bool, true, ov::intel_npu::npuw::partitioning, f16_interconnect, "NPUW_F16IC", ROOT, EXPOSED, CACHED, ALL)
+INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_F16IC, bool, false, ov::intel_npu::npuw::partitioning, f16_interconnect, "NPUW_F16IC", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_SPATIAL_NWAY, std::size_t, 128, ov::intel_npu::npuw::partitioning, spatial_nway, "NPUW_SPATIAL_NWAY", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_SPATIAL_DYN, bool, true, ov::intel_npu::npuw::partitioning, spatial_dyn, "NPUW_SPATIAL_DYN", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_MOE_TOKEN_CHUNK_SIZE, uint64_t, 0, ov::intel_npu::npuw::partitioning, moe_token_chunk_size, "NPUW_MOE_TOKEN_CHUNK_SIZE", ROOT, EXPOSED, CACHED, ALL)
