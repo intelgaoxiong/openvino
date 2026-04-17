@@ -56,6 +56,12 @@ public:
     ShapeOfParameter();
 };
 
+class SoftmaxScalarShiftElimination : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("npuw::patterns::attn::SoftmaxScalarShiftElimination");
+    SoftmaxScalarShiftElimination();
+};
+
 class RegularizeSDPA : public ov::pass::ModelPass {
     bool m_run_broadcast_pattern = false;
 

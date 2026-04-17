@@ -275,6 +275,52 @@ ShapeOfParameter::ShapeOfParameter() {
     register_matcher(std::make_shared<opp::Matcher>(param_shp, "ShapeOfParameter"), std::move(callback));
 }
 
+SoftmaxScalarShiftElimination::SoftmaxScalarShiftElimination() {
+    auto add = opp::wrap_type<ov::op::v1::Add>({opp::any_input(), opp::any_input()});
+    auto softmax = opp::wrap_type<ov::op::v8::Softmax>({add});
+
+    auto is_scalar_like_constant = [](const ov::Output<ov::Node>& out) -> bool {
+        auto node = out.get_node_shared_ptr();
+        if (auto convert = ov::as_type_ptr<ov::op::v0::Convert>(node)) {
+            node = convert->input_value(0).get_node_shared_ptr();
+        }
+        auto constant = ov::as_type_ptr<ov::op::v0::Constant>(node);
+        if (!constant) {
+            return false;
+        }
+        // softmax(x + c) == softmax(x) for scalar shifts, so this add is redundant.
+        return ov::shape_size(constant->get_shape()) == 1;
+    };
+
+    // Note: Use [=] to make sure the above objects stay alive in the callback
+    auto callback = [=](ov::pass::pattern::Matcher& m) {
+        auto& node_to_output = m.get_pattern_value_map();
+        auto matched_softmax = ov::as_type_ptr<ov::op::v8::Softmax>(node_to_output.at(softmax).get_node_shared_ptr());
+        auto matched_add = ov::as_type_ptr<ov::op::v1::Add>(node_to_output.at(add).get_node_shared_ptr());
+        if (!matched_softmax || !matched_add) {
+            return false;
+        }
+
+        const auto lhs = matched_add->input_value(0);
+        const auto rhs = matched_add->input_value(1);
+
+        ov::Output<ov::Node> passthrough;
+        if (is_scalar_like_constant(lhs)) {
+            passthrough = rhs;
+        } else if (is_scalar_like_constant(rhs)) {
+            passthrough = lhs;
+        } else {
+            return false;
+        }
+
+        matched_softmax->input(0).replace_source_output(passthrough);
+        ov::copy_runtime_info(matched_add, matched_softmax);
+        return true;
+    };
+
+    register_matcher(std::make_shared<opp::Matcher>(softmax, "SoftmaxScalarShiftElimination"), std::move(callback));
+}
+
 bool RegularizeSDPA::run_on_model(const std::shared_ptr<ov::Model>& model) {
     bool model_changed = false;
     if (m_run_broadcast_pattern) {
@@ -290,6 +336,7 @@ bool RegularizeSDPA::run_on_model(const std::shared_ptr<ov::Model>& model) {
     // while AttentionBroadcast patterns might break the partitioning (related to F16IC).
     ov::pass::GraphRewrite rewr2;
     rewr2.add_matcher<ov::npuw::patterns::regularize::ShapeOfParameter>();
+    rewr2.add_matcher<ov::npuw::patterns::regularize::SoftmaxScalarShiftElimination>();
     model_changed |= rewr2.run_on_model(model);
 
     return model_changed;
