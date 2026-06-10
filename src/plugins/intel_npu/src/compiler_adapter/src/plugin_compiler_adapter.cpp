@@ -59,7 +59,38 @@ PluginCompilerAdapter::PluginCompilerAdapter(const std::shared_ptr<ZeroInitStruc
                  ZE_MINOR_VERSION(graphExtVersion));
 }
 
-std::shared_ptr<IGraph> PluginCompilerAdapter::compile(const std::shared_ptr<const ov::Model>& model,
+//std::shared_ptr<IGraph> PluginCompilerAdapter::import_precompiled(const const void* blobData, size_t blobSize) {
+//    GraphDescriptor graphDesc;
+//    NetworkMetadata networkMeta;
+//    FilteredConfig config{};
+//    ov::Tensor tensor;
+//    if (_zeGraphExt) {
+//        // Depending on the config, we may get an error when trying to get the graph handle from the compiled
+//        // network
+//        try {
+//            graphDesc = _zeGraphExt->getGraphDescriptor(blobData, blobSize);
+//            networkMeta = _zeGraphExt->getNetworkMeta(graphDesc);
+//            networkMeta.name = model->get_friendly_name();
+//        } catch (const std::exception& ex) {
+//            _logger.info("Failed to use the level zero graph handle: %s. Inference requests for this model are not "
+//                         "allowed. Only exports are available",
+//                         ex.what());
+//        }
+//    } else {
+//        _logger.warning("No driver is found, zeGraphExt is nullptr, so metadata is empty. Only exports are available");
+//    }
+//
+//    return std::make_shared<Graph>(
+//        _zeGraphExt,
+//        _zeroInitStruct,
+//        graphDesc,
+//        std::move(networkMeta),
+//        std::move(tensor),
+//        config,
+//        /* persistentBlob = */ true);  // exporting the blob shall be available in such a scenario
+//}
+
+    std::shared_ptr<IGraph> PluginCompilerAdapter::compile(const std::shared_ptr<const ov::Model>& model,
                                                        const FilteredConfig& config) const {
     OV_ITT_TASK_CHAIN(COMPILE_BLOB, itt::domains::NPUPlugin, "PluginCompilerAdapter", "compile");
 

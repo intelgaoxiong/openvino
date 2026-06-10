@@ -382,7 +382,8 @@ bool ZeGraphExtWrappers::canCpuVaBeImported(const void* data, size_t size) const
     return true;
 }
 
-GraphDescriptor ZeGraphExtWrappers::getGraphDescriptor(SerializedIR serializedIR,
+
+    GraphDescriptor ZeGraphExtWrappers::getGraphDescriptor(SerializedIR serializedIR,
                                                        const std::string& buildFlags,
                                                        const bool bypassUmdCache) const {
     ze_graph_handle_t graphHandle = nullptr;

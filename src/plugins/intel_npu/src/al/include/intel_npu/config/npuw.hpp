@@ -133,6 +133,7 @@ DEFINE_OPT(NPUW_WEIGHTS_BANK, std::string, "", npuw::weights_bank, RunTime);
 DEFINE_OPT(NPUW_WEIGHTS_BANK_ALLOC, std::string, "", npuw::weights_bank_alloc, RunTime);
 DEFINE_OPT(NPUW_CACHE_DIR, std::string, "", npuw::cache_dir, RunTime);
 DEFINE_OPT(NPUW_FUNCALL_ASYNC, bool, false, npuw::funcall_async, RunTime);
+DEFINE_OPT(NPUW_CONTROLFLOW_EN, bool, false, npuw::controlflow_enabled, RunTime);
 DEFINE_OPT(NPUW_UNFOLD_IREQS, bool, false, npuw::unfold_ireqs, RunTime);
 DEFINE_OPT(NPUW_FALLBACK_EXEC, bool, true, npuw::fallback_exec, RunTime);
 DEFINE_OPT(NPUW_ACC_CHECK, bool, false, npuw::accuracy::check, RunTime);

@@ -83,7 +83,6 @@ private:
     friend class LLMCompiledModel;
     friend class LLMInferRequest;
     friend class moe::MoEExecutor;
-
     bool compile_for_success(std::size_t id);
     bool compile_for_device(std::size_t id, const std::string& device_to_try);
     ov::SoPtr<ov::ICompiledModel> compile_submodel(const std::shared_ptr<ov::Model>& submodel,
@@ -158,7 +157,9 @@ private:
     // In the below vector, index == compiled model's input/output port idex.
     std::vector<ToSubmodel> m_inputs_to_submodels_inputs;
     std::vector<ToSubmodel> m_outputs_to_submodels_outputs;
-
+    std::map<uint32_t, uint32_t> m_pipeline_global_inputs;
+    std::map<uint32_t, uint32_t> m_pipeline_global_outputs;
+    std::map<std::string, std::vector<uint32_t>> m_pipeline_global_parameters;
     std::map<std::size_t, std::vector<ToSubmodel>> m_param_subscribers;
 
     std::map<std::pair<size_t /*submodel_idx*/, size_t /*node_idx*/>,  // input ("to")
@@ -264,7 +265,8 @@ private:
                          const ov::npuw::s11n::SubmodelDeserializeCtx& submodel_ctx);
     };
     std::vector<CompiledModelDesc> m_compiled_submodels;
-
+    ov::SoPtr<ov::ICompiledModel> m_compiled_pipeline_model;
+    bool m_using_pipeline_model{false};
     std::function<bool(const ov::SoPtr<ov::ITensor>&, const ov::SoPtr<ov::ITensor>&)> m_acc_check;
     std::string m_ref_device;
 

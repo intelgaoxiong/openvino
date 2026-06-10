@@ -1953,14 +1953,20 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     LOG_DEBUG("Converting KV-cache in prefill model to FP16.");
     prefill_model = cvt_kvcache_to_low_precision(prefill_model, kv_kache_storage_type);
 
+    const ::intel_npu::npuw::llm::GenerateHint generate_hint = m_cfg.get<::intel_npu::NPUW_LLM_GENERATE_HINT>();
+    // G.B. Force single inference submission for prefill model
     auto prefill_config =
         prefill_config_opt.value_or(get_default_prefill_config(prefill_model, npudesc)).as<ov::AnyMap>();
+
+    if (generate_hint == ::intel_npu::npuw::llm::GenerateHint::BEST_PERF) {
+        prefill_config.emplace("NPUW_ONLINE_PIPELINE", "NONE");
+    }
 
     // NB: GENERATE_HINT is only applicable for default generate config!
     if (generate_config_opt.has_value() && npuw_llm_props.count(ov::intel_npu::npuw::llm::generate_hint.name())) {
         OPENVINO_THROW("GENERATE_HINT only works with default generate config!");
     }
-    const ::intel_npu::npuw::llm::GenerateHint generate_hint = m_cfg.get<::intel_npu::NPUW_LLM_GENERATE_HINT>();
+    
     auto generate_config =
         generate_config_opt.value_or(get_default_generate_config(npudesc, generate_hint)).as<ov::AnyMap>();
 
@@ -2578,7 +2584,7 @@ void ov::npuw::LLMCompiledModel::implement_properties() {
                           BIND(npuw::llm::generate_moe_hint, NPUW_LLM_GENERATE_MOE_HINT, get),
                           BIND(npuw::llm::generate_pyramid, NPUW_LLM_GENERATE_PYRAMID, get),
                           BIND(npuw::llm::prefill_chunk_size, NPUW_LLM_PREFILL_CHUNK_SIZE, get),
-                          BIND(npuw::llm::prefill_hint, NPUW_LLM_PREFILL_HINT, getString),
+                          BIND(npuw::llm::prefill_hint, NPUW_LLM_PREFILL_HINT, getString),                                                 
                           BIND(npuw::llm::generate_hint, NPUW_LLM_GENERATE_HINT, getString),
                           BIND(npuw::llm::prefill_attn_hint, NPUW_LLM_PREFILL_ATTENTION_HINT, getString),
                           BIND(npuw::llm::generate_attn_hint, NPUW_LLM_GENERATE_ATTENTION_HINT, getString),

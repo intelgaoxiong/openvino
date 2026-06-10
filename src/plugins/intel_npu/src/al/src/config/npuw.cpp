@@ -47,6 +47,7 @@ void intel_npu::registerNPUWOptions(OptionsDesc& desc) {
     desc.add<NPUW_FUNCALL_FOR_ALL>();
     desc.add<NPUW_PARALLEL_COMPILE>();
     desc.add<NPUW_FUNCALL_ASYNC>();
+    desc.add<NPUW_CONTROLFLOW_EN>();
     desc.add<NPUW_UNFOLD_IREQS>();
     desc.add<NPUW_FALLBACK_EXEC>();
     desc.add<NPUW_WEIGHTS_BANK>();
@@ -67,6 +68,7 @@ void intel_npu::registerNPUWOptions(OptionsDesc& desc) {
 
 void intel_npu::registerNPUWLLMOptions(OptionsDesc& desc) {
     desc.add<NPUW_LLM>();
+    desc.add<NPUW_CONTROLFLOW_EN>();
     desc.add<NPUW_LLM_BATCH_DIM>();
     desc.add<NPUW_LLM_SEQ_LEN_DIM>();
     desc.add<NPUW_LLM_MAX_PROMPT_LEN>();

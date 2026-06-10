@@ -386,6 +386,14 @@ static constexpr ov::Property<bool> funcall_async{"NPUW_FUNCALL_ASYNC"};
 
 /**
  * @brief
+ * Type: bool.
+ * POC for running NPU local inference pipelines with the ControlFlowOp
+ * Default value: true.
+ */
+static constexpr ov::Property<bool> controlflow_enabled{"NPUW_CONTROLFLOW_EN"};
+
+    /**
+ * @brief
  * Type: boolean
  * Create individual infer requests for partitiongs, even repeating.
  * Default value: false.

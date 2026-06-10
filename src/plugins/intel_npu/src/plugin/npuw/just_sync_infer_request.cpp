@@ -222,6 +222,11 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
     m_func_mem_mgr.set_alloc(std::bind(&JustInferRequest::allocMem, this, _1, _2, _3));
     m_func_mem_mgr.assign_memory();
 
+    if (m_npuw_model->m_using_pipeline_model) {
+        m_pipeline_request = m_npuw_model->m_compiled_pipeline_model->create_infer_request();
+        m_pipeline_request_device = "NPU";
+    }
+
     m_closure_update_required = m_npuw_model->m_cfg.get<::intel_npu::NPUW_FOLD>();
     m_use_function_pipelining = m_npuw_model->m_cfg.get<::intel_npu::NPUW_FUNCALL_ASYNC>();
     if (m_use_function_pipelining) {
@@ -421,24 +426,30 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
     connect_subrequests();
     init_gio();
 
-    for (size_t i = 0; i < m_num_submodels; i++) {
-        LOG_VERB("Trying to preemptively set tensors for Subgraph[" << i << "]...");
-        LOG_BLOCK();
-        auto& comp_model_desc = m_npuw_model->m_compiled_submodels[i];
-        // FIXME: figure out our cases and if this should be replaced with &&
-        // Note: replaced_by is utilized below unconditionally
-        if (!comp_model_desc.compiled_model || !comp_model_desc.replaced_by) {
-            continue;
+    if (m_npuw_model->m_using_pipeline_model) {
+        for (size_t i = 0; i < m_num_submodels; i++) {
+            unpack_closure(i, m_pipeline_request);
         }
-        const auto real_idx = comp_model_desc.replaced_by.value();
-        auto& func_desc = m_npuw_model->m_compiled_submodels[real_idx];
+    } else {
+        for (size_t i = 0; i < m_num_submodels; i++) {
+            LOG_VERB("Trying to preemptively set tensors for Subgraph[" << i << "]...");
+            LOG_BLOCK();
+            auto& comp_model_desc = m_npuw_model->m_compiled_submodels[i];
+            // FIXME: figure out our cases and if this should be replaced with &&
+            // Note: replaced_by is utilized below unconditionally
+            if (!comp_model_desc.compiled_model || !comp_model_desc.replaced_by) {
+                continue;
+            }
+            const auto real_idx = comp_model_desc.replaced_by.value();
+            auto& func_desc = m_npuw_model->m_compiled_submodels[real_idx];
 
-        // So - closure update is NOT required, OR the function is SINGLE -
-        // just handle it's closure here and don't do it in runtime
-        if (!m_closure_update_required || func_desc.forced_to_fcall) {
-            unpack_closure(i, m_subrequests[real_idx]);
+            // So - closure update is NOT required, OR the function is SINGLE -
+            // just handle it's closure here and don't do it in runtime
+            if (!m_closure_update_required || func_desc.forced_to_fcall) {
+                unpack_closure(i, m_subrequests[real_idx]);                
+            }
+            LOG_VERB("Done");
         }
-        LOG_VERB("Done");
     }
 
     // Handle spatial dynamic submission
@@ -521,16 +532,29 @@ void ov::npuw::JustInferRequest::set_tensor(const ov::Output<const ov::Node>& po
     // Check if setting output tensor
     for (std::size_t i = 0; i < m_npuw_model->outputs().size(); ++i) {
         if (m_npuw_model->outputs()[i] == port) {
-            const auto& from_submodel = m_npuw_model->m_outputs_to_submodels_outputs.at(i);
-            auto funcall_result_iter = m_funcall_result.find(from_submodel);
-            // This is a tricky case:
-            // 1) We already allocated an output tensor in m_funcall_result via FMM
-            // 2) We got an output tensor from outside
-            // m_funcall_result and m_port_to_tensor aren't connected, thus we will only write
-            // to m_funcall_result, but get_tensor() would return an empty tensor from m_port_to_tensor.
-            // Here we have to set the tensor to function's output, so the function will write to the correct tensor.
-            if (funcall_result_iter != m_funcall_result.end()) {
-                funcall_result_iter->second = tensor;
+            if (!m_npuw_model->m_using_pipeline_model) {
+                const auto& from_submodel = m_npuw_model->m_outputs_to_submodels_outputs.at(i);
+                auto funcall_result_iter = m_funcall_result.find(from_submodel);
+                // This is a tricky case:
+                // 1) We already allocated an output tensor in m_funcall_result via FMM
+                // 2) We got an output tensor from outside
+                // m_funcall_result and m_port_to_tensor aren't connected, thus we will only write
+                // to m_funcall_result, but get_tensor() would return an empty tensor from m_port_to_tensor.
+                // Here we have to set the tensor to function's output, so the function will write to the correct
+                // tensor.
+                if (funcall_result_iter != m_funcall_result.end()) {
+                    funcall_result_iter->second = tensor;
+                }
+            } else {
+                const auto pipeline_output_port_indx{
+                    m_npuw_model->m_pipeline_global_outputs.find(static_cast<uint32_t>(i))};
+
+                if (pipeline_output_port_indx != std::end(m_npuw_model->m_pipeline_global_outputs)) {
+                    auto& oport =
+                        m_npuw_model->m_compiled_pipeline_model->outputs()[pipeline_output_port_indx->second];
+                    
+                    m_pipeline_request->set_tensor(oport, tensor);
+                }               
             }
         }
     }
@@ -641,7 +665,12 @@ void ov::npuw::JustInferRequest::prepare_for_infer() {
     // with constant arguments. The list of heads is empty otherwise.
     for (auto&& id : m_funcall_heads) {
         LOG_DEBUG("Pre-initializing weights for subgraph[" << id << "]");
-        unpack_closure(id, m_subrequests[id]);
+        if (!m_npuw_model->m_using_pipeline_model) {
+            unpack_closure(id, m_subrequests[id]);
+        } else {
+            unpack_closure(id, m_pipeline_request);
+        }
+        
     }
 
     // Adjust spatial input range, if supported
@@ -669,9 +698,13 @@ void ov::npuw::JustInferRequest::prepare_for_infer() {
 }
 
 ov::npuw::IBaseInferRequest::RqPtr ov::npuw::JustInferRequest::get_real_subrequest(std::size_t idx) {
-    auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
-    const auto real_idx = comp_model_desc.replaced_by.value_or(idx);
-    return m_subrequests[real_idx];
+    if (!m_npuw_model->m_using_pipeline_model) {
+        auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
+        const auto real_idx = comp_model_desc.replaced_by.value_or(idx);
+        return m_subrequests[real_idx];
+    }
+
+    return m_pipeline_request;
 }
 
 bool ov::npuw::JustInferRequest::valid_subrequest(std::size_t idx) const {
@@ -700,11 +733,21 @@ void ov::npuw::JustInferRequest::bind_global_parameters(std::size_t idx) {
         // If it is a function call and we have function pipelining ON,
         // it is still the right subrequest we can use.
         LOG_DEBUG("Accessing the primary subrequest");
-        bind_global_params(idx, m_subrequests[real_idx]);
+        if (!m_npuw_model->m_using_pipeline_model) {
+            bind_global_params(idx, m_subrequests[real_idx]);
+        } else {
+            bind_global_params(idx, m_pipeline_request);
+        }
+        
     }
 }
 
 void ov::npuw::JustInferRequest::bind_global_results(std::size_t idx) {
+    if (m_npuw_model->m_using_pipeline_model) {
+        IBaseInferRequest::bind_global_results(idx, m_pipeline_request);
+        return;
+    }
+
     auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
     if (comp_model_desc.replaced_by) {
         // Don't do here - function call will take the right tensor
@@ -1333,80 +1376,90 @@ void ov::npuw::JustInferRequest::setup_hfa_infer_requests(std::size_t real_idx,
 
 void ov::npuw::JustInferRequest::run_subrequest_for_success(std::size_t idx, bool& failover) {
     failover = false;
-    auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
-    auto real_idx = comp_model_desc.replaced_by.value_or(idx);
 
-    // Infer is also fail-safe...
-    bool job_done = false;
-    bool dump_in = false;
-    bool next_prepared = false;
-    while (!job_done) {
-        bool should_recreate = false;
-        if (m_subrequest_devices[real_idx] != *m_npuw_model->m_compiled_submodels[real_idx].device_it) {
-            // This may happen when there's multiple NPUW's infer
-            // requests created and some failure occurs in one of
-            // those before another reaches this point.
-            LOG_INFO("Recreating subrequest[" << real_idx << "] because model was recompiled for "
-                                              << *m_npuw_model->m_compiled_submodels[real_idx].device_it << " device.");
-            recreate_subrequests(real_idx);
-        }
+    if (!m_npuw_model->m_using_pipeline_model) {
+        auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
+        auto real_idx = comp_model_desc.replaced_by.value_or(idx);
 
-        // Feeding the global Parameters is now part of the common
-        // execution pipeline: See how it is done in
-        // `unsafe_run_this_prep_next()`.  Now we only need to bind
-        // the subrequest' outputs to global Results, if relevant.
-        bind_global_results(idx);
-
-        if (comp_model_desc.replaced_by) {
-            function_prologue(idx);
-        }
-        if (!dump_in) {
-            dump_in = true;
-            dump_input_tensors(idx);
-        }
-
-        std::string error_text;
-        try {
-            LOG_DEBUG("Trying to run subrequest[" << idx << "]...");
-            LOG_BLOCK();
-            unsafe_run_this_prep_next(idx, next_prepared);
-            job_done = true;
-            LOG_DEBUG("Done: " << idx << "(exec subrequest)");
-        } catch (const std::exception& ex) {
-            error_text = ex.what();
-            LOG_ERROR("Subgraph [" << idx << "] - FAILED to run infer request:" << std::endl
-                                   << error_text << std::endl);
-            should_recreate = true;
-        } catch (...) {
-            LOG_ERROR("Subgraph [" << idx << "] - FAILED to run infer request: REASON UNKNOWN");
-            should_recreate = true;
-        }
-        if (should_recreate) {
-            // Altering iterators here!! Contracts should be changed!
-            comp_model_desc.device_it++;
-
-            // Check if failover is actually possible
-            if ((m_npuw_model->m_dev_list.cend() == comp_model_desc.device_it) ||
-                !m_npuw_model->m_cfg.get<::intel_npu::NPUW_FALLBACK_EXEC>()) {
-                OPENVINO_THROW("Execution error: \"", error_text, "\" - no fallback possible");
+        // Infer is also fail-safe...
+        bool job_done = false;
+        bool dump_in = false;
+        bool next_prepared = false;
+        while (!job_done) {
+            bool should_recreate = false;
+            if (m_subrequest_devices[real_idx] != *m_npuw_model->m_compiled_submodels[real_idx].device_it) {
+                // This may happen when there's multiple NPUW's infer
+                // requests created and some failure occurs in one of
+                // those before another reaches this point.
+                LOG_INFO("Recreating subrequest[" << real_idx << "] because model was recompiled for "
+                                                  << *m_npuw_model->m_compiled_submodels[real_idx].device_it
+                                                  << " device.");
+                recreate_subrequests(real_idx);
             }
 
-            failover = true;
-            LOG_INFO("- Trying next device...");
-            if (!m_npuw_model->compile_for_success(real_idx)) {
-                OPENVINO_THROW("Execution error: \"", error_text, "\" - failed to recompile the model in runtime");
-            }
-            recreate_subrequests(idx);
-        }
-    }  // while(job_done)
+            // Feeding the global Parameters is now part of the common
+            // execution pipeline: See how it is done in
+            // `unsafe_run_this_prep_next()`.  Now we only need to bind
+            // the subrequest' outputs to global Results, if relevant.
+            bind_global_results(idx);
 
-    if (job_done) {
-        dump_output_tensors(idx);  // FIXME: Called here unconditionally, need to refactor
-        if (is_pipelined(idx) && m_funcall_pipeline[idx].next) {
-            // Swap the next (pipelined, semi-prepared) infer request in the chain
-            // with the default (to be accessed next) one.
-            std::swap(m_subrequests[real_idx], m_funcall_pipeline[real_idx].subrequest);
+            if (comp_model_desc.replaced_by) {
+                function_prologue(idx);
+            }
+            if (!dump_in) {
+                dump_in = true;
+                dump_input_tensors(idx);
+            }
+
+            std::string error_text;
+            try {
+                LOG_DEBUG("Trying to run subrequest[" << idx << "]...");
+                LOG_BLOCK();
+                unsafe_run_this_prep_next(idx, next_prepared);
+                job_done = true;
+                LOG_DEBUG("Done: " << idx << "(exec subrequest)");
+            } catch (const std::exception& ex) {
+                error_text = ex.what();
+                LOG_ERROR("Subgraph [" << idx << "] - FAILED to run infer request:" << std::endl
+                                       << error_text << std::endl);
+                should_recreate = true;
+            } catch (...) {
+                LOG_ERROR("Subgraph [" << idx << "] - FAILED to run infer request: REASON UNKNOWN");
+                should_recreate = true;
+            }
+            if (should_recreate) {
+                // Altering iterators here!! Contracts should be changed!
+                comp_model_desc.device_it++;
+
+                // Check if failover is actually possible
+                if ((m_npuw_model->m_dev_list.cend() == comp_model_desc.device_it) ||
+                    !m_npuw_model->m_cfg.get<::intel_npu::NPUW_FALLBACK_EXEC>()) {
+                    OPENVINO_THROW("Execution error: \"", error_text, "\" - no fallback possible");
+                }
+
+                failover = true;
+                LOG_INFO("- Trying next device...");
+                if (!m_npuw_model->compile_for_success(real_idx)) {
+                    OPENVINO_THROW("Execution error: \"", error_text, "\" - failed to recompile the model in runtime");
+                }
+                recreate_subrequests(idx);
+            }
+        }  // while(job_done)
+
+        if (job_done) {
+            dump_output_tensors(idx);  // FIXME: Called here unconditionally, need to refactor
+            if (is_pipelined(idx) && m_funcall_pipeline[idx].next) {
+                // Swap the next (pipelined, semi-prepared) infer request in the chain
+                // with the default (to be accessed next) one.
+                std::swap(m_subrequests[real_idx], m_funcall_pipeline[real_idx].subrequest);
+            }
         }
+    } else {
+        for (size_t idx{}; idx < m_num_submodels; ++idx) {
+            bind_global_results(idx);
+        }
+                
+        m_pipeline_request->infer();       
     }
 }
 

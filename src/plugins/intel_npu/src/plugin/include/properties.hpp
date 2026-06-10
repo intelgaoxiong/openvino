@@ -183,6 +183,7 @@ private:
         ov::intel_npu::npuw::partitioning::dcoff_with_scale.name(),
         ov::intel_npu::npuw::partitioning::funcall_for_all.name(),
         ov::intel_npu::npuw::funcall_async.name(),
+        ov::intel_npu::npuw::controlflow_enabled.name(),
         ov::intel_npu::npuw::unfold_ireqs.name(),
         ov::intel_npu::npuw::fallback_exec.name(),
         ov::intel_npu::npuw::llm::enabled.name(),

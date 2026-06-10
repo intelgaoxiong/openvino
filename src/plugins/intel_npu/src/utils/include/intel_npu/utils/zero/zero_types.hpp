@@ -196,6 +196,14 @@ public:
         return _impl->pfnCreate3(hContext, hDevice, desc, phGraph, phGraphBuildLog);
     }
 
+    // version 1.17 POC
+    ze_result_t ZE_APICALL pfnCreate4(ze_context_handle_t hContext,
+                                      ze_device_handle_t hDevice,
+                                      _ze_graph_desc_4_t* desc) {
+        throwWhenUnsupported("pfnCreate4", ZE_GRAPH_EXT_VERSION_1_12);
+        return _impl->pfnCreate4(hContext, hDevice, desc);
+    }
+
     ze_result_t ZE_APICALL pfnGetProperties3(ze_graph_handle_t hGraph, ze_graph_properties_3_t* pGraphProperties) {
         throwWhenUnsupported("pfnGetProperties3", ZE_GRAPH_EXT_VERSION_1_12);
         return _impl->pfnGetProperties3(hGraph, pGraphProperties);

@@ -575,6 +575,307 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
         for (std::size_t i = 0u; i < idx_subgraph_to_compile.size(); i++) {
             compile(i);
         }
+
+        const bool m_use_npu_local_pipelining{m_cfg.get<::intel_npu::NPUW_CONTROLFLOW_EN>()};
+
+        if (m_use_npu_local_pipelining && idx_subgraph_to_compile.size() > 1ull) {
+            LOG_WARN("Using NPU local pipelines with ControlFlowOps.");
+            std::cout << "Using NPU local pipelines with ControlFlowOps for inference.\n";
+            auto plugin = get_npuw_plugin();          
+            auto core = plugin->get_core();
+            auto npuw_plugin = std::dynamic_pointer_cast<const ::intel_npu::Plugin>(plugin);
+                               
+            std::vector<::intel_npu::elf_binary> elf_blobs{};
+            const auto m_num_submodels{idx_subgraph_to_compile.size()};
+            elf_blobs.reserve(m_num_submodels);
+            std::map<std::size_t, std::deque<std::size_t>> submodel_to_blob_mapping{};
+           
+
+            for (std::size_t i = 0; i < m_compiled_submodels.size(); i++) {
+                auto& comp_model_desc = m_compiled_submodels[i];
+                const auto real_idx = comp_model_desc.replaced_by.value_or(i);
+                submodel_to_blob_mapping[real_idx].push_back(i);
+
+                if (!comp_model_desc.compiled_model && (i != comp_model_desc.replaced_by)) {
+                    continue;  // Optimized out
+                }
+
+                std::stringstream model_stream;
+                comp_model_desc.compiled_model->export_model(model_stream);
+                std::string model_str{model_stream.str()};
+                std::vector<uint8_t> buffer(model_str.begin(), model_str.end());
+
+                
+                std::stringstream global_io_mapping_param{};
+                global_io_mapping_param << "[INLINE]";
+
+                auto create_global_io_mapping = [&](std::vector<ToSubmodel>& submodel_mapping, std::string io_marker) {
+                    uint32_t global_io_port{};
+
+                    for (auto& global_io : submodel_mapping) {
+                        const auto target_submodel_index{global_io.first};
+                        const auto target_submodel_port{global_io.second};
+
+                        if (target_submodel_index == i) {
+                            global_io_mapping_param << "\n"
+                                                    << io_marker << global_io_port << ":" << target_submodel_port;
+                        }
+                        global_io_port++;
+                    }
+                };
+
+                create_global_io_mapping(m_inputs_to_submodels_inputs, "i");
+                create_global_io_mapping(m_outputs_to_submodels_outputs, "o");
+                auto global_io_mapping_parameters{global_io_mapping_param.str()};
+
+                npuw_plugin->schedule_builder_proceed(buffer,
+                                                      ::intel_npu::BuilderOption::io_global,
+                                                      global_io_mapping_parameters); 
+              
+                elf_blobs.push_back(buffer);                                 
+            }
+
+            size_t prev_submodel_index{~0ull};
+
+            uint32_t elf_index{};
+            using size_t_pair = std::map<size_t, size_t>;
+
+            size_t_pair submodel_to_elf_mapping{};
+            std::map<size_t, size_t_pair> submodel_io_reuse;
+            std::map<size_t, size_t_pair> submodel_io_reuse_new_output_ports;
+
+            std::stringstream io_consolidate_params{};
+            io_consolidate_params << "[INLINE]";
+
+            for (auto& blob_mapping : submodel_to_blob_mapping) {
+                const auto blob_index{blob_mapping.first};
+                const auto& blob_submodels{blob_mapping.second};
+                std::map<std::pair<size_t, size_t>, size_t> prev_submodel_io_mapping{};
+
+                auto& comp_model_desc = m_compiled_submodels[blob_index];
+                auto& inputs{comp_model_desc.compiled_model->inputs()};
+                auto& outputs{comp_model_desc.compiled_model->outputs()};
+
+                const auto input_ports{inputs.size()};
+                const auto output_ports{outputs.size()};
+
+                // Create IO reuse parameters
+                if (blob_submodels.size() > 1ull) {
+                    const auto last_submodel_index{blob_submodels.back()};
+
+                    size_t_pair submodel_index_lut{};
+                    size_t_pair connected_inputs{};
+                    size_t_pair connected_outputs{};
+
+                    {
+                        size_t position{};
+                        for (auto indx : blob_submodels) {
+                            submodel_index_lut[indx] = position++;
+                        }
+                    }
+
+                    const auto submodel_index_lut_it_end{std::end(submodel_index_lut)};
+                    size_t_pair blob_input_output_mapping{};
+
+                    for (const auto& kvp : m_submodels_input_to_prev_output) {
+                        const auto& subm_idx_to{kvp.first.first};
+                        const auto& port_idx_to{kvp.first.second};
+                        const auto& subm_idx_from{kvp.second.first};
+                        const auto& port_idx_from{kvp.second.second};
+
+                        auto to_submodel_it{submodel_index_lut.find(subm_idx_to)};
+                        auto from_submodel_it{submodel_index_lut.find(subm_idx_from)};
+
+                        if (to_submodel_it != submodel_index_lut_it_end &&
+                            from_submodel_it != submodel_index_lut_it_end) {
+                            blob_input_output_mapping[port_idx_from] = port_idx_to;
+                            connected_inputs[port_idx_to] = port_idx_to;
+                            connected_outputs[port_idx_from] = port_idx_from;
+                        }
+
+                        if (prev_submodel_index == subm_idx_from && to_submodel_it != submodel_index_lut_it_end) {
+                            prev_submodel_io_mapping[std::pair<size_t, size_t>{subm_idx_from, port_idx_from}] =
+                                port_idx_to;
+                            connected_inputs[port_idx_to] = port_idx_to;
+                        }
+                    }
+
+                    {
+                        std::stringstream io_reuse_params{};
+                        io_reuse_params << "[INLINE]";
+
+                        for (auto& io_port : blob_input_output_mapping) {
+                            io_reuse_params << "\n" << io_port.first << ":" << io_port.second;
+                        }
+
+                        submodel_io_reuse[last_submodel_index] = blob_input_output_mapping;
+
+                        npuw_plugin->schedule_builder_proceed(elf_blobs[elf_index],
+                                                              ::intel_npu::BuilderOption::io_reuse,
+                                                              io_reuse_params.str());                         
+                    }
+
+                    {
+                        std::stringstream io_iterate_params{};
+                        io_iterate_params << "[INLINE]\nloop:" << blob_submodels.size();
+
+                        auto get_duplicate_io_range =
+                            [&](const size_t& ports, size_t_pair& connected_ports, const std::string& direction, bool is_output) {
+                                size_t start_port{~0ull};
+                                size_t prev_port{};
+                                std::map<size_t, size_t> port_index_mapping;
+
+                                if (is_output) {
+                                    size_t out_indx{};
+
+                                    for (size_t indx{}; indx < ports; ++indx) {
+                                        auto port_it{connected_ports.find(indx)};
+                                        port_index_mapping[indx] = out_indx;
+
+                                        if (port_it == std::end(connected_ports)) {
+                                            out_indx++;
+                                        }
+                                        else {
+                                            port_index_mapping[indx] = ~0ull;
+                                        }
+                                    }
+                                } else {
+                                    for (size_t indx{}; indx < ports; ++indx) {
+                                        port_index_mapping[indx] = indx;
+                                    }
+                                }
+
+                                for (size_t indx{}; indx < ports; ++indx) {
+                                    auto input_it{connected_ports.find(indx)};
+
+                                    if (input_it == std::end(connected_ports)) {
+                                        if (start_port == ~0ull) {
+                                            start_port = indx;
+                                            prev_port = indx;
+                                        } else if (indx == (ports - 1ull)) {
+                                            io_iterate_params << "\n"
+                                                              << direction << port_index_mapping[start_port] << ":"
+                                                              << port_index_mapping[indx];
+                                            start_port = ~0ull;
+                                        } else if ((prev_port + 1ull) == indx) {
+                                            prev_port = indx;
+                                        }
+                                    } else if (start_port != ~0ull) {
+                                        io_iterate_params << "\n"
+                                                          << direction << port_index_mapping[start_port] << ":"
+                                                          << port_index_mapping[prev_port];
+                                        start_port = ~0ull;
+                                    }
+                                }
+
+                                if (start_port != ~0ull) {
+                                    io_iterate_params << "\n"
+                                                      << direction << port_index_mapping[start_port] << ":"
+                                                      << port_index_mapping[prev_port];
+                                    start_port = ~0ull;
+                                }
+
+                                return port_index_mapping;
+                            };
+
+                        get_duplicate_io_range(input_ports, connected_inputs, "i", false);
+                        auto output_port_index_mapping{
+                            get_duplicate_io_range(output_ports, connected_outputs, "o", true)};
+
+                        submodel_io_reuse_new_output_ports[last_submodel_index] = output_port_index_mapping;
+
+                        npuw_plugin->schedule_builder_proceed(elf_blobs[elf_index],
+                                                              ::intel_npu::BuilderOption::io_iterate,
+                                                              io_iterate_params.str());                        
+                    }
+                }
+
+                if (!prev_submodel_io_mapping.size() && prev_submodel_index != ~0ull) {
+                    for (const auto& kvp : m_submodels_input_to_prev_output) {
+                        const auto& subm_idx_to{kvp.first.first};
+                        const auto& port_idx_to{kvp.first.second};
+                        const auto& subm_idx_from{kvp.second.first};
+                        const auto& port_idx_from{kvp.second.second};
+
+                        if (blob_index == subm_idx_to) {
+                            prev_submodel_io_mapping[std::pair<size_t, size_t>{subm_idx_from, port_idx_from}] =
+                                port_idx_to;
+                        }
+                    }
+                }
+
+                for (auto indx : blob_submodels) {
+                    submodel_to_elf_mapping[indx] = elf_index;
+                    prev_submodel_index = indx;
+                }
+
+                if (prev_submodel_io_mapping.size()) {
+                    size_t prev_src_elf_index{~0ull};
+
+                    for (auto io : prev_submodel_io_mapping) {
+                        const auto src_blob_index{io.first.first};
+                        const auto src_elf_index{submodel_to_elf_mapping[src_blob_index]};
+
+                        auto src_output_port{io.first.second};
+                        std::string src_port_str{"o"};
+
+                        const auto dst_input_port{io.second};
+
+                        auto src_reuse_it{submodel_io_reuse.find(src_blob_index)};
+                        auto src_reuse_out_port_it{submodel_io_reuse_new_output_ports.find(src_blob_index)};
+
+                        if (src_reuse_it != std::end(submodel_io_reuse)) {
+                            auto output_it{src_reuse_it->second.find(src_output_port)};
+
+                            if (output_it != std::end(src_reuse_it->second)) {
+                                src_output_port = output_it->second;
+                                src_port_str = "i";
+                            }
+                        } else if (src_reuse_out_port_it != std::end(submodel_io_reuse_new_output_ports)) {
+                            auto output_it{src_reuse_out_port_it->second.find(src_output_port)};
+
+                            if (output_it != std::end(src_reuse_out_port_it->second)) {
+                                src_output_port = output_it->second;                                
+                            }
+                        }
+
+                        if (prev_src_elf_index != src_elf_index) {
+                            io_consolidate_params << "\ns" << src_elf_index << ":s" << elf_index;
+                        }
+
+                        io_consolidate_params << "\n" << src_port_str << src_output_port << ":i" << dst_input_port;
+                        prev_src_elf_index = src_elf_index;
+                    }
+                }
+                elf_index++;
+            }
+
+            // Final ELF fusion pass          
+            auto io_consolidate_parameter{io_consolidate_params.str()};
+              
+            {
+                std::vector<::intel_npu::BuilderOption> options(2);
+                options[0] = ::intel_npu::BuilderOption::fuse_elf;
+                options[1] = ::intel_npu::BuilderOption::io_consolidate;
+                std::vector<std::string> option_parameters(2);
+                option_parameters[1] = io_consolidate_parameter;
+                npuw_plugin->schedule_builder_proceed(elf_blobs, options, option_parameters);
+            }
+            auto& pipeline_blob{elf_blobs[0]};          
+            
+            npuw_plugin->schedule_builder_get_io_mapping(pipeline_blob,
+                                                         m_pipeline_global_inputs,
+                                                         m_pipeline_global_outputs,
+                                                         m_pipeline_global_parameters);            
+            
+            std::string blob_str(std::begin(pipeline_blob), std::end(pipeline_blob));
+            std::istringstream model_stream(blob_str);
+            
+            ov::AnyMap properties{};
+            properties["NPU_IMPORT_RAW_BLOB"] = true;
+            m_compiled_pipeline_model = core->import_model(model_stream, get_context(), properties);
+            m_using_pipeline_model = true;          
+        }
     }
 
     // Finalize memory in closures and weight banks
@@ -2521,6 +2822,7 @@ void ov::npuw::CompiledModel::implement_properties() {
                           BIND(npuw::partitioning::attn_hfa_fused, NPUW_ATTN_HFA_FUSED),
                           BIND(npuw::parallel_compilation, NPUW_PARALLEL_COMPILE),
                           BIND(npuw::funcall_async, NPUW_FUNCALL_ASYNC),
+                          BIND(npuw::controlflow_enabled, NPUW_CONTROLFLOW_EN),
                           BIND(npuw::unfold_ireqs, NPUW_UNFOLD_IREQS),
                           BIND(npuw::weights_bank, NPUW_WEIGHTS_BANK),
                           BIND(npuw::weights_bank_alloc, NPUW_WEIGHTS_BANK_ALLOC),

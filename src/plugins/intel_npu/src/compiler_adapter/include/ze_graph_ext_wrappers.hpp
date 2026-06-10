@@ -38,7 +38,7 @@ public:
     ~ZeGraphExtWrappers();
 
     std::unordered_set<std::string> queryGraph(SerializedIR serializedIR, const std::string& buildFlags) const;
-
+    
     GraphDescriptor getGraphDescriptor(SerializedIR serializedIR,
                                        const std::string& buildFlags,
                                        const bool bypassUmdCache = false) const;

@@ -538,6 +538,7 @@ ov::SoPtr<ov::ITensor> ZeroInferRequest::get_tensor(const ov::Output<const ov::N
     OV_ITT_SCOPED_TASK(itt::domains::LevelZeroBackend, "get_tensor");
 
     auto foundPort = find_port(port);
+
     OPENVINO_ASSERT(foundPort.found(), "Cannot find tensor for port ", port);
 
     const size_t ioIndex = foundPort.idx;

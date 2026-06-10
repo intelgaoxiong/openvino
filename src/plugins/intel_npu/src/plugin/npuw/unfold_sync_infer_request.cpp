@@ -7,9 +7,15 @@
 #include "compiled_model.hpp"
 #include "logging.hpp"
 #include "openvino/core/parallel.hpp"
+#include "JLPAPI.hpp"
 
 ov::npuw::UnfoldInferRequest::UnfoldInferRequest(const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model)
-    : ov::npuw::IBaseInferRequest(compiled_model) {
+    : ov::npuw::IBaseInferRequest(compiled_model) { 
+
+    if (m_npuw_model->m_using_pipeline_model) {
+        m_pipeline_request = m_npuw_model->m_compiled_pipeline_model->create_infer_request();
+        m_pipeline_request_device = "NPU";
+    }
     // Create infer requests
     // Preallocate funcall tensors & substitute function call requests
     for (std::size_t i = 0; i < m_num_submodels; i++) {
@@ -77,7 +83,11 @@ ov::npuw::UnfoldInferRequest::UnfoldInferRequest(const std::shared_ptr<ov::npuw:
             continue;  // Optimized out
         }
         if (comp_model_desc.replaced_by) {
-            unpack_closure(i, m_subrequests[i]);
+            if (!m_npuw_model->m_using_pipeline_model) {
+                unpack_closure(i, m_subrequests[i]);
+            } else {
+                unpack_closure(i, m_pipeline_request);
+            }
         }
         LOG_VERB("Done");
     }
@@ -94,8 +104,15 @@ void ov::npuw::UnfoldInferRequest::infer() {
         if (idx >= m_subrequests.size()) {
             return;
         }
-        bind_global_params(idx, m_subrequests[idx]);
-        bind_global_results(idx, m_subrequests[idx]);
+
+        if (!m_npuw_model->m_using_pipeline_model) {
+            bind_global_params(idx, m_subrequests[idx]);
+            bind_global_results(idx, m_subrequests[idx]);
+        } else {
+            bind_global_params(idx, m_pipeline_request);
+            bind_global_results(idx, m_pipeline_request);
+        }
+        
     };
     auto wait_and_clear = [](RqPtrs& rqs) {
         for (auto&& r : rqs) {
@@ -105,30 +122,41 @@ void ov::npuw::UnfoldInferRequest::infer() {
     };
 
     if (do_async) {
-        std::size_t past_repl_id = 0u;
-        RqPtrs previous_requests;
-
-        prepare(0);
-        for (std::size_t idx = 0; idx < m_num_submodels; idx++) {
-            auto& subr = m_subrequests[idx];
-            if (!subr) {
+        if (!m_npuw_model->m_using_pipeline_model) {
+            std::size_t past_repl_id = 0u;
+            RqPtrs previous_requests;
+            bool dump_in = false;
+            prepare(0);
+            for (std::size_t idx = 0; idx < m_num_submodels; idx++) {
+                auto& subr = m_subrequests[idx];
+                if (!subr) {
+                    prepare(idx + 1);
+                    continue;
+                }
+                auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
+                const auto this_repl_id = comp_model_desc.replaced_by.value_or(idx);
+                if (this_repl_id != past_repl_id) {
+                    // For non-repeating blocks, the above value_or returns idx
+                    // For repeating blocks, it returns the function group id
+                    // If either is not equal to the past_repl_id, make a barrier here
+                    wait_and_clear(previous_requests);
+                    past_repl_id = this_repl_id;
+                }
+                
+                dump_input_tensors(idx);                
+                subr->start_async();               
+                dump_output_tensors(idx);
+                previous_requests.push_back(subr);
                 prepare(idx + 1);
-                continue;
             }
-            auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
-            const auto this_repl_id = comp_model_desc.replaced_by.value_or(idx);
-            if (this_repl_id != past_repl_id) {
-                // For non-repeating blocks, the above value_or returns idx
-                // For repeating blocks, it returns the function group id
-                // If either is not equal to the past_repl_id, make a barrier here
-                wait_and_clear(previous_requests);
-                past_repl_id = this_repl_id;
+            wait_and_clear(previous_requests);
+        } else {
+            for (std::size_t idx = 0; idx < m_num_submodels; idx++) {
+                prepare(idx);
             }
-            subr->start_async();
-            previous_requests.push_back(subr);
-            prepare(idx + 1);
+          
+            m_pipeline_request->infer();            
         }
-        wait_and_clear(previous_requests);
     } else {
         prepare(0);
         for (std::size_t idx = 0; idx < m_num_submodels; idx++) {

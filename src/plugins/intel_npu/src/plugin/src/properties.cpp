@@ -617,6 +617,7 @@ void Properties::registerPluginProperties() {
     TRY_REGISTER_SIMPLE_PROPERTY(ov::intel_npu::npuw::partitioning::dcoff_with_scale, NPUW_DCOFF_SCALE);
     TRY_REGISTER_SIMPLE_PROPERTY(ov::intel_npu::npuw::partitioning::funcall_for_all, NPUW_FUNCALL_FOR_ALL);
     TRY_REGISTER_SIMPLE_PROPERTY(ov::intel_npu::npuw::funcall_async, NPUW_FUNCALL_ASYNC);
+    TRY_REGISTER_SIMPLE_PROPERTY(ov::intel_npu::npuw::controlflow_enabled, NPUW_CONTROLFLOW_EN);
     TRY_REGISTER_SIMPLE_PROPERTY(ov::intel_npu::npuw::unfold_ireqs, NPUW_UNFOLD_IREQS);
     TRY_REGISTER_SIMPLE_PROPERTY(ov::intel_npu::npuw::fallback_exec, NPUW_FALLBACK_EXEC);
     TRY_REGISTER_SIMPLE_PROPERTY(ov::intel_npu::npuw::llm::enabled, NPUW_LLM);

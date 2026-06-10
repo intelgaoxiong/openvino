@@ -113,7 +113,8 @@ void CompiledModel::export_model(std::ostream& stream) const {
     }
 }
 
-std::shared_ptr<const ov::Model> CompiledModel::get_runtime_model() const {
+
+ std::shared_ptr<const ov::Model> CompiledModel::get_runtime_model() const {
     ov::ParameterVector parameters;
     ov::ResultVector results;
     std::shared_ptr<const ov::Model> dummyModel;

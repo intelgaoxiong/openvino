@@ -32,6 +32,7 @@ public:
     bool is_option_supported(std::string optName, std::optional<std::string> optValue = std::nullopt) const override;
 
     uint32_t get_version() const override;
+    //std::shared_ptr<IGraph> import_precompiled(const void* blobData, size_t blobSize);
 
 private:
     std::shared_ptr<ZeroInitStructsHolder> _zeroInitStruct;
