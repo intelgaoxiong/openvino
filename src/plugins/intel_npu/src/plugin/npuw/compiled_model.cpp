@@ -591,12 +591,19 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
             std::map<std::size_t, std::deque<std::size_t>> submodel_to_blob_mapping{};
            
 
+            std::cout << "\n[NLP] ========== submodel_to_blob_mapping ==========\n";
             for (std::size_t i = 0; i < m_compiled_submodels.size(); i++) {
                 auto& comp_model_desc = m_compiled_submodels[i];
                 const auto real_idx = comp_model_desc.replaced_by.value_or(i);
                 submodel_to_blob_mapping[real_idx].push_back(i);
+                std::cout << "  submodel[" << i << "] -> blob_index=" << real_idx
+                          << (comp_model_desc.replaced_by.has_value() && comp_model_desc.replaced_by != i
+                                  ? " (funcall)"
+                                  : " (body)")
+                          << "\n";
 
                 if (!comp_model_desc.compiled_model && (i != comp_model_desc.replaced_by)) {
+                    std::cout << "  submodel[" << i << "] optimized out, skip\n";
                     continue;  // Optimized out
                 }
 
@@ -628,6 +635,9 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                 create_global_io_mapping(m_outputs_to_submodels_outputs, "o");
                 auto global_io_mapping_parameters{global_io_mapping_param.str()};
 
+                std::cout << "\n[NLP] --- io_global for submodel[" << i << "] ---\n"
+                          << global_io_mapping_parameters << "\n";
+
                 npuw_plugin->schedule_builder_proceed(buffer,
                                                       ::intel_npu::BuilderOption::io_global,
                                                       global_io_mapping_parameters); 
@@ -658,6 +668,12 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
 
                 const auto input_ports{inputs.size()};
                 const auto output_ports{outputs.size()};
+
+                std::cout << "\n[NLP] ========== Processing ELF elf_index=" << elf_index
+                          << " (blob_index=" << blob_index << ")";
+                std::cout << "  funcalls={";
+                for (auto idx : blob_submodels) std::cout << idx << ",";
+                std::cout << "}  inputs=" << input_ports << "  outputs=" << output_ports << "\n";
 
                 // Create IO reuse parameters
                 if (blob_submodels.size() > 1ull) {
@@ -709,6 +725,10 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                         }
 
                         submodel_io_reuse[last_submodel_index] = blob_input_output_mapping;
+
+                        std::cout << "\n[NLP] --- io_reuse for ELF[" << elf_index << "] ---\n"
+                                  << io_reuse_params.str() << "\n";
+                        std::cout << "  (output port X -> input port Y: same buffer, no copy between iterations)\n";
 
                         npuw_plugin->schedule_builder_proceed(elf_blobs[elf_index],
                                                               ::intel_npu::BuilderOption::io_reuse,
@@ -784,6 +804,16 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
 
                         submodel_io_reuse_new_output_ports[last_submodel_index] = output_port_index_mapping;
 
+                        std::cout << "\n[NLP] --- io_iterate for ELF[" << elf_index << "] ---\n"
+                                  << io_iterate_params.str() << "\n";
+                        std::cout << "  output port remapping (orig->new, ~0=removed by reuse):\n";
+                        for (auto& kv : output_port_index_mapping) {
+                            if (kv.second == static_cast<size_t>(~0ull))
+                                std::cout << "    orig_out[" << kv.first << "] -> REMOVED (reused as input)\n";
+                            else
+                                std::cout << "    orig_out[" << kv.first << "] -> new_out[" << kv.second << "]\n";
+                        }
+
                         npuw_plugin->schedule_builder_proceed(elf_blobs[elf_index],
                                                               ::intel_npu::BuilderOption::io_iterate,
                                                               io_iterate_params.str());                        
@@ -841,9 +871,14 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
 
                         if (prev_src_elf_index != src_elf_index) {
                             io_consolidate_params << "\ns" << src_elf_index << ":s" << elf_index;
+                            std::cout << "[NLP]   io_consolidate: ELF[" << src_elf_index << "] -> ELF[" << elf_index << "]\n";
                         }
 
                         io_consolidate_params << "\n" << src_port_str << src_output_port << ":i" << dst_input_port;
+                        std::cout << "[NLP]   io_consolidate: ELF[" << src_elf_index << "] "
+                                  << src_port_str << src_output_port
+                                  << (src_port_str == "i" ? " (reused input, was output)" : " (output)")
+                                  << " -> ELF[" << elf_index << "] i" << dst_input_port << "\n";
                         prev_src_elf_index = src_elf_index;
                     }
                 }
@@ -852,6 +887,11 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
 
             // Final ELF fusion pass          
             auto io_consolidate_parameter{io_consolidate_params.str()};
+
+            std::cout << "\n[NLP] ========== io_consolidate (full) ==========\n"
+                      << io_consolidate_parameter << "\n";
+            std::cout << "[NLP] Calling fuse_elf + io_consolidate on "
+                      << elf_blobs.size() << " ELF blobs\n";
               
             {
                 std::vector<::intel_npu::BuilderOption> options(2);
@@ -866,7 +906,21 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
             npuw_plugin->schedule_builder_get_io_mapping(pipeline_blob,
                                                          m_pipeline_global_inputs,
                                                          m_pipeline_global_outputs,
-                                                         m_pipeline_global_parameters);            
+                                                         m_pipeline_global_parameters);
+
+            std::cout << "\n[NLP] ========== pipeline global I/O mapping ==========\n";
+            std::cout << "  global_inputs (model_input_idx -> pipeline_blob_port):\n";
+            for (auto& kv : m_pipeline_global_inputs)
+                std::cout << "    global_in[" << kv.first << "] -> blob_port[" << kv.second << "]\n";
+            std::cout << "  global_outputs (model_output_idx -> pipeline_blob_port):\n";
+            for (auto& kv : m_pipeline_global_outputs)
+                std::cout << "    global_out[" << kv.first << "] -> blob_port[" << kv.second << "]\n";
+            std::cout << "  global_parameters (weight_name -> [iter0_port, iter1_port, ...]):\n";
+            for (auto& kv : m_pipeline_global_parameters) {
+                std::cout << "    \"" << kv.first << "\" -> [";
+                for (auto p : kv.second) std::cout << p << ",";
+                std::cout << "]\n";
+            }            
             
             std::string blob_str(std::begin(pipeline_blob), std::end(pipeline_blob));
             std::istringstream model_stream(blob_str);
