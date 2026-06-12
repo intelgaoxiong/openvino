@@ -103,6 +103,8 @@ protected:
     std::shared_ptr<ov::npuw::CompiledModel> m_npuw_model;
     std::vector<IBaseInferRequest::Completed> m_completion_cbs;
     RqPtrs m_subrequests;
+    RqPtr m_pipeline_request;
+    std::string m_pipeline_request_device;
 
     struct TensorStorage {
         ov::SoPtr<ov::ITensor> tensor;
@@ -189,6 +191,7 @@ protected:
 
     void dump_input_tensors(std::size_t idx);
     void dump_output_tensors(std::size_t idx);
+    void dump_pipeline_tensors(const std::string& output_dir, const bool dump_input);
 
     // Quick-and-dirty profiling
     using MS = ov::npuw::perf::metric<ov::npuw::perf::MSec>;
