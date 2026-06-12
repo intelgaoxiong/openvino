@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 
 #include "accuracy/comparator.hpp"
@@ -731,6 +733,423 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
         ov::parallel_for(idx_subgraph_to_compile.size(), compile);
     } else {
         ov::npuw::util::non_parallel_for(idx_subgraph_to_compile.size(), compile);
+    }
+
+    const bool m_use_npu_local_pipelining{m_cfg.get<::intel_npu::NPUW_CONTROLFLOW_EN>()};
+
+    if (m_use_npu_local_pipelining && idx_subgraph_to_compile.size() > 1ull) {
+        LOG_WARN("Using NPU local pipelines with ControlFlowOps.");
+        std::cout << "Using NPU local pipelines with ControlFlowOps for inference.\n";
+        auto plugin = get_npuw_plugin();
+        auto core = plugin->get_core();
+        auto npuw_plugin = std::dynamic_pointer_cast<const ::intel_npu::Plugin>(plugin);
+
+        std::vector<::intel_npu::elf_binary> elf_blobs{};
+        const auto m_num_submodels{idx_subgraph_to_compile.size()};
+        elf_blobs.reserve(m_num_submodels);
+        std::map<std::size_t, std::deque<std::size_t>> submodel_to_blob_mapping{};
+
+        std::cout << "\n[NLP] ========== submodel_to_blob_mapping ==========\n";
+        for (std::size_t i = 0; i < m_compiled_submodels.size(); i++) {
+            auto& comp_model_desc = m_compiled_submodels[i];
+            // Multiple submodels with the same replaced_by index share one compiled ELF body (funcall mechanism).
+            // submodel_to_blob_mapping groups them: key = body submodel index, value = all funcall indices.
+            // e.g., blob_index=0 -> {0,1,...,31} for 32 transformer layers sharing one compiled ELF.
+            const auto real_idx = comp_model_desc.replaced_by.value_or(i);
+            submodel_to_blob_mapping[real_idx].push_back(i);
+            std::cout << "  submodel[" << i << "] -> blob_index=" << real_idx
+                      << (comp_model_desc.replaced_by.has_value() && comp_model_desc.replaced_by != i
+                              ? " (funcall)"
+                              : " (body)")
+                      << "\n";
+
+            if (!comp_model_desc.compiled_model && (i != comp_model_desc.replaced_by)) {
+                std::cout << "  submodel[" << i << "] optimized out, skip\n";
+                continue;  // Optimized out
+            }
+
+            std::stringstream model_stream;
+            comp_model_desc.compiled_model->export_model(model_stream);
+            std::string model_str{model_stream.str()};
+            std::vector<uint8_t> buffer(model_str.begin(), model_str.end());
+
+            std::stringstream global_io_mapping_param{};
+            global_io_mapping_param << "[INLINE]";
+
+            // io_global: tells the JLP driver which local ports of this ELF correspond to the
+            // model's global I/O ports.  This mapping is STATIC - it uses the original pre-transform
+            // port numbers and does NOT change across iterations.  io_global is applied before
+            // io_reuse/io_iterate so all port references here are the raw ELF port indices.
+            // The driver preserves these associations in the fused blob; after fuse_elf the
+            // io_mapping pass embeds "#GI[N]" / "#GO[N]" markers in the port-name text so that
+            // schedule_builder_get_io_mapping() can later extract m_pipeline_global_inputs /
+            // m_pipeline_global_outputs.
+            auto create_global_io_mapping = [&](std::vector<ToSubmodel>& submodel_mapping, std::string io_marker) {
+                uint32_t global_io_port{};
+
+                for (auto& global_io : submodel_mapping) {
+                    const auto target_submodel_index{global_io.first};
+                    const auto target_submodel_port{global_io.second};
+
+                    if (target_submodel_index == i) {
+                        global_io_mapping_param << "\n"
+                                                << io_marker << global_io_port << ":" << target_submodel_port;
+                    }
+                    global_io_port++;
+                }
+            };
+
+            create_global_io_mapping(m_inputs_to_submodels_inputs, "i");
+            create_global_io_mapping(m_outputs_to_submodels_outputs, "o");
+            auto global_io_mapping_parameters{global_io_mapping_param.str()};
+
+            std::cout << "\n[NLP] --- io_global for submodel[" << i << "] ---\n"
+                      << global_io_mapping_parameters << "\n";
+
+            npuw_plugin->schedule_builder_proceed(buffer,
+                                                  ::intel_npu::BuilderOption::io_global,
+                                                  global_io_mapping_parameters);
+
+            elf_blobs.push_back(buffer);
+        }
+
+        size_t prev_submodel_index{~0ull};
+
+        uint32_t elf_index{};
+        using size_t_pair = std::map<size_t, size_t>;
+
+        size_t_pair submodel_to_elf_mapping{};
+        std::map<size_t, size_t_pair> submodel_io_reuse;
+        std::map<size_t, size_t_pair> submodel_io_reuse_new_output_ports;
+
+        std::stringstream io_consolidate_params{};
+        io_consolidate_params << "[INLINE]";
+
+        for (auto& blob_mapping : submodel_to_blob_mapping) {
+            const auto blob_index{blob_mapping.first};
+            const auto& blob_submodels{blob_mapping.second};
+            std::map<std::pair<size_t, size_t>, size_t> prev_submodel_io_mapping{};
+
+            auto& comp_model_desc = m_compiled_submodels[blob_index];
+            auto& inputs{comp_model_desc.compiled_model->inputs()};
+            auto& outputs{comp_model_desc.compiled_model->outputs()};
+
+            const auto input_ports{inputs.size()};
+            const auto output_ports{outputs.size()};
+
+            std::cout << "\n[NLP] ========== Processing ELF elf_index=" << elf_index
+                      << " (blob_index=" << blob_index << ")";
+            std::cout << "  funcalls={";
+            for (auto idx : blob_submodels) std::cout << idx << ",";
+            std::cout << "}  inputs=" << input_ports << "  outputs=" << output_ports << "\n";
+
+            // Create IO reuse parameters
+            if (blob_submodels.size() > 1ull) {
+                const auto last_submodel_index{blob_submodels.back()};
+
+                // submodel_index_lut: maps submodel index -> position within this funcall group.
+                // Used to distinguish intra-group connections (same ELF, loop-back)
+                // from inter-group connections (cross-ELF, handled by io_consolidate).
+                size_t_pair submodel_index_lut{};
+
+                // connected_inputs / connected_outputs: ports that are internally consumed.
+                // Ports in these sets are excluded from io_iterate's per-iteration weight range ("i" declaration).
+                // connected_inputs collects TWO types:
+                //   (1) io_reuse loop-back ports: output[X] feeds back into input[Y] same buffer
+                //   (2) cross-ELF incoming ports: prev-ELF output connects to this ELF's input
+                // Both types must be excluded so that only true weight-bank ports appear in io_iterate.
+                size_t_pair connected_inputs{};
+                size_t_pair connected_outputs{};
+
+                {
+                    size_t position{};
+                    for (auto indx : blob_submodels) {
+                        submodel_index_lut[indx] = position++;
+                    }
+                }
+
+                const auto submodel_index_lut_it_end{std::end(submodel_index_lut)};
+                // blob_input_output_mapping: output_port -> input_port for intra-group (io_reuse) connections.
+                // Each entry represents: "output[X] and input[Y] share the same buffer" - the driver
+                // allocates a single buffer and binds it to both ports so no copy is needed between iterations.
+                size_t_pair blob_input_output_mapping{};
+
+                for (const auto& kvp : m_submodels_input_to_prev_output) {
+                    const auto& subm_idx_to{kvp.first.first};
+                    const auto& port_idx_to{kvp.first.second};
+                    const auto& subm_idx_from{kvp.second.first};
+                    const auto& port_idx_from{kvp.second.second};
+
+                    auto to_submodel_it{submodel_index_lut.find(subm_idx_to)};
+                    auto from_submodel_it{submodel_index_lut.find(subm_idx_from)};
+
+                    if (to_submodel_it != submodel_index_lut_it_end &&
+                        from_submodel_it != submodel_index_lut_it_end) {
+                        blob_input_output_mapping[port_idx_from] = port_idx_to;
+                        connected_inputs[port_idx_to] = port_idx_to;
+                        connected_outputs[port_idx_from] = port_idx_from;
+                    }
+
+                    if (prev_submodel_index == subm_idx_from && to_submodel_it != submodel_index_lut_it_end) {
+                        prev_submodel_io_mapping[std::pair<size_t, size_t>{subm_idx_from, port_idx_from}] =
+                            port_idx_to;
+                        connected_inputs[port_idx_to] = port_idx_to;
+                    }
+                }
+
+                {
+                    std::stringstream io_reuse_params{};
+                    io_reuse_params << "[INLINE]";
+
+                    for (auto& io_port : blob_input_output_mapping) {
+                        io_reuse_params << "\n" << io_port.first << ":" << io_port.second;
+                    }
+
+                    submodel_io_reuse[last_submodel_index] = blob_input_output_mapping;
+
+                    // submodel_io_reuse stores the output->input reuse mapping for later use in
+                    // io_consolidate: when a cross-ELF source port has been declared in io_reuse,
+                    // the driver sees it as an input buffer (not an output), so io_consolidate must
+                    // reference it with the "i" prefix instead of "o".
+
+                    std::cout << "\n[NLP] --- io_reuse for ELF[" << elf_index << "] ---\n"
+                              << io_reuse_params.str() << "\n";
+                    std::cout << "  (output port X -> input port Y: same buffer, no copy between iterations)\n";
+
+                    npuw_plugin->schedule_builder_proceed(elf_blobs[elf_index],
+                                                          ::intel_npu::BuilderOption::io_reuse,
+                                                          io_reuse_params.str());
+                }
+
+                {
+                    std::stringstream io_iterate_params{};
+                    io_iterate_params << "[INLINE]\nloop:" << blob_submodels.size();
+
+                    // get_duplicate_io_range: determines which contiguous port ranges to declare in io_iterate.
+                    // For INPUTS (is_output=false):
+                    //   port_index_mapping[i] = i (identity, no renumbering).
+                    //   Ports NOT in connected_inputs are per-iteration weight-bank slots; they form the "i<s>:<e>"
+                    //   ranges.  Both io_reuse loop-back ports and cross-ELF incoming ports are excluded.
+                    // For OUTPUTS (is_output=true):
+                    //   First builds a compact renumbering: io_reuse-consumed ports get ~0ull (REMOVED),
+                    //   remaining ports get sequential new indices 0, 1, 2, ...
+                    //   Then writes "o<new_start>:<new_end>" for contiguous non-removed ranges.
+                    //   This renumbering is critical: io_consolidate must use the NEW port numbers when
+                    //   referencing cross-ELF output connections from this ELF.
+                    auto get_duplicate_io_range =
+                        [&](const size_t& ports, size_t_pair& connected_ports, const std::string& direction, bool is_output) {
+                            size_t start_port{~0ull};
+                            size_t prev_port{};
+                            std::map<size_t, size_t> port_index_mapping;
+
+                            if (is_output) {
+                                size_t out_indx{};
+
+                                for (size_t indx{}; indx < ports; ++indx) {
+                                    auto port_it{connected_ports.find(indx)};
+                                    port_index_mapping[indx] = out_indx;
+
+                                    if (port_it == std::end(connected_ports)) {
+                                        out_indx++;
+                                    } else {
+                                        port_index_mapping[indx] = ~0ull;
+                                    }
+                                }
+                            } else {
+                                for (size_t indx{}; indx < ports; ++indx) {
+                                    port_index_mapping[indx] = indx;
+                                }
+                            }
+
+                            for (size_t indx{}; indx < ports; ++indx) {
+                                auto input_it{connected_ports.find(indx)};
+
+                                if (input_it == std::end(connected_ports)) {
+                                    if (start_port == ~0ull) {
+                                        start_port = indx;
+                                        prev_port = indx;
+                                    } else if (indx == (ports - 1ull)) {
+                                        io_iterate_params << "\n"
+                                                          << direction << port_index_mapping[start_port] << ":"
+                                                          << port_index_mapping[indx];
+                                        start_port = ~0ull;
+                                    } else if ((prev_port + 1ull) == indx) {
+                                        prev_port = indx;
+                                    }
+                                } else if (start_port != ~0ull) {
+                                    io_iterate_params << "\n"
+                                                      << direction << port_index_mapping[start_port] << ":"
+                                                      << port_index_mapping[prev_port];
+                                    start_port = ~0ull;
+                                }
+                            }
+
+                            if (start_port != ~0ull) {
+                                io_iterate_params << "\n"
+                                                  << direction << port_index_mapping[start_port] << ":"
+                                                  << port_index_mapping[prev_port];
+                                start_port = ~0ull;
+                            }
+
+                            return port_index_mapping;
+                        };
+
+                    get_duplicate_io_range(input_ports, connected_inputs, "i", false);
+                    auto output_port_index_mapping{
+                        get_duplicate_io_range(output_ports, connected_outputs, "o", true)};
+
+                    // submodel_io_reuse_new_output_ports stores the orig->new output port mapping
+                    // produced by io_iterate.  io_consolidate reads this map to translate
+                    // a source ELF's original output port number to the renumbered port that
+                    // io_iterate exposed to the outside world.
+                    submodel_io_reuse_new_output_ports[last_submodel_index] = output_port_index_mapping;
+
+                    std::cout << "\n[NLP] --- io_iterate for ELF[" << elf_index << "] ---\n"
+                              << io_iterate_params.str() << "\n";
+                    std::cout << "  output port remapping (orig->new, ~0=removed by reuse):\n";
+                    for (auto& kv : output_port_index_mapping) {
+                        if (kv.second == static_cast<size_t>(~0ull))
+                            std::cout << "    orig_out[" << kv.first << "] -> REMOVED (reused as input)\n";
+                        else
+                            std::cout << "    orig_out[" << kv.first << "] -> new_out[" << kv.second << "]\n";
+                    }
+
+                    npuw_plugin->schedule_builder_proceed(elf_blobs[elf_index],
+                                                          ::intel_npu::BuilderOption::io_iterate,
+                                                          io_iterate_params.str());
+                }
+            }
+
+            if (!prev_submodel_io_mapping.size() && prev_submodel_index != ~0ull) {
+                for (const auto& kvp : m_submodels_input_to_prev_output) {
+                    const auto& subm_idx_to{kvp.first.first};
+                    const auto& port_idx_to{kvp.first.second};
+                    const auto& subm_idx_from{kvp.second.first};
+                    const auto& port_idx_from{kvp.second.second};
+
+                    if (blob_index == subm_idx_to) {
+                        prev_submodel_io_mapping[std::pair<size_t, size_t>{subm_idx_from, port_idx_from}] =
+                            port_idx_to;
+                    }
+                }
+            }
+
+            for (auto indx : blob_submodels) {
+                submodel_to_elf_mapping[indx] = elf_index;
+                prev_submodel_index = indx;
+            }
+
+            if (prev_submodel_io_mapping.size()) {
+                size_t prev_src_elf_index{~0ull};
+
+                for (auto io : prev_submodel_io_mapping) {
+                    const auto src_blob_index{io.first.first};
+                    const auto src_elf_index{submodel_to_elf_mapping[src_blob_index]};
+
+                    auto src_output_port{io.first.second};
+                    std::string src_port_str{"o"};
+
+                    const auto dst_input_port{io.second};
+
+                    auto src_reuse_it{submodel_io_reuse.find(src_blob_index)};
+                    auto src_reuse_out_port_it{submodel_io_reuse_new_output_ports.find(src_blob_index)};
+
+                    // Port-prefix selection for io_consolidate:
+                    //
+                    // Case 1 - source port was declared in io_reuse (output[X] == input[Y], shared buffer):
+                    //   io_iterate marked it as REMOVED from the output list.
+                    //   The driver knows this buffer only by its INPUT side address.
+                    //   -> Switch prefix from "o" to "i" and use the corresponding input port number.
+                    //
+                    // Case 2 - source ELF has io_iterate output renumbering (but this port was NOT reused):
+                    //   io_iterate assigned new sequential indices to surviving output ports.
+                    //   -> Keep "o" prefix but translate port number to the new (compact) index.
+                    if (src_reuse_it != std::end(submodel_io_reuse)) {
+                        auto output_it{src_reuse_it->second.find(src_output_port)};
+
+                        if (output_it != std::end(src_reuse_it->second)) {
+                            src_output_port = output_it->second;
+                            src_port_str = "i";
+                        }
+                    } else if (src_reuse_out_port_it != std::end(submodel_io_reuse_new_output_ports)) {
+                        auto output_it{src_reuse_out_port_it->second.find(src_output_port)};
+
+                        if (output_it != std::end(src_reuse_out_port_it->second)) {
+                            src_output_port = output_it->second;
+                        }
+                    }
+
+                    if (prev_src_elf_index != src_elf_index) {
+                        io_consolidate_params << "\ns" << src_elf_index << ":s" << elf_index;
+                        std::cout << "[NLP]   io_consolidate: ELF[" << src_elf_index << "] -> ELF[" << elf_index << "]\n";
+                    }
+
+                    io_consolidate_params << "\n" << src_port_str << src_output_port << ":i" << dst_input_port;
+                    std::cout << "[NLP]   io_consolidate: ELF[" << src_elf_index << "] "
+                              << src_port_str << src_output_port
+                              << (src_port_str == "i" ? " (reused input, was output)" : " (output)")
+                              << " -> ELF[" << elf_index << "] i" << dst_input_port << "\n";
+                    prev_src_elf_index = src_elf_index;
+                }
+            }
+            elf_index++;
+        }
+
+        // Final ELF fusion pass:
+        // fuse_elf merges all individual ELF blobs into a single pipeline ELF.
+        // io_consolidate is passed as a co-option (same pfnCreate4 call via pNext chaining)
+        // so the driver knows the cross-ELF port wiring while performing the fusion.
+        // After this call elf_blobs[0] contains the complete pipeline ELF blob.
+        auto io_consolidate_parameter{io_consolidate_params.str()};
+
+        std::cout << "\n[NLP] ========== io_consolidate (full) ==========\n"
+                  << io_consolidate_parameter << "\n";
+        std::cout << "[NLP] Calling fuse_elf + io_consolidate on "
+                  << elf_blobs.size() << " ELF blobs\n";
+
+        {
+            std::vector<::intel_npu::BuilderOption> options(2);
+            options[0] = ::intel_npu::BuilderOption::fuse_elf;
+            options[1] = ::intel_npu::BuilderOption::io_consolidate;
+            std::vector<std::string> option_parameters(2);
+            option_parameters[1] = io_consolidate_parameter;
+            npuw_plugin->schedule_builder_proceed(elf_blobs, options, option_parameters);
+        }
+        auto& pipeline_blob{elf_blobs[0]};
+
+        // schedule_builder_get_io_mapping runs the IO_MAPPING pass on the fused pipeline blob.
+        // The driver writes port-name text containing "#GI[N]" / "#GO[N]" markers for global ports
+        // and "iter<k>" suffixes for per-iteration weight ports.  The resulting maps are used at
+        // inference time by:
+        //   m_pipeline_global_inputs  -> bind_global_params() to route model inputs to pipeline ports
+        //   m_pipeline_global_outputs -> just_sync_infer_request::set_tensor() for model outputs
+        //   m_pipeline_global_parameters -> unpack_closure() to bind per-layer weights by iteration index
+        npuw_plugin->schedule_builder_get_io_mapping(pipeline_blob,
+                                                     m_pipeline_global_inputs,
+                                                     m_pipeline_global_outputs,
+                                                     m_pipeline_global_parameters);
+
+        std::cout << "\n[NLP] ========== pipeline global I/O mapping ==========\n";
+        std::cout << "  global_inputs (model_input_idx -> pipeline_blob_port):\n";
+        for (auto& kv : m_pipeline_global_inputs)
+            std::cout << "    global_in[" << kv.first << "] -> blob_port[" << kv.second << "]\n";
+        std::cout << "  global_outputs (model_output_idx -> pipeline_blob_port):\n";
+        for (auto& kv : m_pipeline_global_outputs)
+            std::cout << "    global_out[" << kv.first << "] -> blob_port[" << kv.second << "]\n";
+        std::cout << "  global_parameters (weight_name -> [iter0_port, iter1_port, ...]):\n";
+        for (auto& kv : m_pipeline_global_parameters) {
+            std::cout << "    \"" << kv.first << "\" -> [";
+            for (auto p : kv.second) std::cout << p << ",";
+            std::cout << "]\n";
+        }
+
+        std::string blob_str(std::begin(pipeline_blob), std::end(pipeline_blob));
+        std::istringstream model_stream(blob_str);
+
+        ov::AnyMap properties{};
+        properties["NPU_IMPORT_RAW_BLOB"] = true;
+        m_compiled_pipeline_model = core->import_model(model_stream, get_context(), properties);
+        m_using_pipeline_model = true;
     }
 
     // Finalize memory in closures and weight banks
@@ -2465,6 +2884,7 @@ void ov::npuw::CompiledModel::implement_properties() {
                           BIND(npuw::parallel_compilation, NPUW_PARALLEL_COMPILE),
                           BIND(npuw::ensure_compatibility, NPUW_ENSURE_COMPATIBILITY),
                           BIND(npuw::funcall_async, NPUW_FUNCALL_ASYNC),
+                          BIND(npuw::controlflow_enabled, NPUW_CONTROLFLOW_EN),
                           BIND(npuw::unfold_ireqs, NPUW_UNFOLD_IREQS),
                           BIND(npuw::weights_bank, NPUW_WEIGHTS_BANK),
                           BIND(npuw::weights_bank_alloc, NPUW_WEIGHTS_BANK_ALLOC),

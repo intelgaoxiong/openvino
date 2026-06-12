@@ -39,6 +39,7 @@ INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_WEIGHTS_BANK, std::string, "", ov::intel_npu::npu
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_WEIGHTS_BANK_ALLOC, std::string, "", ov::intel_npu::npuw, weights_bank_alloc, "NPUW_WEIGHTS_BANK_ALLOC", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_CACHE_DIR, std::string, "", ov::intel_npu::npuw, cache_dir, "NPUW_CACHE_DIR", ROOT, HIDDEN, UNCACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_FUNCALL_ASYNC, bool, false, ov::intel_npu::npuw, funcall_async, "NPUW_FUNCALL_ASYNC", ROOT, EXPOSED, CACHED, ALL)
+INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_CONTROLFLOW_EN, bool, false, ov::intel_npu::npuw, controlflow_enabled, "NPUW_CONTROLFLOW_EN", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_UNFOLD_IREQS, bool, false, ov::intel_npu::npuw, unfold_ireqs, "NPUW_UNFOLD_IREQS", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_FALLBACK_EXEC, bool, true, ov::intel_npu::npuw, fallback_exec, "NPUW_FALLBACK_EXEC", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_ACC_CHECK, bool, false, ov::intel_npu::npuw::accuracy, check, "NPUW_ACC_CHECK", ROOT, HIDDEN, UNCACHED, ALL)

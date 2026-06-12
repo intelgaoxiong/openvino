@@ -222,16 +222,24 @@ std::string ov::npuw::IBaseInferRequest::profile_tag(std::size_t idx) const {
 void ov::npuw::IBaseInferRequest::infer() {
     m_now_idx.reset();
     prepare_for_infer();
-    for (std::size_t idx = 0u; idx < m_num_submodels; idx++) {
-        m_now_idx = idx;
-        if (!valid_subrequest(idx)) {
-            continue;
+    if (!m_npuw_model->m_using_pipeline_model) {
+        for (std::size_t idx = 0u; idx < m_num_submodels; idx++) {
+            m_now_idx = idx;
+            if (!valid_subrequest(idx)) {
+                continue;
+            }
+            subscribe_subrequest(idx, [](std::exception_ptr) {});
+            m_profile[profile_tag(idx)].record([&]() {
+                run_subrequest_for_success(idx);
+            });
+            complete_subrequest(idx);
         }
-        subscribe_subrequest(idx, [](std::exception_ptr) {});
-        m_profile[profile_tag(idx)].record([&]() {
-            run_subrequest_for_success(idx);
+    } else {
+        subscribe_subrequest(0u, [](std::exception_ptr) {});
+        m_profile[profile_tag(0u)].record([&]() {
+            run_subrequest_for_success(0u);
         });
-        complete_subrequest(idx);
+        complete_subrequest(0u);
     }
 
     // Increment counter regardless if dumps etc are enabled or not.
@@ -358,18 +366,35 @@ void ov::npuw::IBaseInferRequest::unpack_closure(std::size_t idx, RqPtr request)
             continue;
         }
 
-        auto& iport = func_desc.compiled_model->inputs()[closure_param_id];
-        if (m_npuw_model->unpack_required(idx, cidx)) {
-            // Remember where the unpack is required
-            closure_unpack_required.push_back(cidx);
-        } else {
-            if (needs_copy(idx, cidx)) {
-                // Remember where copy is requried
-                closure_copy_required.push_back(cidx);
+        auto connect_closure = [&](const ov::Output<const ov::Node>& iport) {
+            if (m_npuw_model->unpack_required(idx, cidx)) {
+                // Remember where the unpack is required
+                closure_unpack_required.push_back(cidx);
             } else {
-                // Easy case, just set one to another
-                request->set_tensor(iport, ov::get_tensor_impl(closure));
+                if (needs_copy(idx, cidx)) {
+                    // Remember where copy is requried
+                    closure_copy_required.push_back(cidx);
+                } else {
+                    // Easy case, just set one to another
+                    request->set_tensor(iport, ov::get_tensor_impl(closure));
+                }
             }
+        };
+
+        auto& iport_submodel = func_desc.compiled_model->inputs()[closure_param_id];
+
+        if (m_npuw_model->m_using_pipeline_model) {
+            std::string port_name{iport_submodel.get_node()->get_friendly_name()};
+            auto port_name_it{m_npuw_model->m_pipeline_global_parameters.find(port_name)};
+
+            if (port_name_it != std::end(m_npuw_model->m_pipeline_global_parameters)) {
+                const auto port_usage_index{idx - real_idx};
+                auto param_id{port_name_it->second[port_usage_index]};
+                auto& iport_pipeline_model = m_npuw_model->m_compiled_pipeline_model->inputs()[param_id];
+                connect_closure(iport_pipeline_model);
+            }
+        } else {
+            connect_closure(iport_submodel);
         }
     }  // for(closure)
 
@@ -379,8 +404,22 @@ void ov::npuw::IBaseInferRequest::unpack_closure(std::size_t idx, RqPtr request)
         auto& closure = desc_closure[cidx];
         const auto closure_param_id = comp_model_desc.param_base + cidx;
         auto& iport = func_desc.compiled_model->inputs()[closure_param_id];
-        auto clparam = request->get_tensor(iport);
-        ov::get_tensor_impl(closure)->copy_to(clparam._ptr);
+
+        if (m_npuw_model->m_using_pipeline_model) {
+            std::string port_name{iport.get_node()->get_friendly_name()};
+            auto port_name_it{m_npuw_model->m_pipeline_global_parameters.find(port_name)};
+
+            if (port_name_it != std::end(m_npuw_model->m_pipeline_global_parameters)) {
+                const auto port_usage_index{idx - real_idx};
+                auto param_id{port_name_it->second[port_usage_index]};
+                auto& iport_pipeline_model = m_npuw_model->m_compiled_pipeline_model->inputs()[param_id];
+                auto clparam = request->get_tensor(iport_pipeline_model);
+                ov::get_tensor_impl(closure)->copy_to(clparam._ptr);
+            }
+        } else {
+            auto clparam = request->get_tensor(iport);
+            ov::get_tensor_impl(closure)->copy_to(clparam._ptr);
+        }
     });
     // }); // ms_to_run
 
@@ -395,7 +434,21 @@ void ov::npuw::IBaseInferRequest::unpack_closure(std::size_t idx, RqPtr request)
 
         const auto closure_param_id = comp_model_desc.param_base + cidx;
         auto& iport = func_desc.compiled_model->inputs()[closure_param_id];
-        auto clparam = request->get_tensor(iport);
+        ov::SoPtr<ov::ITensor> clparam{};
+
+        if (m_npuw_model->m_using_pipeline_model) {
+            std::string port_name{iport.get_node()->get_friendly_name()};
+            auto port_name_it{m_npuw_model->m_pipeline_global_parameters.find(port_name)};
+
+            if (port_name_it != std::end(m_npuw_model->m_pipeline_global_parameters)) {
+                const auto port_usage_index{idx - real_idx};
+                auto param_id{port_name_it->second[port_usage_index]};
+                auto& iport_pipeline_model = m_npuw_model->m_compiled_pipeline_model->inputs()[param_id];
+                clparam = request->get_tensor(iport_pipeline_model);
+            }
+        } else {
+            clparam = request->get_tensor(iport);
+        }
 
         if (!comp_model_desc.scales.empty() && comp_model_desc.scales[cidx] && comp_model_desc.zerops[cidx]) {
             // Unpacking this weight requires scaling with zero points...
@@ -455,7 +508,16 @@ void ov::npuw::IBaseInferRequest::bind_global_params(std::size_t idx, RqPtr requ
 
         const auto& g_port = m_npuw_model->inputs()[param_idx];
         const auto& g_tnsr = get_tensor(g_port);
-        const auto& s_port = request->get_inputs()[sub_in_idx];
+        auto subm_in_idx{sub_in_idx};
+
+        if (m_npuw_model->m_using_pipeline_model) {
+            auto global_input_it{m_npuw_model->m_pipeline_global_inputs.find(static_cast<uint32_t>(param_idx))};
+            if (global_input_it != std::end(m_npuw_model->m_pipeline_global_inputs)) {
+                subm_in_idx = static_cast<size_t>(global_input_it->second);
+            }
+        }
+
+        const auto& s_port = request->get_inputs()[subm_in_idx];
         LOG_DEBUG("Processing " << g_port << " -> " << s_port << "...");
         LOG_BLOCK();
 
@@ -494,12 +556,27 @@ void ov::npuw::IBaseInferRequest::bind_global_params(std::size_t idx, RqPtr requ
 
     // Run host-side gather, if required
     if (comp_model_desc.host_gather.dst_idx != -1) {
-        const auto& gport = comp_model_desc.compiled_model->inputs()[comp_model_desc.host_gather.dst_idx];
+        auto gport_ref = comp_model_desc.compiled_model->inputs()[comp_model_desc.host_gather.dst_idx];
+
+        auto get_global_port = [&](ov::Output<const ov::Node>& ref) {
+            if (m_npuw_model->m_using_pipeline_model) {
+                std::string port_name{ref.get_node()->get_friendly_name()};
+                auto port_name_it{m_npuw_model->m_pipeline_global_parameters.find(port_name)};
+                const auto port_usage_index{idx - real_idx};
+                auto param_id{port_name_it->second[port_usage_index]};
+                auto& iport_pipeline_model = m_npuw_model->m_compiled_pipeline_model->inputs()[param_id];
+                return iport_pipeline_model;
+            }
+            return ref;
+        };
+
+        auto& gport{get_global_port(gport_ref)};
         const auto gather = request->get_tensor(gport);
 
         const auto& vocab =
             comp_model_desc.closure.get().closure[comp_model_desc.host_gather.src_idx - comp_model_desc.param_base];
-        const auto& lport = comp_model_desc.compiled_model->inputs()[comp_model_desc.host_gather.idx_idx];
+        auto lport_ref = comp_model_desc.compiled_model->inputs()[comp_model_desc.host_gather.idx_idx];
+        auto& lport{get_global_port(lport_ref)};
         const auto lookup = request->get_tensor(lport);
 
         ov::npuw::util::gather(ov::get_tensor_impl(vocab), lookup, gather);
@@ -554,50 +631,91 @@ void ov::npuw::IBaseInferRequest::handle_quant_host_gather(std::size_t idx, RqPt
     auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
     auto& quant_unpack_gather = comp_model_desc.quant_unpack_gather;
 
+    auto get_pipeline_index = [&](const ov::Output<const ov::Node>& port) {
+        std::string port_name{port.get_node()->get_friendly_name()};
+        auto port_name_it{m_npuw_model->m_pipeline_global_parameters.find(port_name)};
+        if (port_name_it != std::end(m_npuw_model->m_pipeline_global_parameters)) {
+            auto param_id{port_name_it->second[0]};
+            return static_cast<size_t>(param_id);
+        }
+        return size_t{~0ull};
+    };
+
     if (quant_unpack_gather.dst_idx != -1) {
         NPUW_ASSERT(quant_unpack_gather.idx_idx != -1 && quant_unpack_gather.src_w_idx != -1);
 
+        auto quant_gather = [&](const ov::Output<const ov::Node>& lport,
+                                const ov::Output<const ov::Node>& gport,
+                                const ov::Output<const ov::Node>& wport) {
+            const auto& lookup = request->get_tensor(lport);
+            const auto& gather = request->get_tensor(gport);
+            const auto& vocabw = request->get_tensor(wport);
+
+            // Gather weight
+            ov::npuw::util::gather(vocabw, lookup, ov::get_tensor_impl(m_quant_gather_tensors.w));
+
+            if (quant_unpack_gather.src_z_idx != -1 && quant_unpack_gather.src_s_idx != -1) {
+                const auto& zport = comp_model_desc.compiled_model->inputs()[quant_unpack_gather.src_z_idx];
+                const auto& sport = comp_model_desc.compiled_model->inputs()[quant_unpack_gather.src_s_idx];
+
+                auto quant_gather_cond1 = [&](const ov::Output<const ov::Node>& zport,
+                                              const ov::Output<const ov::Node>& sport) {
+                    const auto& vocabz = request->get_tensor(zport);
+                    const auto& vocabs = request->get_tensor(sport);
+                    ov::npuw::util::gather(vocabz, lookup, ov::get_tensor_impl(m_quant_gather_tensors.z));
+                    ov::npuw::util::gather(vocabs, lookup, ov::get_tensor_impl(m_quant_gather_tensors.s));
+                    ov::npuw::util::unpack(ov::get_tensor_impl(m_quant_gather_tensors.w),
+                                           ov::get_tensor_impl(m_quant_gather_tensors.z),
+                                           ov::get_tensor_impl(m_quant_gather_tensors.s),
+                                           gather);
+                };
+
+                if (!m_npuw_model->m_using_pipeline_model) {
+                    quant_gather_cond1(zport, sport);
+                } else {
+                    const auto zport_idx{get_pipeline_index(zport)};
+                    const auto sport_idx{get_pipeline_index(sport)};
+                    const auto& zport_pipe = m_npuw_model->m_compiled_pipeline_model->inputs()[zport_idx];
+                    const auto& sport_pipe = m_npuw_model->m_compiled_pipeline_model->inputs()[sport_idx];
+                    quant_gather_cond1(zport_pipe, sport_pipe);
+                }
+            } else if (quant_unpack_gather.src_s_idx != -1) {
+                const auto& sport = comp_model_desc.compiled_model->inputs()[quant_unpack_gather.src_s_idx];
+
+                auto quant_gather_cond2 = [&](const ov::Output<const ov::Node>& sport) {
+                    const auto& vocabs = request->get_tensor(sport);
+                    ov::npuw::util::gather(vocabs, lookup, ov::get_tensor_impl(m_quant_gather_tensors.s));
+                    ov::npuw::util::unpack(ov::get_tensor_impl(m_quant_gather_tensors.w),
+                                           ov::get_tensor_impl(m_quant_gather_tensors.s),
+                                           gather);
+                };
+
+                if (!m_npuw_model->m_using_pipeline_model) {
+                    quant_gather_cond2(sport);
+                } else {
+                    const auto sport_idx{get_pipeline_index(sport)};
+                    const auto& sport_pipe = m_npuw_model->m_compiled_pipeline_model->inputs()[sport_idx];
+                    quant_gather_cond2(sport_pipe);
+                }
+            } else {
+                NPUW_ASSERT(false && "Not supported");
+            }
+        };
+
         const auto& lport = comp_model_desc.compiled_model->inputs()[quant_unpack_gather.idx_idx];
-        const auto& lookup = request->get_tensor(lport);
-
         const auto& gport = comp_model_desc.compiled_model->inputs()[quant_unpack_gather.dst_idx];
-        const auto& gather = request->get_tensor(gport);
-
         const auto& wport = comp_model_desc.compiled_model->inputs()[quant_unpack_gather.src_w_idx];
-        const auto& vocabw = request->get_tensor(wport);
 
-        // Gather weight
-        ov::npuw::util::gather(vocabw, lookup, ov::get_tensor_impl(m_quant_gather_tensors.w));
-
-        if (quant_unpack_gather.src_z_idx != -1 && quant_unpack_gather.src_s_idx != -1) {
-            const auto& zport = comp_model_desc.compiled_model->inputs()[quant_unpack_gather.src_z_idx];
-            const auto& vocabz = request->get_tensor(zport);
-
-            const auto& sport = comp_model_desc.compiled_model->inputs()[quant_unpack_gather.src_s_idx];
-            const auto& vocabs = request->get_tensor(sport);
-
-            // Gather first
-            ov::npuw::util::gather(vocabz, lookup, ov::get_tensor_impl(m_quant_gather_tensors.z));
-            ov::npuw::util::gather(vocabs, lookup, ov::get_tensor_impl(m_quant_gather_tensors.s));
-
-            // Then unpack
-            ov::npuw::util::unpack(ov::get_tensor_impl(m_quant_gather_tensors.w),
-                                   ov::get_tensor_impl(m_quant_gather_tensors.z),
-                                   ov::get_tensor_impl(m_quant_gather_tensors.s),
-                                   gather);
-        } else if (quant_unpack_gather.src_s_idx != -1) {
-            const auto& sport = comp_model_desc.compiled_model->inputs()[quant_unpack_gather.src_s_idx];
-            const auto& vocabs = request->get_tensor(sport);
-
-            // Gather first
-            ov::npuw::util::gather(vocabs, lookup, ov::get_tensor_impl(m_quant_gather_tensors.s));
-
-            // Then unpack
-            ov::npuw::util::unpack(ov::get_tensor_impl(m_quant_gather_tensors.w),
-                                   ov::get_tensor_impl(m_quant_gather_tensors.s),
-                                   gather);
+        if (!m_npuw_model->m_using_pipeline_model) {
+            quant_gather(lport, gport, wport);
         } else {
-            NPUW_ASSERT(false && "Not supported");
+            const auto lport_idx{get_pipeline_index(lport)};
+            const auto gport_idx{get_pipeline_index(gport)};
+            const auto wport_idx{get_pipeline_index(wport)};
+            const auto& lport_pipe = m_npuw_model->m_compiled_pipeline_model->inputs()[lport_idx];
+            const auto& gport_pipe = m_npuw_model->m_compiled_pipeline_model->inputs()[gport_idx];
+            const auto& wport_pipe = m_npuw_model->m_compiled_pipeline_model->inputs()[wport_idx];
+            quant_gather(lport_pipe, gport_pipe, wport_pipe);
         }
     }
 }
@@ -619,7 +737,17 @@ void ov::npuw::IBaseInferRequest::bind_global_results(std::size_t idx, RqPtr req
         std::size_t result_idx{}, sub_out_idx{};
         std::tie(result_idx, sub_out_idx) = it;
         const auto& g_port = m_npuw_model->outputs()[result_idx];
-        const auto& s_port = request->get_outputs()[sub_out_idx];
+        auto subm_out_idx{sub_out_idx};
+
+        if (m_npuw_model->m_using_pipeline_model) {
+            auto pipeline_out_port_idx{
+                m_npuw_model->m_pipeline_global_outputs.find(static_cast<uint32_t>(result_idx))};
+            if (pipeline_out_port_idx != std::end(m_npuw_model->m_pipeline_global_outputs)) {
+                subm_out_idx = pipeline_out_port_idx->second;
+            }
+        }
+
+        const auto& s_port = request->get_outputs()[subm_out_idx];
         request->set_tensor(s_port, get_tensor(g_port));
     }
 
@@ -652,8 +780,10 @@ void ov::npuw::IBaseInferRequest::dump_input_tensors(std::size_t idx) {
         std::vector<std::string> in_base_names;
         for (std::size_t i = 0u; i < num_inputs; i++) {
             const auto& port = comp_submodel->inputs()[i];
+            std::string port_name{port.get_node()->get_friendly_name()};
             const auto& tnsr = m_subrequests[real_idx]->get_tensor(port);
-            std::string in_base_name = comp_submodel_path + "_input_" + ov::npuw::util::fmt(i, num_inputs);
+            std::string in_base_name =
+                comp_submodel_path + "_input_" + ov::npuw::util::fmt(i, num_inputs) + "_" + port_name;
             ov::npuw::dump_tensor(tnsr, in_base_name);
             in_base_names.push_back(std::move(in_base_name));
         }
@@ -707,6 +837,34 @@ void ov::npuw::IBaseInferRequest::dump_input_tensors(std::size_t idx) {
     }
 }
 
+void ov::npuw::IBaseInferRequest::dump_pipeline_tensors(const std::string& output_dir, const bool dump_input) {
+    const std::string dump_ios_opt = m_npuw_model->m_cfg.get<::intel_npu::NPUW_DUMP_IO>();
+    if (!ov::npuw::util::is_set(0ull, dump_ios_opt, 0ull, 0ull)) {
+        return;
+    }
+
+    auto dump_io = [&](const std::vector<ov::Output<const ov::Node>>& io_ports) {
+        auto num_ports{io_ports.size()};
+        std::string io_label{"_input_"};
+        if (!dump_input) {
+            io_label = "_output_";
+        }
+        for (std::size_t i = 0u; i < num_ports; i++) {
+            const auto& port = io_ports[i];
+            std::string port_name{port.get_node()->get_friendly_name()};
+            const auto& tnsr = m_pipeline_request->get_tensor(port);
+            std::string in_base_name = output_dir + io_label + ov::npuw::util::fmt(i, num_ports) + "_" + port_name;
+            ov::npuw::dump_tensor(tnsr, in_base_name);
+        }
+    };
+
+    if (dump_input) {
+        dump_io(m_npuw_model->m_compiled_pipeline_model->inputs());
+    } else {
+        dump_io(m_npuw_model->m_compiled_pipeline_model->outputs());
+    }
+}
+
 void ov::npuw::IBaseInferRequest::dump_output_tensors(std::size_t idx) {
     const std::string dump_ios_opt = m_npuw_model->m_cfg.get<::intel_npu::NPUW_DUMP_IO>();
     const std::size_t end_idx = m_npuw_model->m_compiled_submodels.size();
@@ -732,8 +890,10 @@ void ov::npuw::IBaseInferRequest::dump_output_tensors(std::size_t idx) {
         std::vector<std::string> out_base_names;
         for (std::size_t i = 0u; i < num_outputs; i++) {
             const auto& port = comp_submodel->outputs()[i];
+            std::string port_name{port.get_node()->get_friendly_name()};
             const auto& tnsr = m_subrequests[real_idx]->get_tensor(port);
-            std::string out_base_name = comp_submodel_path + "_output_" + ov::npuw::util::fmt(i, num_outputs);
+            std::string out_base_name =
+                comp_submodel_path + "_output_" + ov::npuw::util::fmt(i, num_outputs) + "_" + port_name;
             ov::npuw::dump_tensor(tnsr, out_base_name);
             out_base_names.push_back(std::move(out_base_name));
         }
