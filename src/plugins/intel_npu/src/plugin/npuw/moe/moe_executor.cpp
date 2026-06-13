@@ -459,15 +459,17 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
             cur.slots.clear();
 
             const auto* row = data + expert_id * num_tokens;
-            for (size_t token_id = 0; token_id < num_tokens; ++token_id) {
-                const float v = std::abs(static_cast<float>(row[token_id]));
-                if (v > 1e-6f) {
-                    cur.tokens.push_back(token_id);
-                    cur.slots.push_back(token_slot_count[token_id]++);
-                    m_token_to_experts[token_id].push_back(expert_id);
-                    m_expert_to_tokens[expert_id].push_back(token_id);
+            m_profile->iterative["Parse Router Row"].record([&]() {
+                for (size_t token_id = 0; token_id < num_tokens; ++token_id) {
+                    const float v = std::abs(static_cast<float>(row[token_id]));
+                    if (v > 1e-6f) {
+                        cur.tokens.push_back(token_id);
+                        cur.slots.push_back(token_slot_count[token_id]++);
+                        m_token_to_experts[token_id].push_back(expert_id);
+                        m_expert_to_tokens[expert_id].push_back(token_id);
+                    }
                 }
-            }
+            });
 
             if (cur.tokens.empty()) {
                 continue;  // expert not selected — do not advance ring_idx
