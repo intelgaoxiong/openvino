@@ -218,7 +218,7 @@ void MoEExecutor::run(size_t real_idx, size_t idx) {
     // Dispatch to appropriate inference function.
     // EXPERT_BATCH: parse upfront (single token, routing maps needed for cache lookup).
     // EXPERT_ITERATIVE: parse is fused inside run_expert_iterative, expert-row by row,
-    //   overlapping with NPU execution to hide the ~0.9ms parse overhead.
+    //   overlapping with NPU execution to hide the per-layer parse overhead.
     if (processing_mode == MoEProcessingMode::EXPERT_BATCH) {
         std::vector<size_t> selected_experts;
         m_profile->batch["Parse Router Output"].record([&]() {
@@ -431,42 +431,57 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
         });
     };
 
-    // Routing state
-    m_token_to_experts.clear();
-    m_expert_to_tokens.clear();
     // Per-token counter: how many earlier experts have already selected this token.
-    // Used to compute the expert's position (slot) in each token's expert list,
-    // without needing the fully-populated m_token_to_experts map.
+    // Gives each token's expert-slot index in O(1) without a full two-pass scan.
     std::vector<size_t> token_slot_count(num_tokens, 0);
 
-    // Streaming parse + pipeline:
-    // For each expert, scan its router row (contiguous memory, cache-friendly) to
-    // find which tokens selected it.  Immediately launch NPU work items for that
-    // expert, overlapping with the previous expert's NPU execution.
+    // Parse-ahead buffer: pre-scan the NEXT expert's router row after drain(k-1) but
+    // while NPU k is still executing.  This hides the O(num_tokens) threshold scan
+    // inside the NPU overlap window instead of paying for it on the critical path
+    // before item k+1's dispatch.
     //
-    // Timeline per expert:
-    //   CPU: [scan_row(k) + Unpack(k) + Gather(k)] → start_async(k)
-    //        → [scan_row(k+1) + Unpack(k+1) + ...] → start_async(k+1)
-    //        → wait(k) + scatter(k) → ...
-    //   NPU:                                          [====NPU(k)====]
+    // The buffer stores only token IDs that passed the threshold (v > 1e-6).
+    // Slot assignment (O(selected) not O(num_tokens)) is still done at the
+    // top of the next expert iteration.
     //
+    // Timeline with parse-ahead:
+    //   CPU: [Unpack(k)+Gather(k)] → start(k) → drain(k-1) → [Parse(k+1)] → [Unpack(k+1)+Gather(k+1)] → start(k+1)
+    //   NPU:                         [=================NPU(k)==================] [==NPU(k+1)==]
+    //
+    struct ParseAheadBuffer {
+        std::vector<size_t> tokens;   // pre-filtered token IDs for next expert
+        size_t expert_id = SIZE_MAX;  // which expert was pre-scanned (sentinel = none)
+    };
+    ParseAheadBuffer parse_ahead;
+
+    // Per-expert loop: three phases — Parse, Dispatch, Prefetch.
     auto stream_and_run = [&](auto* data) {
         for (size_t expert_id = 0; expert_id < num_experts; ++expert_id) {
-            // Fill current ring slot with this expert's token list and slot indices.
+            // -- Parse: determine which tokens this expert processes --
             const size_t ring_slot = expert_ring_idx & 1;
             auto& cur = expert_ring[ring_slot];
             cur.tokens.clear();
             cur.slots.clear();
 
             const auto* row = data + expert_id * num_tokens;
+            // Shared by both the parse-ahead fast path and the full threshold scan below.
+            auto fill_token = [&](size_t token_id) {
+                cur.tokens.push_back(token_id);
+                cur.slots.push_back(token_slot_count[token_id]++);
+            };
             m_profile->iterative["Parse Router Row"].record([&]() {
-                for (size_t token_id = 0; token_id < num_tokens; ++token_id) {
-                    const float v = std::abs(static_cast<float>(row[token_id]));
-                    if (v > 1e-6f) {
-                        cur.tokens.push_back(token_id);
-                        cur.slots.push_back(token_slot_count[token_id]++);
-                        m_token_to_experts[token_id].push_back(expert_id);
-                        m_expert_to_tokens[expert_id].push_back(token_id);
+                if (parse_ahead.expert_id == expert_id) {
+                    // Fast path: token IDs already filtered; only slot updates remain.
+                    for (size_t token_id : parse_ahead.tokens) {
+                        fill_token(token_id);
+                    }
+                    parse_ahead.expert_id = SIZE_MAX;  // consumed
+                } else {
+                    // Full O(num_tokens) threshold scan (first expert, or parse-ahead missed).
+                    for (size_t token_id = 0; token_id < num_tokens; ++token_id) {
+                        if (std::abs(static_cast<float>(row[token_id])) > 1e-6f) {
+                            fill_token(token_id);
+                        }
                     }
                 }
             });
@@ -475,7 +490,7 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
                 continue;  // expert not selected — do not advance ring_idx
             }
 
-            // Chunk and pipeline the work items for this expert.
+            // -- Dispatch: slice tokens into chunks and pipeline NPU execution --
             size_t processed = 0;
             while (processed < cur.tokens.size()) {
                 const size_t cs = select_chunk(cur.tokens.size() - processed);
@@ -483,7 +498,6 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
                 const size_t s = global_slot & 1;
                 auto& req = get_req(cs, s);
 
-                // CPU: Unpack + Gather (executes while NPU runs previous item)
                 do_unpack(cs, s, req, expert_id);
                 {
                     const auto cm = m_config.compiled_models.at(cs);
@@ -506,13 +520,10 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
                     });
                 }
 
-                // NOTE: Start NPU immediately, before draining the previous item.
-                // This is what creates the CPU/NPU overlap (pipeline depth = 1).
+                // Start NPU first, then drain previous — this creates the CPU/NPU overlap.
                 m_profile->iterative["NPU Start"].record([&]() {
                     req->start_async();
                 });
-
-                // Drain previous in-flight item (current NPU already running)
                 if (inflight) {
                     do_drain();
                 }
@@ -520,6 +531,19 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
                 inflight = InflightItem{cs, s, processed, actual, ring_slot};
                 ++global_slot;
                 processed += actual;
+            }
+
+            // -- Prefetch: scan next expert's row while the last NPU chunk runs --
+            if ((expert_id + 1) < num_experts) {
+                const size_t next_id = expert_id + 1;
+                const auto* next_row = data + next_id * num_tokens;
+                parse_ahead.tokens.clear();
+                parse_ahead.expert_id = next_id;
+                for (size_t token_id = 0; token_id < num_tokens; ++token_id) {
+                    if (std::abs(static_cast<float>(next_row[token_id])) > 1e-6f) {
+                        parse_ahead.tokens.push_back(token_id);
+                    }
+                }
             }
 
             ++expert_ring_idx;
