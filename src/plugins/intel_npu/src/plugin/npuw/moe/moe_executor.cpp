@@ -4,6 +4,8 @@
 
 #include "moe_executor.hpp"
 
+#include <optional>
+
 #include "../compiled_model.hpp"  // For CompiledModel::CompiledModelDesc
 #include "../logging.hpp"
 #include "moe_infer_utils.hpp"
@@ -327,23 +329,20 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
     const auto input_token_count = m_config.input_token_count;
     const auto& io = m_moe_io[idx];
 
-    // Clear output buffer before accumulating expert outputs
-    if (!m_resources.expert_output_accumulator) {
+    // Precondition checks
+    if (!m_resources.expert_output_accumulator)
         OPENVINO_THROW("MoE: Expert output accumulator is null");
-    }
+    if (!m_config.router_scores.compiled.has_value())
+        OPENVINO_THROW("MoE: Router scores index not available");
+    if (!m_config.expert_input.compiled.has_value())
+        OPENVINO_THROW("MoE: Expert input parameter index not available");
+    if (m_resources.sorted_chunk_sizes.empty())
+        OPENVINO_THROW("MoE: Sorted chunk sizes cannot be empty");
+
+    // Clear output accumulator before accumulating expert outputs
     std::memset(m_resources.expert_output_accumulator->data(),
                 0,
                 m_resources.expert_output_accumulator->get_byte_size());
-
-    if (!m_config.router_scores.compiled.has_value()) {
-        OPENVINO_THROW("MoE: Router scores index not available");
-    }
-    if (!m_config.expert_input.compiled.has_value()) {
-        OPENVINO_THROW("MoE: Expert input parameter index not available");
-    }
-    if (m_resources.sorted_chunk_sizes.empty()) {
-        OPENVINO_THROW("MoE: Sorted chunk sizes cannot be empty");
-    }
 
     auto expert_input_source = io.expert_input;
 
@@ -354,7 +353,7 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
     const size_t num_tokens = input_token_count;
     const size_t num_experts = m_config.num_experts;
 
-    // ── Chunk-size selector ───────────────────────────────────────────────────────
+    // Chunk-size selector
     auto select_chunk = [&](size_t remaining) -> size_t {
         const size_t smallest = m_resources.sorted_chunk_sizes.back();
         const size_t largest = m_resources.sorted_chunk_sizes.front();
@@ -369,7 +368,7 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
         return smallest;
     };
 
-    // ── Double-buffer request helpers ────────────────────────────────────────────
+    // Double-buffer request helpers
     size_t global_slot = 0;
     auto get_req = [&](size_t cs, size_t slot) -> RqPtr& {
         return m_resources.chunk_infer_requests.at(cs)[slot & 1];
@@ -387,7 +386,7 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
         }
     };
 
-    // ── Expert data ring buffer ───────────────────────────────────────────────────
+    // Expert data ring buffer:
     // 2 slots alternate per non-empty expert.  At most one slot is "in-flight" for
     // scatter at any time; the other slot is being filled for the next expert.
     // Safety: expert[k+2] reuses the slot that expert[k] used, and by then expert[k]'s
@@ -399,7 +398,7 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
     std::array<ExpertData, 2> expert_ring;
     size_t expert_ring_idx = 0;  // incremented per non-empty expert
 
-    // ── In-flight item tracking ───────────────────────────────────────────────────
+    // In-flight item tracking
     struct InflightItem {
         size_t cs;
         size_t req_slot;
@@ -407,10 +406,32 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
         size_t chunk_tokens;
         size_t ring_idx;  // expert_ring slot index at launch time
     };
-    bool pipeline_started = false;
-    InflightItem inflight{};
+    std::optional<InflightItem> inflight;
 
-    // ── Routing state ─────────────────────────────────────────────────────────────
+    // Drain the in-flight item referenced by `inflight` (wait + scatter).
+    // Called both inside the pipeline loop (to drain the previous item while NPU
+    // runs the current one) and once after the loop to drain the final item.
+    auto do_drain = [&]() {
+        auto& req = get_req(inflight->cs, inflight->req_slot);
+        m_profile->iterative["NPU Wait"].record([&]() {
+            req->wait();
+        });
+        const auto& data = expert_ring[inflight->ring_idx & 1];
+        const auto cm = m_config.compiled_models.at(inflight->cs);
+        auto output = req->get_tensor(cm->outputs()[0]);
+        m_profile->iterative["Scatter Output"].record([&]() {
+            ov::npuw::moe::scatter_expert_outputs(output,
+                                                  m_resources.expert_output_accumulator,
+                                                  data.tokens,
+                                                  inflight->chunk_start,
+                                                  inflight->chunk_tokens,
+                                                  embed_dim,
+                                                  input_token_count,
+                                                  data.slots);
+        });
+    };
+
+    // Routing state
     m_token_to_experts.clear();
     m_expert_to_tokens.clear();
     // Per-token counter: how many earlier experts have already selected this token.
@@ -418,8 +439,7 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
     // without needing the fully-populated m_token_to_experts map.
     std::vector<size_t> token_slot_count(num_tokens, 0);
 
-    // ── Streaming parse + pipeline ────────────────────────────────────────────────
-    //
+    // Streaming parse + pipeline:
     // For each expert, scan its router row (contiguous memory, cache-friendly) to
     // find which tokens selected it.  Immediately launch NPU work items for that
     // expert, overlapping with the previous expert's NPU execution.
@@ -484,34 +504,18 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
                     });
                 }
 
-                // ★ Start NPU immediately — before draining the previous item ★
+                // NOTE: Start NPU immediately, before draining the previous item.
+                // This is what creates the CPU/NPU overlap (pipeline depth = 1).
                 m_profile->iterative["NPU Start"].record([&]() {
                     req->start_async();
                 });
 
                 // Drain previous in-flight item (current NPU already running)
-                if (pipeline_started) {
-                    auto& prev_req = get_req(inflight.cs, inflight.req_slot);
-                    m_profile->iterative["NPU Wait"].record([&]() {
-                        prev_req->wait();
-                    });
-                    const auto& prev = expert_ring[inflight.ring_idx & 1];
-                    const auto cm_p = m_config.compiled_models.at(inflight.cs);
-                    auto output = prev_req->get_tensor(cm_p->outputs()[0]);
-                    m_profile->iterative["Scatter Output"].record([&]() {
-                        ov::npuw::moe::scatter_expert_outputs(output,
-                                                              m_resources.expert_output_accumulator,
-                                                              prev.tokens,
-                                                              inflight.chunk_start,
-                                                              inflight.chunk_tokens,
-                                                              embed_dim,
-                                                              input_token_count,
-                                                              prev.slots);
-                    });
+                if (inflight) {
+                    do_drain();
                 }
 
-                inflight = {cs, s, processed, actual, ring_slot};
-                pipeline_started = true;
+                inflight = InflightItem{cs, s, processed, actual, ring_slot};
                 ++global_slot;
                 processed += actual;
             }
@@ -529,28 +533,12 @@ void MoEExecutor::run_expert_iterative(size_t idx, size_t real_idx) {
         OPENVINO_THROW("MoE: Unsupported router element type for iterative inference");
     }
 
-    if (!pipeline_started) {
+    if (!inflight) {
         OPENVINO_THROW("MoE: No experts selected by router");
     }
 
     // Drain the last in-flight item
-    auto& req_last = get_req(inflight.cs, inflight.req_slot);
-    m_profile->iterative["NPU Wait"].record([&]() {
-        req_last->wait();
-    });
-    const auto& last = expert_ring[inflight.ring_idx & 1];
-    const auto cm_l = m_config.compiled_models.at(inflight.cs);
-    auto output_last = req_last->get_tensor(cm_l->outputs()[0]);
-    m_profile->iterative["Scatter Output"].record([&]() {
-        ov::npuw::moe::scatter_expert_outputs(output_last,
-                                              m_resources.expert_output_accumulator,
-                                              last.tokens,
-                                              inflight.chunk_start,
-                                              inflight.chunk_tokens,
-                                              embed_dim,
-                                              input_token_count,
-                                              last.slots);
-    });
+    do_drain();
 }
 
 void MoEExecutor::set_router_scores(size_t idx,
