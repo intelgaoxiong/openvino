@@ -2743,20 +2743,38 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
                 LOG_BLOCK();
                 auto& function = P.functions.at(func_group);
                 if (function._pipeline.partition_stage) {
-                    function._pipeline.context.put<ov::npuw::v1::subgraphs::PartitioningCallbacks>(
-                        {[&P, &part_ctx = effective_ctx](const std::string& tag) -> std::shared_ptr<ov::Model> {
-                            auto cached = part_ctx.tagged_models.find(tag);
-                            if (cached != part_ctx.tagged_models.end()) {
-                                return cached->second;
+                    auto find_tagged_model =
+                        [&P, &part_ctx = effective_ctx](const std::string& tag) -> std::shared_ptr<ov::Model> {
+                        auto cached = part_ctx.tagged_models.find(tag);
+                        if (cached != part_ctx.tagged_models.end()) {
+                            return cached->second;
+                        }
+                        for (const auto& [name, candidate] : P.functions) {
+                            if (candidate.gettag() == tag) {
+                                part_ctx.tagged_models.emplace(tag, candidate._model);
+                                return candidate._model;
                             }
-                            for (const auto& [name, candidate] : P.functions) {
-                                if (candidate.gettag() == tag) {
-                                    part_ctx.tagged_models.emplace(tag, candidate._model);
-                                    return candidate._model;
+                        }
+                        return nullptr;
+                    };
+
+                    auto find_moe_k_value = [&P]() -> std::optional<size_t> {
+                        // Scan all sub-models for the TopK K value tagged during
+                        // Router pattern matching (see patterns::moe::RT_INFO_MOE_K).
+                        for (const auto& [name, func] : P.functions) {
+                            for (const auto& node : func._model->get_ordered_ops()) {
+                                const auto& rt = node->get_rt_info();
+                                auto it = rt.find(ov::npuw::patterns::moe::RT_INFO_MOE_K);
+                                if (it != rt.end()) {
+                                    return it->second.as<size_t>();
                                 }
                             }
-                            return nullptr;
-                        }});
+                        }
+                        return std::nullopt;
+                    };
+
+                    function._pipeline.context.put<ov::npuw::v1::subgraphs::PartitioningCallbacks>(
+                        {std::move(find_tagged_model), std::move(find_moe_k_value)});
                     function._pipeline.partition_stage(function, function._pipeline.context);
                     // The callback captures partitioning state by reference, so keep it scoped to this
                     // immediate partition-stage invocation and remove it before the context outlives us.

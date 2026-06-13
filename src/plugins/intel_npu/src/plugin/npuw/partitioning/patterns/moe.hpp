@@ -26,6 +26,11 @@ constexpr const char* EXPERT_TAG = "expert";
 constexpr const char* MLP_ROUTER_NAME = ".mlp.router";
 constexpr const char* MLP_EXPERT_NAME = ".mlp.expert";
 
+// RT info key used to propagate the Router's K value from pattern-matching
+// callbacks to the partition stage (written by Router matchers, read by
+// PartitioningCallbacks::find_moe_k_value).
+constexpr const char* RT_INFO_MOE_K = "npuw_moe_k";
+
 class GPTOSSExpert : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("npuw::patterns::moe::GPTOSSExpert");

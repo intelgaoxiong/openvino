@@ -121,6 +121,10 @@ struct CompiledPipeline;
 struct InferContext;
 struct PartitioningCallbacks {
     std::function<std::shared_ptr<ov::Model>(const std::string&)> find_tagged_model;
+    // Returns the K value extracted from the Router's TopK node, tagged during
+    // pattern matching via the patterns::moe::RT_INFO_MOE_K RT info key.  Nullopt
+    // when not found (e.g. Router was never matched, or this is not an MoE model).
+    std::function<std::optional<size_t>()> find_moe_k_value;
 };
 
 struct CompileContext {

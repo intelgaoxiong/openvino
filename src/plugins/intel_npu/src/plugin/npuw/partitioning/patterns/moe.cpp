@@ -250,7 +250,7 @@ GPTOSSExpert::GPTOSSExpert(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
                             Transpose, Reshape, Unsqueeze
 */
 GPTOSSRouter::GPTOSSRouter(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag) {
-    LOG_DEBUG("GPTOSSRouter pattern matcher registered with tag: " << isol_tag);
+    LOG_DEBUG("GPTOSSRouter pattern matcher registered (K-extraction only, no isolation)");
 
     // Pattern-matched nodes (7): Multiply, Convert, MatMul, Add, TopK, Softmax, Slice
     // topk_convert (indices Convert) is retrieved manually - TopK has two outputs and
@@ -266,8 +266,6 @@ GPTOSSRouter::GPTOSSRouter(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
     // because ShapeOf nodes are constant-folded before this pattern runs.
     auto slice = opp::wrap_type<ov::op::v8::Slice>(
         {softmax, opp::any_input(), opp::any_input(), opp::any_input(), opp::any_input()});
-
-    auto node_to_gptr = snapshot->getNodeToGroupMap();
 
     auto callback = [=](ov::pass::pattern::Matcher& m) {
         auto& node_to_output = m.get_pattern_value_map();
@@ -287,85 +285,19 @@ GPTOSSRouter::GPTOSSRouter(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
             return false;
         }
 
-        LOG_DEBUG("GPT-OSS Router pattern matched: " << topk_name);
-
-        // Get pattern-matched nodes needed for manual retrieval
-        auto matched_slice = node_to_output.at(slice).get_node_shared_ptr();
-
-        // topk_convert: Convert on TopK indices output (output(1)).  Not in the formal
-        // pattern because TopK has two outputs and wrap_type always binds output(0).
-        std::shared_ptr<ov::Node> matched_topk_convert = nullptr;
-        for (auto& target : matched_topk->output(1).get_target_inputs()) {
-            auto consumer = target.get_node()->shared_from_this();
-            if (std::dynamic_pointer_cast<ov::op::v0::Convert>(consumer)) {
-                matched_topk_convert = consumer;
-                break;
+        // Extract K from the TopK constant input and tag the node so that
+        // PartitioningCallbacks::find_moe_k_value can retrieve it later.
+        auto k_input = topk_node->input_value(1);
+        if (auto k_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(k_input.get_node_shared_ptr())) {
+            auto k_data = k_const->cast_vector<int64_t>();
+            if (!k_data.empty()) {
+                const size_t k_value = static_cast<size_t>(k_data[0]);
+                matched_topk->get_rt_info()[RT_INFO_MOE_K] = k_value;
+                LOG_DEBUG("GPT-OSS Router: tagged TopK '" << topk_name << "' with K=" << k_value);
             }
         }
 
-        // Manual retrieval (7 nodes): helper function
-        auto matched_scatter = find_consumer_by_type(matched_slice, [](const std::shared_ptr<ov::Node>& n) {
-            return std::dynamic_pointer_cast<ov::op::v3::ScatterElementsUpdate>(n) ||
-                   std::dynamic_pointer_cast<ov::op::v12::ScatterElementsUpdate>(n);
-        });
-        if (!matched_scatter) {
-            LOG_DEBUG("Router pattern: ScatterElementsUpdate not found");
-            return false;
-        }
-
-        // Retrieve Broadcast and ShapeOf
-        auto broadcast_node = matched_scatter->input_value(0).get_node_shared_ptr();
-        auto matched_broadcast = std::dynamic_pointer_cast<ov::op::v3::Broadcast>(broadcast_node);
-        if (!matched_broadcast) {
-            LOG_DEBUG("Router pattern: Broadcast not found");
-            return false;
-        }
-
-        // Retrieve output chain (Transpose -> Reshape -> Unsqueeze)
-        auto matched_transpose = find_consumer_by_type(matched_scatter, [](const std::shared_ptr<ov::Node>& n) {
-            return std::dynamic_pointer_cast<ov::op::v1::Transpose>(n) != nullptr;
-        });
-        if (!matched_transpose) {
-            LOG_DEBUG("Router pattern: Transpose not found");
-            return false;
-        }
-
-        auto matched_reshape = find_consumer_by_type(matched_transpose, [](const std::shared_ptr<ov::Node>& n) {
-            return std::dynamic_pointer_cast<ov::op::v1::Reshape>(n) != nullptr;
-        });
-        if (!matched_reshape) {
-            LOG_DEBUG("Router pattern: Reshape not found");
-            return false;
-        }
-
-        auto matched_unsqueeze = find_consumer_by_type(matched_reshape, [](const std::shared_ptr<ov::Node>& n) {
-            return std::dynamic_pointer_cast<ov::op::v0::Unsqueeze>(n) != nullptr;
-        });
-        if (!matched_unsqueeze) {
-            LOG_DEBUG("Router pattern: Unsqueeze not found");
-            return false;
-        }
-
-        // Isolate all 16 nodes
-        auto isolate = [&](const std::shared_ptr<ov::Node>& pattern_node) {
-            isolate_node(node_to_output.at(pattern_node).get_node_shared_ptr(), isol_tag, node_to_gptr);
-        };
-
-        isolate(weights_multiply);
-        isolate(weights_convert2);
-        isolate(matmul);
-        isolate(add);
-        isolate_node(matched_topk, isol_tag, node_to_gptr);
-        isolate(softmax);
-        isolate_node(matched_topk_convert, isol_tag, node_to_gptr);
-        isolate_node(matched_slice, isol_tag, node_to_gptr);
-        isolate_node(matched_broadcast, isol_tag, node_to_gptr);
-        isolate_node(matched_scatter, isol_tag, node_to_gptr);
-        isolate_node(matched_transpose, isol_tag, node_to_gptr);
-        isolate_node(matched_reshape, isol_tag, node_to_gptr);
-        isolate_node(matched_unsqueeze, isol_tag, node_to_gptr);
-
-        LOG_DEBUG("Router pattern isolated");
+        // Router stays in the upstream subgraph — no isolation.
         return false;
     };
 
@@ -503,7 +435,7 @@ Qwen3Expert::Qwen3Expert(const std::shared_ptr<ov::npuw::online::Snapshot>& snap
     requiring explicit renormalization via ReduceSum->Divide.
 */
 Qwen3Router::Qwen3Router(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag) {
-    LOG_DEBUG("Qwen3Router pattern matcher registered with tag: " << isol_tag);
+    LOG_DEBUG("Qwen3Router pattern matcher registered (K-extraction only, no isolation)");
 
     // Router weights: Convert(weight) -> Multiply(weight, scale) -> Convert -> MatMul
     auto weights_convert_in = opp::wrap_type<ov::op::v0::Convert>({opp::any_input()});
@@ -526,8 +458,6 @@ Qwen3Router::Qwen3Router(const std::shared_ptr<ov::npuw::online::Snapshot>& snap
     auto reshape = opp::wrap_type<ov::op::v1::Reshape>({transpose, opp::any_input()});
     auto unsqueeze = opp::wrap_type<ov::op::v0::Unsqueeze>({reshape, opp::any_input()});
 
-    auto node_to_gptr = snapshot->getNodeToGroupMap();
-
     auto callback = [=](ov::pass::pattern::Matcher& m) {
         auto& node_to_output = m.get_pattern_value_map();
 
@@ -538,32 +468,19 @@ Qwen3Router::Qwen3Router(const std::shared_ptr<ov::npuw::online::Snapshot>& snap
             return false;
         }
 
-        LOG_DEBUG("Qwen3Router pattern matched: " << matched_topk->get_friendly_name());
+        // Extract K from the TopK constant input and tag the node so that
+        // PartitioningCallbacks::find_moe_k_value can retrieve it later.
+        auto k_input = topk_node->input_value(1);
+        if (auto k_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(k_input.get_node_shared_ptr())) {
+            auto k_data = k_const->cast_vector<int64_t>();
+            if (!k_data.empty()) {
+                const size_t k_value = static_cast<size_t>(k_data[0]);
+                matched_topk->get_rt_info()[RT_INFO_MOE_K] = k_value;
+                LOG_DEBUG("Qwen3 Router: tagged TopK '" << matched_topk->get_friendly_name() << "' with K=" << k_value);
+            }
+        }
 
-        auto matched_scatter = node_to_output.at(scatter).get_node_shared_ptr();
-
-        // Also isolate Broadcast node that provides zero-filled base for ScatterElementsUpdate
-        auto broadcast_node = matched_scatter->input_value(0).get_node_shared_ptr();
-        auto matched_broadcast = std::dynamic_pointer_cast<ov::op::v3::Broadcast>(broadcast_node);
-
-        auto isolate = [&](const std::shared_ptr<ov::Node>& pattern_node) {
-            isolate_node(node_to_output.at(pattern_node).get_node_shared_ptr(), isol_tag, node_to_gptr);
-        };
-
-        isolate(weights_convert_in);
-        isolate(weights_multiply);
-        isolate(weights_convert_out);
-        isolate(matmul);
-        isolate(softmax);
-        isolate_node(matched_topk, isol_tag, node_to_gptr);
-        isolate(reduce_sum);
-        isolate(divide);
-        isolate_node(matched_broadcast, isol_tag, node_to_gptr);
-        isolate_node(matched_scatter, isol_tag, node_to_gptr);
-        isolate(transpose);
-        isolate(reshape);
-        isolate(unsqueeze);
-
+        // Router stays in the upstream subgraph — no isolation.
         return false;
     };
 
