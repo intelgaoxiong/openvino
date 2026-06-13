@@ -103,16 +103,15 @@ std::vector<size_t> parse_selected_experts_from_router(const ov::SoPtr<ov::ITens
 
     // Parse which expert each token selects based on non-zero weights
     auto parse_experts = [&](auto* data) {
-        // For each token, find which experts have non-zero weights
-        for (size_t token_id = 0; token_id < num_tokens; ++token_id) {
-            for (size_t expert_id = 0; expert_id < num_experts; ++expert_id) {
-                // Index calculation for shape [num_experts, 1, token_num, 1]
-                // data[expert_id, 0, token_id, 0]
-                size_t idx = expert_id * num_tokens + token_id;
-
-                float value = std::abs(static_cast<float>(data[idx]));
+        // Iterate expert-major so the inner loop walks data[] with stride 1,
+        // keeping each expert's row hot in L1/L2 cache.
+        // Layout is [num_experts, 1, num_tokens, 1]:
+        //   data[expert_id, 0, token_id, 0] = data[expert_id * num_tokens + token_id]
+        for (size_t expert_id = 0; expert_id < num_experts; ++expert_id) {
+            const auto* row = data + expert_id * num_tokens;  // pointer to expert's contiguous row
+            for (size_t token_id = 0; token_id < num_tokens; ++token_id) {
+                float value = std::abs(static_cast<float>(row[token_id]));
                 if (value > 1e-6f) {
-                    // This token selected this expert
                     token_to_experts[token_id].push_back(expert_id);
                     expert_to_tokens[expert_id].push_back(token_id);
                 }
