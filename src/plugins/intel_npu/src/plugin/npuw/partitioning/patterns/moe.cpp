@@ -87,6 +87,28 @@ void isolate_reduce_sum_after(const std::shared_ptr<ov::Node>& output_multiply,
     }
 }
 
+// Extract K from a TopK node's constant second input and write it to rt_info
+// under the RT_INFO_MOE_K key so that PartitioningCallbacks::find_moe_k_value
+// can retrieve it during the partition stage.  Returns true on success.
+// Both GPTOSSRouter and Qwen3Router call this after validating the TopK node.
+static bool tag_topk_k(const std::shared_ptr<ov::Node>& topk_node) {
+    auto k_input = topk_node->input_value(1);
+    auto k_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(k_input.get_node_shared_ptr());
+    if (!k_const) {
+        return false;
+    }
+    auto k_data = k_const->cast_vector<int64_t>();
+    if (k_data.empty() || k_data[0] <= 0) {
+        LOG_WARN("Router TopK K value is non-positive or empty (" << (k_data.empty() ? 0 : k_data[0])
+                                                                  << "); skipping tag");
+        return false;
+    }
+    const size_t k_value = static_cast<size_t>(k_data[0]);
+    topk_node->get_rt_info()[RT_INFO_MOE_K] = k_value;
+    LOG_DEBUG("Router: tagged TopK '" << topk_node->get_friendly_name() << "' with K=" << k_value);
+    return true;
+}
+
 }  // namespace
 
 /*
@@ -287,15 +309,7 @@ GPTOSSRouter::GPTOSSRouter(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
 
         // Extract K from the TopK constant input and tag the node so that
         // PartitioningCallbacks::find_moe_k_value can retrieve it later.
-        auto k_input = topk_node->input_value(1);
-        if (auto k_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(k_input.get_node_shared_ptr())) {
-            auto k_data = k_const->cast_vector<int64_t>();
-            if (!k_data.empty()) {
-                const size_t k_value = static_cast<size_t>(k_data[0]);
-                matched_topk->get_rt_info()[RT_INFO_MOE_K] = k_value;
-                LOG_DEBUG("GPT-OSS Router: tagged TopK '" << topk_name << "' with K=" << k_value);
-            }
-        }
+        tag_topk_k(matched_topk);
 
         // Router stays in the upstream subgraph — no isolation.
         return false;
@@ -470,15 +484,7 @@ Qwen3Router::Qwen3Router(const std::shared_ptr<ov::npuw::online::Snapshot>& snap
 
         // Extract K from the TopK constant input and tag the node so that
         // PartitioningCallbacks::find_moe_k_value can retrieve it later.
-        auto k_input = topk_node->input_value(1);
-        if (auto k_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(k_input.get_node_shared_ptr())) {
-            auto k_data = k_const->cast_vector<int64_t>();
-            if (!k_data.empty()) {
-                const size_t k_value = static_cast<size_t>(k_data[0]);
-                matched_topk->get_rt_info()[RT_INFO_MOE_K] = k_value;
-                LOG_DEBUG("Qwen3 Router: tagged TopK '" << matched_topk->get_friendly_name() << "' with K=" << k_value);
-            }
-        }
+        tag_topk_k(matched_topk);
 
         // Router stays in the upstream subgraph — no isolation.
         return false;

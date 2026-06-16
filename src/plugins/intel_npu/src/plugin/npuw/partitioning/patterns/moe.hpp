@@ -52,6 +52,9 @@ public:
     static constexpr const char* pattern_name() {
         return "GPTOSSRouter";
     }
+    // NOTE: GPTOSSRouter does NOT isolate any nodes.  It only tags the matched
+    // TopK with RT_INFO_MOE_K.  This tag is the ISOL_PRESETS lookup key used by
+    // the pattern registry ("P:GPTOSSRouter/router") — not an isolation target.
     static constexpr const char* isolation_tag() {
         return ROUTER_TAG;
     }
@@ -82,6 +85,9 @@ public:
     static constexpr const char* pattern_name() {
         return "Qwen3Router";
     }
+    // NOTE: Qwen3Router does NOT isolate any nodes.  It only tags the matched
+    // TopK with RT_INFO_MOE_K.  This tag is the ISOL_PRESETS lookup key used by
+    // the pattern registry ("P:Qwen3Router/router") — not an isolation target.
     static constexpr const char* isolation_tag() {
         return ROUTER_TAG;
     }
