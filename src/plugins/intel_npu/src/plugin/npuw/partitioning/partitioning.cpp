@@ -2738,6 +2738,25 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
             // Pass 2: run deferred partition-stage transformations after all functions are registered.
             // Partitioning stays generic here: it only exposes shared lookup helpers through the
             // pipeline context and then runs the registered callbacks.
+
+            // Scan all sub-models once for the TopK K value tagged during Router pattern matching.
+            // Done here (before the per-function loop) so each find_moe_k_value callback is O(1)
+            // instead of re-scanning every function on every call (O(F*N) per call, O(F^2*N) total).
+            std::optional<size_t> moe_k_value_cache;
+            for (const auto& [name, func] : P.functions) {
+                for (const auto& node : func._model->get_ordered_ops()) {
+                    const auto& rt = node->get_rt_info();
+                    auto it = rt.find(ov::npuw::patterns::moe::RT_INFO_MOE_K);
+                    if (it != rt.end()) {
+                        moe_k_value_cache = it->second.as<size_t>();
+                        break;
+                    }
+                }
+                if (moe_k_value_cache.has_value()) {
+                    break;
+                }
+            }
+
             for (auto&& func_group : all_functions) {
                 LOG_INFO("FOLD Pass 2: Partition-stage pipeline for " << func_group << "...");
                 LOG_BLOCK();
@@ -2758,19 +2777,9 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
                         return nullptr;
                     };
 
-                    auto find_moe_k_value = [&P]() -> std::optional<size_t> {
-                        // Scan all sub-models for the TopK K value tagged during
-                        // Router pattern matching (see patterns::moe::RT_INFO_MOE_K).
-                        for (const auto& [name, func] : P.functions) {
-                            for (const auto& node : func._model->get_ordered_ops()) {
-                                const auto& rt = node->get_rt_info();
-                                auto it = rt.find(ov::npuw::patterns::moe::RT_INFO_MOE_K);
-                                if (it != rt.end()) {
-                                    return it->second.as<size_t>();
-                                }
-                            }
-                        }
-                        return std::nullopt;
+                    // Capture the pre-computed K value; O(1) per call.
+                    auto find_moe_k_value = [moe_k_value_cache]() -> std::optional<size_t> {
+                        return moe_k_value_cache;
                     };
 
                     function._pipeline.context.put<ov::npuw::v1::subgraphs::PartitioningCallbacks>(
