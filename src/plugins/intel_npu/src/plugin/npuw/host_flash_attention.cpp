@@ -184,14 +184,26 @@ static FlashAttentionResults execute_fused_flash_attention(const HFATileF32Nodes
     auto past_sum_squeezed = std::make_shared<ov::op::v0::Squeeze>(f32_nodes.past_d_f32, squeeze);
     past_sum_squeezed->set_friendly_name("past_sum_squeezed");
 
-    auto flash_attn_tile = std::make_shared<ov::intel_npu::op::FlashAttentionTile>(q_input,
-                                                                                   k_input,
-                                                                                   v_transpose,
-                                                                                   f32_nodes.past_acc_f32,
-                                                                                   past_max_squeezed,
-                                                                                   past_sum_squeezed,
-                                                                                   f32_nodes.mask_tile_f32,
-                                                                                   config);
+    std::shared_ptr<ov::intel_npu::op::FlashAttentionTile> flash_attn_tile;
+    if (is_last_tile) {
+        flash_attn_tile = std::make_shared<ov::intel_npu::op::FlashAttentionTile>(q_input,
+                                                                                  k_input,
+                                                                                  v_transpose,
+                                                                                  f32_nodes.past_acc_f32,
+                                                                                  past_max_squeezed,
+                                                                                  past_sum_squeezed,
+                                                                                  f32_nodes.mask_tile_f32,
+                                                                                  config);
+    } else {
+        flash_attn_tile = std::make_shared<ov::intel_npu::op::FlashAttentionTile>(q_input,
+                                                                                  k_input,
+                                                                                  v_transpose,
+                                                                                  f32_nodes.past_acc_f32,
+                                                                                  past_max_squeezed,
+                                                                                  past_sum_squeezed,
+                                                                                  config);
+    }
+
     flash_attn_tile->set_friendly_name("npu_op_flash_attention_tile");
     FlashAttentionResults results;
     results.acc = flash_attn_tile->output(0);
