@@ -160,5 +160,5 @@ target_sources(${TARGET_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pipeline_passes/patch_sliding_mask_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pipeline_passes/remove_empty_kv_inputs_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pipeline_passes/stateful_to_stateless_test.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/npuw/router_pattern_tag_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/npuw/moe_k_tag_test.cpp
 )

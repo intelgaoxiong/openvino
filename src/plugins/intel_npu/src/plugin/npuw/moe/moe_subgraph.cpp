@@ -92,10 +92,14 @@ const T* get_compiled_state(const ov::npuw::v1::subgraphs::Context& context) {
 
 static std::optional<size_t> find_moe_k_value(ov::npuw::v1::subgraphs::Context& ctx) {
     auto* callbacks = ctx.get_if<ov::npuw::v1::subgraphs::PartitioningCallbacks>();
-    if (callbacks == nullptr || !callbacks->find_moe_k_value) {
+    if (callbacks == nullptr || !callbacks->find_node_with_rt_info) {
         return std::nullopt;
     }
-    return callbacks->find_moe_k_value();
+    auto node = callbacks->find_node_with_rt_info(ov::npuw::patterns::moe::RT_INFO_MOE_K);
+    if (!node) {
+        return std::nullopt;
+    }
+    return node->get_rt_info().at(ov::npuw::patterns::moe::RT_INFO_MOE_K).as<size_t>();
 }
 
 void transform_experts(ov::npuw::Function& function,

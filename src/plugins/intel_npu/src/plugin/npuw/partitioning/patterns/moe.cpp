@@ -4,6 +4,8 @@
 
 #include "moe.hpp"
 
+#include <optional>
+
 #include "../../logging.hpp"
 #include "openvino/op/ops.hpp"
 #include "openvino/pass/pattern/op/optional.hpp"
@@ -88,10 +90,12 @@ void isolate_reduce_sum_after(const std::shared_ptr<ov::Node>& output_multiply,
 }
 
 // Extract K from a TopK node's constant second input and write it to rt_info
-// under the RT_INFO_MOE_K key so that PartitioningCallbacks::find_moe_k_value
+// under the RT_INFO_MOE_K key so that PartitioningCallbacks::find_node_with_rt_info
 // can retrieve it during the partition stage.  Returns true on success.
 // Both GPTOSSRouter and Qwen3Router call this after validating the TopK node.
-static bool tag_topk_k(const std::shared_ptr<ov::Node>& topk_node) {
+// expected_k is updated on first call and checked for consistency on subsequent calls;
+// OPENVINO_THROW is raised if two matched layers carry different K values.
+static bool tag_topk_k(const std::shared_ptr<ov::Node>& topk_node, std::optional<size_t>& expected_k) {
     auto k_input = topk_node->input_value(1);
     auto k_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(k_input.get_node_shared_ptr());
     if (!k_const) {
@@ -104,6 +108,14 @@ static bool tag_topk_k(const std::shared_ptr<ov::Node>& topk_node) {
         return false;
     }
     const size_t k_value = static_cast<size_t>(k_data[0]);
+    if (expected_k.has_value() && expected_k.value() != k_value) {
+        OPENVINO_THROW("NPUW: Inconsistent MoE K values across layers: ",
+                       expected_k.value(),
+                       " vs ",
+                       k_value,
+                       ". All MoE layers in a model must share the same K.");
+    }
+    expected_k = k_value;
     topk_node->get_rt_info()[RT_INFO_MOE_K] = k_value;
     LOG_DEBUG("Router: tagged TopK '" << topk_node->get_friendly_name() << "' with K=" << k_value);
     return true;
@@ -271,7 +283,7 @@ GPTOSSExpert::GPTOSSExpert(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
     Manually retrieved (4): topk_convert (indices Convert), Broadcast, Scatter,
                             Transpose, Reshape, Unsqueeze
 */
-GPTOSSRouter::GPTOSSRouter(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
+GPTOSSRouter::GPTOSSRouter([[maybe_unused]] const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
                            [[maybe_unused]] const std::string& isol_tag) {
     LOG_DEBUG("GPTOSSRouter pattern matcher registered (K-extraction only, no isolation)");
 
@@ -290,6 +302,9 @@ GPTOSSRouter::GPTOSSRouter(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
     auto slice = opp::wrap_type<ov::op::v8::Slice>(
         {softmax, opp::any_input(), opp::any_input(), opp::any_input(), opp::any_input()});
 
+    // Shared across all invocations of this callback (one per MoE layer in the model).
+    // tag_topk_k uses it to detect inconsistent K values across layers.
+    auto expected_k = std::make_shared<std::optional<size_t>>();
     auto callback = [=](ov::pass::pattern::Matcher& m) {
         auto& node_to_output = m.get_pattern_value_map();
 
@@ -309,8 +324,8 @@ GPTOSSRouter::GPTOSSRouter(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
         }
 
         // Extract K from the TopK constant input and tag the node so that
-        // PartitioningCallbacks::find_moe_k_value can retrieve it later.
-        if (!tag_topk_k(matched_topk)) {
+        // PartitioningCallbacks::find_node_with_rt_info can retrieve it later.
+        if (!tag_topk_k(matched_topk, *expected_k)) {
             LOG_WARN("GPTOSSRouter: failed to extract K from TopK '" << matched_topk->get_friendly_name()
                                                                      << "'; MoE transformation will be skipped");
         }
@@ -452,7 +467,7 @@ Qwen3Expert::Qwen3Expert(const std::shared_ptr<ov::npuw::online::Snapshot>& snap
     Key difference from GPT-OSS: Softmax is BEFORE TopK (not after),
     requiring explicit renormalization via ReduceSum->Divide.
 */
-Qwen3Router::Qwen3Router(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
+Qwen3Router::Qwen3Router([[maybe_unused]] const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
                          [[maybe_unused]] const std::string& isol_tag) {
     LOG_DEBUG("Qwen3Router pattern matcher registered (K-extraction only, no isolation)");
 
@@ -477,6 +492,9 @@ Qwen3Router::Qwen3Router(const std::shared_ptr<ov::npuw::online::Snapshot>& snap
     auto reshape = opp::wrap_type<ov::op::v1::Reshape>({transpose, opp::any_input()});
     auto unsqueeze = opp::wrap_type<ov::op::v0::Unsqueeze>({reshape, opp::any_input()});
 
+    // Shared across all invocations of this callback (one per MoE layer in the model).
+    // tag_topk_k uses it to detect inconsistent K values across layers.
+    auto expected_k = std::make_shared<std::optional<size_t>>();
     auto callback = [=](ov::pass::pattern::Matcher& m) {
         auto& node_to_output = m.get_pattern_value_map();
 
@@ -488,8 +506,8 @@ Qwen3Router::Qwen3Router(const std::shared_ptr<ov::npuw::online::Snapshot>& snap
         }
 
         // Extract K from the TopK constant input and tag the node so that
-        // PartitioningCallbacks::find_moe_k_value can retrieve it later.
-        if (!tag_topk_k(matched_topk)) {
+        // PartitioningCallbacks::find_node_with_rt_info can retrieve it later.
+        if (!tag_topk_k(matched_topk, *expected_k)) {
             LOG_WARN("Qwen3Router: failed to extract K from TopK '" << matched_topk->get_friendly_name()
                                                                     << "'; MoE transformation will be skipped");
         }

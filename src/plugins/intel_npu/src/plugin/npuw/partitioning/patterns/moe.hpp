@@ -28,7 +28,7 @@ constexpr const char* MLP_EXPERT_NAME = ".mlp.expert";
 
 // RT info key used to propagate the Router's K value from pattern-matching
 // callbacks to the partition stage (written by Router matchers, read by
-// PartitioningCallbacks::find_moe_k_value).
+// PartitioningCallbacks::find_node_with_rt_info).
 constexpr const char* RT_INFO_MOE_K = "npuw_moe_k";
 
 class GPTOSSExpert : public ov::pass::MatcherPass {
@@ -63,7 +63,7 @@ public:
     }
     // NOTE: isol_tag is accepted for macro-call uniformity but is intentionally unused
     //       (Router nodes are not isolated; only K is extracted via RT_INFO_MOE_K).
-    GPTOSSRouter(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
+    GPTOSSRouter([[maybe_unused]] const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
                  [[maybe_unused]] const std::string& isol_tag);
 };
 
@@ -99,7 +99,7 @@ public:
     }
     // NOTE: isol_tag is accepted for macro-call uniformity but is intentionally unused
     //       (Router nodes are not isolated; only K is extracted via RT_INFO_MOE_K).
-    Qwen3Router(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
+    Qwen3Router([[maybe_unused]] const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
                 [[maybe_unused]] const std::string& isol_tag);
 };
 

@@ -22,7 +22,6 @@
 #include "openvino/util/common_util.hpp"
 #include "openvino/util/xml_parse_utils.hpp"
 #include "patterns/dcoff.hpp"
-#include "patterns/moe.hpp"
 #include "patterns/opt.hpp"
 #include "traits.hpp"
 
@@ -2736,31 +2735,9 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
             }
 
             // Pass 2: run deferred partition-stage transformations after all functions are registered.
-
-            // Pre-scan: collect the MoE K value tagged on TopK nodes during Router pattern matching.
-            // Must precede Pass 2 execution so find_moe_k_value() is always O(1) per call.
-            std::optional<size_t> moe_k_value_cache;
-            for (const auto& func_name : all_functions) {
-                const auto& func = P.functions.at(func_name);
-                for (const auto& node : func._model->get_ordered_ops()) {
-                    const auto& rt = node->get_rt_info();
-                    auto it = rt.find(ov::npuw::patterns::moe::RT_INFO_MOE_K);
-                    if (it != rt.end()) {
-                        const size_t found_k = it->second.as<size_t>();
-                        if (moe_k_value_cache.has_value() && moe_k_value_cache.value() != found_k) {
-                            OPENVINO_THROW("NPUW: Inconsistent MoE K values across layers: ",
-                                           moe_k_value_cache.value(),
-                                           " vs ",
-                                           found_k,
-                                           ". All MoE layers in a model must share the same K.");
-                        }
-                        moe_k_value_cache = found_k;
-                        break;
-                    }
-                }
-                // No outer break: scan all functions to catch inconsistent K values.
-            }
-
+            // Partitioning stays generic here: it only exposes shared lookup helpers through the
+            // pipeline context and then runs the registered callbacks.
+            std::unordered_map<std::string, std::shared_ptr<ov::Node>> rt_info_node_cache;
             for (auto&& func_group : all_functions) {
                 LOG_INFO("FOLD Pass 2: Partition-stage pipeline for " << func_group << "...");
                 LOG_BLOCK();
@@ -2781,13 +2758,25 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
                         return nullptr;
                     };
 
-                    // Capture the pre-computed K value (O(1)).
-                    auto find_moe_k_value = [moe_k_value_cache]() -> std::optional<size_t> {
-                        return moe_k_value_cache;
+                    auto find_node_with_rt_info =
+                        [&P, &cache = rt_info_node_cache](const std::string& key) -> std::shared_ptr<ov::Node> {
+                        auto cached = cache.find(key);
+                        if (cached != cache.end()) {
+                            return cached->second;
+                        }
+                        for (const auto& [name, func] : P.functions) {
+                            for (const auto& node : func._model->get_ordered_ops()) {
+                                if (node->get_rt_info().count(key) > 0) {
+                                    cache.emplace(key, node);
+                                    return node;
+                                }
+                            }
+                        }
+                        return nullptr;
                     };
 
                     function._pipeline.context.put<ov::npuw::v1::subgraphs::PartitioningCallbacks>(
-                        {std::move(find_tagged_model), std::move(find_moe_k_value)});
+                        {std::move(find_tagged_model), std::move(find_node_with_rt_info)});
                     function._pipeline.partition_stage(function, function._pipeline.context);
                     // The callback captures partitioning state by reference, so keep it scoped to this
                     // immediate partition-stage invocation and remove it before the context outlives us.
