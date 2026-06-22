@@ -271,7 +271,8 @@ GPTOSSExpert::GPTOSSExpert(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
     Manually retrieved (4): topk_convert (indices Convert), Broadcast, Scatter,
                             Transpose, Reshape, Unsqueeze
 */
-GPTOSSRouter::GPTOSSRouter(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag) {
+GPTOSSRouter::GPTOSSRouter(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
+                           [[maybe_unused]] const std::string& isol_tag) {
     LOG_DEBUG("GPTOSSRouter pattern matcher registered (K-extraction only, no isolation)");
 
     // Pattern-matched nodes (7): Multiply, Convert, MatMul, Add, TopK, Softmax, Slice
@@ -309,7 +310,10 @@ GPTOSSRouter::GPTOSSRouter(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
 
         // Extract K from the TopK constant input and tag the node so that
         // PartitioningCallbacks::find_moe_k_value can retrieve it later.
-        tag_topk_k(matched_topk);
+        if (!tag_topk_k(matched_topk)) {
+            LOG_WARN("GPTOSSRouter: failed to extract K from TopK '" << matched_topk->get_friendly_name()
+                                                                     << "'; MoE transformation will be skipped");
+        }
 
         // Router stays in the upstream subgraph — no isolation.
         return false;
@@ -448,7 +452,8 @@ Qwen3Expert::Qwen3Expert(const std::shared_ptr<ov::npuw::online::Snapshot>& snap
     Key difference from GPT-OSS: Softmax is BEFORE TopK (not after),
     requiring explicit renormalization via ReduceSum->Divide.
 */
-Qwen3Router::Qwen3Router(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag) {
+Qwen3Router::Qwen3Router(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
+                         [[maybe_unused]] const std::string& isol_tag) {
     LOG_DEBUG("Qwen3Router pattern matcher registered (K-extraction only, no isolation)");
 
     // Router weights: Convert(weight) -> Multiply(weight, scale) -> Convert -> MatMul
@@ -484,7 +489,10 @@ Qwen3Router::Qwen3Router(const std::shared_ptr<ov::npuw::online::Snapshot>& snap
 
         // Extract K from the TopK constant input and tag the node so that
         // PartitioningCallbacks::find_moe_k_value can retrieve it later.
-        tag_topk_k(matched_topk);
+        if (!tag_topk_k(matched_topk)) {
+            LOG_WARN("Qwen3Router: failed to extract K from TopK '" << matched_topk->get_friendly_name()
+                                                                    << "'; MoE transformation will be skipped");
+        }
 
         // Router stays in the upstream subgraph — no isolation.
         return false;
