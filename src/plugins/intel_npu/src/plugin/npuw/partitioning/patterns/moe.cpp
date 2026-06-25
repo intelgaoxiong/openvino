@@ -49,20 +49,6 @@ bool is_decoding_stage(const std::shared_ptr<ov::Node>& output_multiply) {
     return true;  // all middle dims are 1 → decoding
 }
 
-// Find the first consumer of `node` satisfying `pred`. Returns nullptr if not found.
-template <typename Pred>
-std::shared_ptr<ov::Node> find_consumer_by_type(const std::shared_ptr<ov::Node>& node, Pred&& pred) {
-    for (auto& output : node->outputs()) {
-        for (auto& input : output.get_target_inputs()) {
-            auto consumer = input.get_node()->shared_from_this();
-            if (pred(consumer)) {
-                return consumer;
-            }
-        }
-    }
-    return nullptr;
-}
-
 // After output_multiply, find the first ReduceSum consumer and isolate it.
 void isolate_reduce_sum_after(const std::shared_ptr<ov::Node>& output_multiply,
                               const std::string& isol_tag,
@@ -181,7 +167,6 @@ static bool tag_topk_k(const std::shared_ptr<ov::Node>& topk_node, std::optional
 GPTOSSExpert::GPTOSSExpert(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag) {
     LOG_DEBUG("GPTOSSExpert pattern matcher registered with tag: " << isol_tag);
 
-    // Input preparation
     auto tile = opp::wrap_type<ov::op::v0::Tile>({opp::any_input(), opp::any_input()});
     auto reshape1 = opp::wrap_type<ov::op::v1::Reshape>({tile, opp::any_input()});
 
@@ -206,7 +191,7 @@ GPTOSSExpert::GPTOSSExpert(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
     auto clamp = opp::wrap_type<ov::op::v0::Clamp>({other_slice});
     auto add2 = opp::wrap_type<ov::op::v1::Add>({clamp, opp::any_input()});
 
-    // Merge branches - awq_multiply will be Swish if not matched, or AWQ Multiply if matched
+    // awq_multiply aliases Swish when not matched.
     auto multiply1 = opp::wrap_type<ov::op::v1::Multiply>({add2, awq_multiply});
 
     // Second MatMul (down projection) - weights path: Multiply -> Convert -> MatMul
@@ -215,7 +200,6 @@ GPTOSSExpert::GPTOSSExpert(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
     auto matmul2 = opp::wrap_type<ov::op::v0::MatMul>({multiply1, weights_convert2});
     auto add3 = opp::wrap_type<ov::op::v1::Add>({matmul2, opp::any_input()});
 
-    // Output reshape - Multiply
     auto reshape2 = opp::wrap_type<ov::op::v1::Reshape>({add3, opp::any_input()});
     auto output_multiply = opp::wrap_type<ov::op::v1::Multiply>({reshape2, opp::any_input()});
 
@@ -299,17 +283,15 @@ GPTOSSExpert::GPTOSSExpert(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
     Slice -> ScatterElementsUpdate -> Transpose -> Reshape -> Unsqueeze
     Broadcast (zero base for Scatter, shape fed by folded Const)
 
-    Pattern-matched (6): Multiply, Convert, MatMul, Add, TopK, Softmax, Slice
-    Manually retrieved (4): topk_convert (indices Convert), Broadcast, Scatter,
-                            Transpose, Reshape, Unsqueeze
+    Pattern root is ScatterElementsUpdate to avoid matching other TopK+Slice subgraphs.
+    No isolation; only TopK K value is extracted via RT_INFO_MOE_K.
 */
 GPTOSSRouter::GPTOSSRouter([[maybe_unused]] const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
                            [[maybe_unused]] const std::string& isol_tag) {
     LOG_DEBUG("GPTOSSRouter pattern matcher registered (K-extraction only, no isolation)");
 
-    // Pattern-matched nodes (7): Multiply, Convert, MatMul, Add, TopK, Softmax, Slice
-    // topk_convert (indices Convert) is retrieved manually - TopK has two outputs and
-    // wrap_type always binds output(0), so output(1)->Convert cannot be expressed inline.
+    // TopK output(1)->Convert (indices) cannot be expressed in wrap_type
+    // (always binds output(0)), so Scatter port 1 uses any_input().
     auto weights_multiply = opp::wrap_type<ov::op::v1::Multiply>({opp::any_input(), opp::any_input()});
     auto weights_convert2 = opp::wrap_type<ov::op::v0::Convert>({weights_multiply});
     auto matmul = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), weights_convert2});
@@ -317,13 +299,15 @@ GPTOSSRouter::GPTOSSRouter([[maybe_unused]] const std::shared_ptr<ov::npuw::onli
     auto topk = opp::wrap_type<ov::op::v11::TopK>({add, opp::any_input()});
     auto softmax = opp::wrap_type<ov::op::v8::Softmax>({topk});  // connects to topk->output(0)
 
-    // Pattern root: Slice data input is Softmax output; all shape inputs are any_input()
-    // because ShapeOf nodes are constant-folded before this pattern runs.
+    // Shape inputs use any_input(): ShapeOf nodes are constant-folded.
     auto slice = opp::wrap_type<ov::op::v8::Slice>(
         {softmax, opp::any_input(), opp::any_input(), opp::any_input(), opp::any_input()});
 
-    // Shared across all invocations of this callback (one per MoE layer in the model).
-    // tag_topk_k uses it to detect inconsistent K values across layers.
+    // Pattern root. port 1: TopK indices (any_input() — wrap_type binds output(0) only).
+    auto scatter = opp::wrap_type<ov::op::v12::ScatterElementsUpdate>(
+        {opp::any_input(), opp::any_input(), slice, opp::any_input()});
+
+    // Shared across layers to detect inconsistent K values.
     auto expected_k = std::make_shared<std::optional<size_t>>();
     auto callback = [=](ov::pass::pattern::Matcher& m) {
         auto& node_to_output = m.get_pattern_value_map();
@@ -354,7 +338,7 @@ GPTOSSRouter::GPTOSSRouter([[maybe_unused]] const std::shared_ptr<ov::npuw::onli
         return false;
     };
 
-    register_matcher(std::make_shared<opp::Matcher>(slice, "TagGPTOSSRouter"), std::move(callback));
+    register_matcher(std::make_shared<opp::Matcher>(scatter, "TagGPTOSSRouter"), std::move(callback));
 }
 
 /*
@@ -384,11 +368,9 @@ GPTOSSRouter::GPTOSSRouter([[maybe_unused]] const std::shared_ptr<ov::npuw::onli
         Reshape2 * router_score -> Multiply_output   <-- pattern root
         (router_score = opp::any_input(), produced entirely by Qwen3Router)
 
-    Isolation boundary:
-    - Expert claims: Tile, Reshape1, all weight-dequant nodes, MatMuls, SwiGLU Multiply, Reshape2, output Multiply
-    - Router claims: Softmax, TopK, ReduceSum, Divide, ScatterElementsUpdate, Transpose, Reshape_score, Unsqueeze_score
-    - Shared shape-compute nodes (ShapeOf->Gather->Unsqueeze->Concat chains) stay outside both,
-      becoming parameter inputs at subgraph boundaries.
+    Expert isolates: Tile, Reshape1, weight-dequant nodes, MatMuls, SwiGLU Multiply, Reshape2, output Multiply.
+    Router isolates: Softmax, TopK, ReduceSum, Divide, Scatter, Transpose, Reshape, Unsqueeze.
+    Shape-compute chains (ShapeOf->Gather->...) stay outside both as subgraph parameters.
 */
 Qwen3Expert::Qwen3Expert(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag) {
     LOG_DEBUG("Qwen3Expert pattern matcher registered with tag: " << isol_tag);
@@ -432,13 +414,10 @@ Qwen3Expert::Qwen3Expert(const std::shared_ptr<ov::npuw::online::Snapshot>& snap
         const bool is_decoding = is_decoding_stage(matched_output_multiply);
         LOG_DEBUG("Qwen3 Expert pattern matched (" << (is_decoding ? "Decoding" : "Prefill") << " stage)");
 
-        // Isolate a required pattern node.
         auto isolate = [&](const std::shared_ptr<ov::Node>& pat) {
             isolate_node(node_to_output.at(pat).get_node_shared_ptr(), isol_tag, node_to_gptr);
         };
-        // Isolate all nodes in a weight chain.
-        // convert_in and reshape are optional: when absent, opp::optional does NOT insert an
-        // entry into node_to_output, so we must guard with .count() before calling .at().
+        // Optional nodes (convert_in, reshape) may be absent from node_to_output.
         auto isolate_weight_chain = [&](const WeightChainPattern& wc) {
             if (node_to_output.count(wc.convert_in)) {
                 auto n_cin = node_to_output.at(wc.convert_in).get_node_shared_ptr();
@@ -499,16 +478,13 @@ Qwen3Expert::Qwen3Expert(const std::shared_ptr<ov::npuw::online::Snapshot>& snap
     Shape to [num_experts, token_count, 1, 1] for expert broadcast:
         ScatterElementsUpdate -> Transpose -> Reshape -> Unsqueeze   <-- pattern root
 
-    Note: TopK output(1) -> Convert(indices) matched via any_input() in Scatter port 1
-    since wrap_type always binds output(0).
     Key difference from GPT-OSS: Softmax is BEFORE TopK (not after).
 */
 Qwen3Router::Qwen3Router([[maybe_unused]] const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
                          [[maybe_unused]] const std::string& isol_tag) {
     LOG_DEBUG("Qwen3Router pattern matcher registered (K-extraction only, no isolation)");
 
-    // Router weight dequantization chain (same layout as Qwen3Expert projections).
-    // Supports both regular and group-quantized weight tensors via opp::optional.
+    // Weight dequant chain (same layout as Qwen3Expert; supports regular and group quant).
     auto wc = make_weight_chain();
     auto matmul = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), wc.convert_out});
 
@@ -520,26 +496,18 @@ Qwen3Router::Qwen3Router([[maybe_unused]] const std::shared_ptr<ov::npuw::online
     auto reduce_sum = opp::wrap_type<ov::op::v1::ReduceSum>({topk, opp::any_input()});
     auto divide = opp::wrap_type<ov::op::v1::Divide>({topk, reduce_sum});
 
-    // Optional Slice of normalized scores before Scatter.
-    // Present in group-quantized models (Divide -> Slice -> Scatter port 2).
-    // Absent in regular models (Divide -> Scatter port 2 directly).
+    // Optional: present in group-quant models (Divide -> Slice -> Scatter port 2).
     auto slice = opp::optional<ov::op::v8::Slice>(
         {divide, opp::any_input(), opp::any_input(), opp::any_input(), opp::any_input()});
 
-    // Scatter to full expert shape.
-    // port 0: zero broadcast (any_input)
-    // port 1: Convert(TopK indices i64->i32) — TopK output(1) cannot be expressed in
-    //         wrap_type (always binds output(0)), so use any_input() here
-    // port 2: slice (normalized scores, or Divide directly if Slice absent)
-    // port 3: axis constant (any_input)
+    // port 1: TopK indices (any_input() — wrap_type binds output(0) only); port 2: scores.
     auto scatter = opp::wrap_type<ov::op::v12::ScatterElementsUpdate>(
         {opp::any_input(), opp::any_input(), slice, opp::any_input()});
     auto transpose = opp::wrap_type<ov::op::v1::Transpose>({scatter, opp::any_input()});
     auto reshape = opp::wrap_type<ov::op::v1::Reshape>({transpose, opp::any_input()});
     auto unsqueeze = opp::wrap_type<ov::op::v0::Unsqueeze>({reshape, opp::any_input()});
 
-    // Shared across all invocations of this callback (one per MoE layer in the model).
-    // tag_topk_k uses it to detect inconsistent K values across layers.
+    // Shared across layers to detect inconsistent K values.
     auto expected_k = std::make_shared<std::optional<size_t>>();
     auto callback = [=](ov::pass::pattern::Matcher& m) {
         auto& node_to_output = m.get_pattern_value_map();
