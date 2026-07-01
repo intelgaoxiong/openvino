@@ -1194,6 +1194,10 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         }
     }
 
+    // Prefill model does not use NPU local pipelining for long context test
+    // control flow is only OK for the iterative kvcache/generate stage
+    prefill_config["NPUW_CONTROLFLOW_EN"] = "NO";
+
     // Compile multiple generate model variants with different sizes
     compile_generate_model_variants(generate_model_variants, plugin, generate_config);
 
