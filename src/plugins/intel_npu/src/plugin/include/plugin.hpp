@@ -15,7 +15,6 @@
 #include "openvino/runtime/iplugin.hpp"
 #include "openvino/runtime/so_ptr.hpp"
 #include "plugin_property_manager.hpp"
-#include "properties.hpp"
 #include "schedule_builder.hpp"
 
 namespace intel_npu {
