@@ -253,68 +253,63 @@ void reconstruct_dense_router_scores(const ov::SoPtr<ov::ITensor>& compact_score
                                      size_t num_experts,
                                      size_t num_active,
                                      size_t num_tokens) {
-    NPUW_ASSERT(compact_scores  && "compact_scores tensor is null");
+    NPUW_ASSERT(compact_scores && "compact_scores tensor is null");
     NPUW_ASSERT(compact_indices && "compact_indices tensor is null");
-    NPUW_ASSERT(dense_out       && "dense_out tensor is null");
+    NPUW_ASSERT(dense_out && "dense_out tensor is null");
 
-    // Zero the dense output first
+    // Zero the dense output (experts not selected by any token must be 0)
     std::memset(dense_out->data(), 0, dense_out->get_byte_size());
 
     // Determine compact layout: [K, N] or [N, K]
     const auto& cshape = compact_scores->get_shape();
     NPUW_ASSERT(cshape.size() >= 2 && "compact_scores must be at least 2D");
-    const bool k_first  = (cshape[0] == num_active);
-    const size_t K_stride = k_first ? num_tokens : 1;   // stride along K dimension
-    const size_t N_stride = k_first ? 1 : num_active;   // stride along N (token) dimension
+    const bool k_first = (cshape[0] == num_active);
+    const size_t K_stride = k_first ? num_tokens : 1;
+    const size_t N_stride = k_first ? 1 : num_active;
 
-    // Dense layout: [E, 1, N, 1] — expert_id * num_tokens + token_id
-    const auto scatter_fp16 = [&](const ov::float16* scores, const auto* indices, ov::float16* dense) {
+    // Dense layout: [E, 1, N, 1] — offset = expert_id * num_tokens + token_id
+    // Inner scatter: converts scores (any float type) → dense (any float type) via static_cast.
+    // This handles same-type (f16→f16, f32→f32) and cross-type (f16→f32) cases uniformly.
+    auto scatter_core = [&](const auto* scores, const auto* indices, auto* dense) {
+        using DstT = std::remove_pointer_t<decltype(dense)>;
         for (size_t k = 0; k < num_active; ++k) {
             for (size_t t = 0; t < num_tokens; ++t) {
                 const size_t src = k * K_stride + t * N_stride;
                 const size_t expert_id = static_cast<size_t>(indices[src]);
                 NPUW_ASSERT(expert_id < num_experts && "Expert index out of range in compact_indices");
-                dense[expert_id * num_tokens + t] = scores[src];
-            }
-        }
-    };
-    const auto scatter_f32 = [&](const float* scores, const auto* indices, float* dense) {
-        for (size_t k = 0; k < num_active; ++k) {
-            for (size_t t = 0; t < num_tokens; ++t) {
-                const size_t src = k * K_stride + t * N_stride;
-                const size_t expert_id = static_cast<size_t>(indices[src]);
-                NPUW_ASSERT(expert_id < num_experts && "Expert index out of range in compact_indices");
-                dense[expert_id * num_tokens + t] = scores[src];
+                dense[expert_id * num_tokens + t] = static_cast<DstT>(scores[src]);
             }
         }
     };
 
-    const auto scores_type  = compact_scores->get_element_type();
+    const auto scores_type = compact_scores->get_element_type();
+    const auto dense_type = dense_out->get_element_type();
     const auto indices_type = compact_indices->get_element_type();
-    const auto dense_type   = dense_out->get_element_type();
-    (void)dense_type;  // dense_type must match scores_type; asserted below in dispatching
 
-    if (scores_type == ov::element::f16) {
-        const auto* s = compact_scores->data<ov::float16>();
-        auto*       d = dense_out->data<ov::float16>();
-        if (indices_type == ov::element::i32)
-            scatter_fp16(s, compact_indices->data<int32_t>(), d);
-        else if (indices_type == ov::element::i64)
-            scatter_fp16(s, compact_indices->data<int64_t>(), d);
+    // Dispatch on (scores_type, dense_type, indices_type)
+    auto with_dest = [&](const auto* scores) {
+        auto with_indices = [&](auto* dense) {
+            if (indices_type == ov::element::i32)
+                scatter_core(scores, compact_indices->data<int32_t>(), dense);
+            else if (indices_type == ov::element::i64)
+                scatter_core(scores, compact_indices->data<int64_t>(), dense);
+            else
+                OPENVINO_THROW("reconstruct_dense_router_scores: unsupported indices type ", indices_type);
+        };
+        if (dense_type == ov::element::f16)
+            with_indices(dense_out->data<ov::float16>());
+        else if (dense_type == ov::element::f32)
+            with_indices(dense_out->data<float>());
         else
-            OPENVINO_THROW("reconstruct_dense_router_scores: unsupported indices type ", indices_type);
-    } else if (scores_type == ov::element::f32) {
-        const auto* s = compact_scores->data<float>();
-        auto*       d = dense_out->data<float>();
-        if (indices_type == ov::element::i32)
-            scatter_f32(s, compact_indices->data<int32_t>(), d);
-        else if (indices_type == ov::element::i64)
-            scatter_f32(s, compact_indices->data<int64_t>(), d);
-        else
-            OPENVINO_THROW("reconstruct_dense_router_scores: unsupported indices type ", indices_type);
-    } else {
+            OPENVINO_THROW("reconstruct_dense_router_scores: unsupported dense_out type ", dense_type);
+    };
+
+    if (scores_type == ov::element::f16)
+        with_dest(compact_scores->data<ov::float16>());
+    else if (scores_type == ov::element::f32)
+        with_dest(compact_scores->data<float>());
+    else
         OPENVINO_THROW("reconstruct_dense_router_scores: unsupported scores type ", scores_type);
-    }
 }
 
 // ====================================================================================================

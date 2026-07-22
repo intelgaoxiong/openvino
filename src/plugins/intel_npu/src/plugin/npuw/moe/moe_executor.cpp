@@ -335,7 +335,6 @@ void MoEExecutor::run_expert_batch(size_t idx, size_t real_idx, const std::vecto
 
 void MoEExecutor::run_expert_iterative(size_t idx) {
     LOG_DEBUG("\n[EXPERT_ITERATIVE] Processing multiple tokens with async inference and overlapping NPU execution");
-
     const auto& io = m_moe_io[idx];
 
     // Precondition checks
@@ -353,9 +352,26 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
         OPENVINO_THROW("MoE: Expert input parameter index not available");
     if (m_resources.sorted_chunk_sizes.empty())
         OPENVINO_THROW("MoE: Sorted chunk sizes cannot be empty");
-    NPUW_ASSERT(m_resources.dense_router_scores_buffer &&
-                "dense_router_scores_buffer not allocated — initialize_expert_iterative_mode must run first");
 
+    // Lazily (re)allocate the dense router scores buffer with the type that the Expert compiled
+    // model expects for its router_scores input port.  This may differ from compact_scores
+    // (e.g. compact f16 from Router but router_dest f32 from the explicit Parameter).
+    {
+        ov::element::Type router_dest_type = io.compact_scores->get_element_type();  // fallback
+        if (m_config.router_scores.compiled.has_value() && !m_config.compiled_models.empty()) {
+            const auto& first_cm = m_config.compiled_models.begin()->second;
+            const auto rs_idx = m_config.router_scores.compiled.value();
+            if (rs_idx < first_cm->inputs().size())
+                router_dest_type = first_cm->inputs()[rs_idx].get_element_type();
+        }
+        if (!m_resources.dense_router_scores_buffer ||
+            m_resources.dense_router_scores_buffer->get_element_type() != router_dest_type) {
+            const ov::Shape dense_shape{m_config.num_experts, 1, m_config.input_token_count, 1};
+            m_resources.dense_router_scores_buffer = m_allocator(router_dest_type, dense_shape, "CPU");
+            LOG_DEBUG("(Re)allocated dense_router_scores_buffer: type=" << router_dest_type
+                                                                        << ", shape=" << dense_shape);
+        }
+    }
     // Reconstruct dense [E,1,N,1] router scores from compact [K,N] format (HOST-side, once per layer).
     // This eliminates ScatterElementsUpdate from the Router NPU model.
     ov::npuw::moe::reconstruct_dense_router_scores(io.compact_scores,
@@ -366,7 +382,6 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
                                                    m_config.input_token_count);
     // Expose the reconstructed dense tensor as io.router_scores for gather_router_scores().
     m_moe_io[idx].router_scores = m_resources.dense_router_scores_buffer;
-
 
     auto expert_input_source = io.expert_input;
 
@@ -470,13 +485,13 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
         auto output = req->get_tensor(cm->outputs()[0]);
         // Capture scatter inputs by value so the async task owns them independently of
         // the ring buffer and inflight state (both advance immediately after this return).
-        std::vector<size_t> sc_tokens   = data.tokens;
-        std::vector<size_t> sc_slots    = data.slots;
-        const size_t sc_chunk_start     = inflight->chunk_start;
-        const size_t sc_chunk_tokens    = inflight->chunk_tokens;
-        auto         sc_accum           = m_resources.expert_output_accumulator;
-        const size_t sc_embed_dim       = embed_dim;
-        const size_t sc_num_tokens      = num_tokens;
+        std::vector<size_t> sc_tokens = data.tokens;
+        std::vector<size_t> sc_slots = data.slots;
+        const size_t sc_chunk_start = inflight->chunk_start;
+        const size_t sc_chunk_tokens = inflight->chunk_tokens;
+        auto sc_accum = m_resources.expert_output_accumulator;
+        const size_t sc_embed_dim = embed_dim;
+        const size_t sc_num_tokens = num_tokens;
         scatter_future = std::async(std::launch::async, [=]() {
             ov::npuw::moe::scatter_expert_outputs(output,
                                                   sc_accum,
