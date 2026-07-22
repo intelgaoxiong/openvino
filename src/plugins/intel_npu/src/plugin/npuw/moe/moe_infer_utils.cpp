@@ -244,6 +244,80 @@ void scatter_expert_outputs(const ov::SoPtr<ov::ITensor>& expert_output,
 }
 
 // ====================================================================================================
+// reconstruct_dense_router_scores
+// ====================================================================================================
+
+void reconstruct_dense_router_scores(const ov::SoPtr<ov::ITensor>& compact_scores,
+                                     const ov::SoPtr<ov::ITensor>& compact_indices,
+                                     const ov::SoPtr<ov::ITensor>& dense_out,
+                                     size_t num_experts,
+                                     size_t num_active,
+                                     size_t num_tokens) {
+    NPUW_ASSERT(compact_scores  && "compact_scores tensor is null");
+    NPUW_ASSERT(compact_indices && "compact_indices tensor is null");
+    NPUW_ASSERT(dense_out       && "dense_out tensor is null");
+
+    // Zero the dense output first
+    std::memset(dense_out->data(), 0, dense_out->get_byte_size());
+
+    // Determine compact layout: [K, N] or [N, K]
+    const auto& cshape = compact_scores->get_shape();
+    NPUW_ASSERT(cshape.size() >= 2 && "compact_scores must be at least 2D");
+    const bool k_first  = (cshape[0] == num_active);
+    const size_t K_stride = k_first ? num_tokens : 1;   // stride along K dimension
+    const size_t N_stride = k_first ? 1 : num_active;   // stride along N (token) dimension
+
+    // Dense layout: [E, 1, N, 1] — expert_id * num_tokens + token_id
+    const auto scatter_fp16 = [&](const ov::float16* scores, const auto* indices, ov::float16* dense) {
+        for (size_t k = 0; k < num_active; ++k) {
+            for (size_t t = 0; t < num_tokens; ++t) {
+                const size_t src = k * K_stride + t * N_stride;
+                const size_t expert_id = static_cast<size_t>(indices[src]);
+                NPUW_ASSERT(expert_id < num_experts && "Expert index out of range in compact_indices");
+                dense[expert_id * num_tokens + t] = scores[src];
+            }
+        }
+    };
+    const auto scatter_f32 = [&](const float* scores, const auto* indices, float* dense) {
+        for (size_t k = 0; k < num_active; ++k) {
+            for (size_t t = 0; t < num_tokens; ++t) {
+                const size_t src = k * K_stride + t * N_stride;
+                const size_t expert_id = static_cast<size_t>(indices[src]);
+                NPUW_ASSERT(expert_id < num_experts && "Expert index out of range in compact_indices");
+                dense[expert_id * num_tokens + t] = scores[src];
+            }
+        }
+    };
+
+    const auto scores_type  = compact_scores->get_element_type();
+    const auto indices_type = compact_indices->get_element_type();
+    const auto dense_type   = dense_out->get_element_type();
+    (void)dense_type;  // dense_type must match scores_type; asserted below in dispatching
+
+    if (scores_type == ov::element::f16) {
+        const auto* s = compact_scores->data<ov::float16>();
+        auto*       d = dense_out->data<ov::float16>();
+        if (indices_type == ov::element::i32)
+            scatter_fp16(s, compact_indices->data<int32_t>(), d);
+        else if (indices_type == ov::element::i64)
+            scatter_fp16(s, compact_indices->data<int64_t>(), d);
+        else
+            OPENVINO_THROW("reconstruct_dense_router_scores: unsupported indices type ", indices_type);
+    } else if (scores_type == ov::element::f32) {
+        const auto* s = compact_scores->data<float>();
+        auto*       d = dense_out->data<float>();
+        if (indices_type == ov::element::i32)
+            scatter_f32(s, compact_indices->data<int32_t>(), d);
+        else if (indices_type == ov::element::i64)
+            scatter_f32(s, compact_indices->data<int64_t>(), d);
+        else
+            OPENVINO_THROW("reconstruct_dense_router_scores: unsupported indices type ", indices_type);
+    } else {
+        OPENVINO_THROW("reconstruct_dense_router_scores: unsupported scores type ", scores_type);
+    }
+}
+
+// ====================================================================================================
 // MoE Request Cache Implementation
 // ====================================================================================================
 

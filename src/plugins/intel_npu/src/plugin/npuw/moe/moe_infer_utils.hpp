@@ -143,6 +143,27 @@ void scatter_expert_outputs(const ov::SoPtr<ov::ITensor>& expert_output,
                             const std::vector<size_t>& expert_slots_for_tokens);
 
 /**
+ * @brief Reconstruct dense router scores from compact (ScatterEU-free) format.
+ *
+ * Converts compact tensors produced by the Router NPU subgraph (after ScatterEU removal)
+ * to the dense [E, 1, N, 1] format expected by gather_router_scores().
+ * Called once per layer at the start of run_expert_iterative.
+ *
+ * @param compact_scores  Compact scores [K, N] or [N, K] (float16/float32)
+ * @param compact_indices Compact expert indices [K, N] or [N, K] (int32/int64)
+ * @param dense_out       Pre-allocated dense output [E, 1, N, 1]; will be zeroed first
+ * @param num_experts     E — total expert count
+ * @param num_active      K — active experts per token (size of K dimension)
+ * @param num_tokens      N — token count (size of N dimension)
+ */
+void reconstruct_dense_router_scores(const ov::SoPtr<ov::ITensor>& compact_scores,
+                                     const ov::SoPtr<ov::ITensor>& compact_indices,
+                                     const ov::SoPtr<ov::ITensor>& dense_out,
+                                     size_t num_experts,
+                                     size_t num_active,
+                                     size_t num_tokens);
+
+/**
  * @brief MoE Request Cache - LRU cache for expert inference requests.
  *
  * Manages a fixed-size pool of pre-configured inference requests per MoE sublayer.

@@ -52,7 +52,9 @@ struct MoEStructureInfo {
 
     // Parameter indices (detected once during analysis)
     std::optional<size_t> expert_input_param_idx;  // Parameter index for expert's input (token embeddings)
-    std::optional<size_t> router_scores_idx;       // Parameter index for router scores (from Multiply in output path)
+    // Compact router parameters from ScatterElementsUpdate inputs inside the Expert subgraph:
+    std::optional<size_t> compact_scores_idx;      // Divide output [K, N] — normalized router scores
+    std::optional<size_t> compact_indices_idx;     // TopK.indices [K, N] — selected expert indices
 
     // Processing mode (inferred from input_token_count)
     moe::MoEProcessingMode processing_mode = moe::MoEProcessingMode::EXPERT_ITERATIVE;
@@ -70,7 +72,7 @@ struct MoEStructureInfo {
     bool is_valid() const {
         return num_experts > 0 && expert_hidden_dim > 0 && expert_input_tile_node != nullptr &&
                router_scores_multiply_node != nullptr && expert_input_param_idx.has_value() &&
-               router_scores_idx.has_value();
+               compact_scores_idx.has_value() && compact_indices_idx.has_value();
     }
 };
 
@@ -193,8 +195,12 @@ struct MoEExperts {
     std::map<size_t, std::shared_ptr<ov::Model>> _transformed_models;
 
     // Parameter indices (original = in original model, compiled = in compiled/transformed model)
-    ParamIndex _router_scores;  // router scores input parameter
-    ParamIndex _expert_input;   // expert activation input parameter
+    ParamIndex _router_scores;    // explicit router-scores Parameter added during transformation
+                                  // (.original = nullopt — synthetic; .compiled set via rt_info tag)
+    ParamIndex _expert_input;     // expert activation input parameter
+    // Compact router parameters from ScatterEU inputs (cross-boundary from Router partition):
+    ParamIndex _compact_scores;   // Divide [K,N] — compact router scores
+    ParamIndex _compact_indices;  // TopK.indices [K,N] — compact router indices
 
     // Parameter mapping: original_param_idx -> [unrolled_param_indices]
     // For EXPERT_ITERATIVE mode: no unrolling, so this will be empty or identity mapping
@@ -205,7 +211,7 @@ struct MoEExperts {
     // Validation helpers
     bool is_valid() const {
         return _num_experts > 0 && _expert_hidden_dim > 0 && !_transformed_models.empty() &&
-               _router_scores.original.has_value();
+               _compact_scores.original.has_value();
     }
 
     size_t num_experts() const {
@@ -278,8 +284,11 @@ struct MoEExperts {
 
     // Router scores / expert input parameter indices
     // (.original = in original model; .compiled = in compiled/transformed model)
-    ParamIndex _router_scores;
+    ParamIndex _router_scores;    // explicit router_scores Parameter (synthetic; .original = nullopt)
     ParamIndex _expert_input;
+    // Compact router parameters:
+    ParamIndex _compact_scores;   // Divide [K,N]
+    ParamIndex _compact_indices;  // TopK.indices [K,N]
 
     // Parameter mapping: original_param_idx -> [unrolled_param_indices]
     // Same for all chunk sizes (unrolling only in EXPERT_BATCH mode)

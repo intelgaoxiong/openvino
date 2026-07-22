@@ -91,8 +91,13 @@ void MoEResources::initialize_expert_iterative_mode(
 
     expert_output_accumulator = allocator(output_element_type, buffer_shape, device);
 
-    LOG_DEBUG("Allocated iterative mode output buffer: shape=" << buffer_shape << ", type=" << output_element_type
-                                                               << ", device=" << device);
+    // Allocate dense router scores buffer for HOST-side compact→dense reconstruction.
+    // Shape [E, 1, N, 1] mirrors the original ScatterEU output layout used by gather_router_scores.
+    const size_t num_experts_val = config.num_experts;
+    const ov::Shape dense_scores_shape{num_experts_val, 1, num_tokens, 1};
+    dense_router_scores_buffer = allocator(output_element_type, dense_scores_shape, "CPU");
+    LOG_DEBUG("Allocated dense_router_scores_buffer: shape=" << dense_scores_shape
+              << ", type=" << output_element_type << ", device=" << device);
 
     LOG_DEBUG("Expert iterative mode initialization completed");
 }

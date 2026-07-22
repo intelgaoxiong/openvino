@@ -33,6 +33,46 @@ void isolate_node(const std::shared_ptr<ov::Node>& node,
     }
 }
 
+// Isolate the ScatterEU tail (router_score input chain of output_multiply) into the Expert
+// partition so it is removed from the Router NPU subgraph during Expert model transformation.
+// Chain traversed upward from output_multiply's router_score input:
+//   Unsqueeze ← Reshape ← Transpose ← ScatterElementsUpdate (stop)
+// Additionally, ScatterEU's zero-broadcast target input (port 0) is also isolated:
+//   Constant → Convert → Broadcast → ScatterEU input(0)
+void isolate_scatter_chain_from_multiply(const std::shared_ptr<ov::Node>& output_multiply,
+                                         const std::string& isol_tag,
+                                         const NodeToGroupMapPtr& node_to_gptr) {
+    for (size_t i = 0; i < 2; ++i) {
+        auto inp = output_multiply->input_value(i).get_node_shared_ptr();
+        if (std::dynamic_pointer_cast<ov::op::v1::Reshape>(inp))
+            continue;  // skip the expert-output Reshape; follow the router_score side
+        auto curr = inp;
+        while (curr) {
+            if (auto scatter = std::dynamic_pointer_cast<ov::op::v12::ScatterElementsUpdate>(curr)) {
+                isolate_node(curr, isol_tag, node_to_gptr);
+                // Also isolate the zero-broadcast target input chain on ScatterEU port 0.
+                // Typical pattern: Constant → Convert → Broadcast → ScatterEU input(0)
+                auto zero_curr = scatter->input_value(0).get_node_shared_ptr();
+                while (zero_curr && !std::dynamic_pointer_cast<ov::op::v0::Constant>(zero_curr)) {
+                    isolate_node(zero_curr, isol_tag, node_to_gptr);
+                    if (zero_curr->get_input_size() == 0)
+                        break;
+                    zero_curr = zero_curr->input_value(0).get_node_shared_ptr();
+                }
+                break;  // stop — do not pull Router score-compute nodes into Expert
+            } else if (std::dynamic_pointer_cast<ov::op::v0::Unsqueeze>(curr) ||
+                       std::dynamic_pointer_cast<ov::op::v1::Transpose>(curr) ||
+                       std::dynamic_pointer_cast<ov::op::v1::Reshape>(curr)) {
+                isolate_node(curr, isol_tag, node_to_gptr);
+                curr = curr->input_value(0).get_node_shared_ptr();
+            } else {
+                break;
+            }
+        }
+        break;  // only one non-Reshape input to process
+    }
+}
+
 // Scan output_multiply's middle dimensions (all dims except dim-0=num_experts and last=hidden).
 // If any middle dim > 1 it is the token count (prefill). If all are 1, it is decoding.
 // Shape layouts:  GPT-OSS [N, token, 1, H]  /  Qwen3 [N, 1, token, H]
@@ -157,13 +197,24 @@ RouterScorePattern build_shared_router_score_pattern() {
     return {matmul, topk, reduce_sum, divide};
 }
 
-// Builds the shared router tail pattern (Scatter -> Transpose -> Reshape -> Unsqueeze).
-// Pattern root is Unsqueeze; this helper encapsulates the tail logic common to all Router implementations.
-std::shared_ptr<ov::Node> build_shared_router_tail(const std::shared_ptr<ov::Node>& scatter_input) {
+// Nodes produced by the shared router tail pattern (Scatter→Transpose→Reshape→Unsqueeze).
+struct RouterTailNodes {
+    std::shared_ptr<ov::Node> transpose;
+    std::shared_ptr<ov::Node> reshape;
+    std::shared_ptr<ov::Node> unsqueeze;
+};
+
+// Builds the shared router tail pattern and returns all intermediate nodes for isolation.
+RouterTailNodes build_shared_router_tail_nodes(const std::shared_ptr<ov::Node>& scatter_input) {
     auto transpose = opp::wrap_type<ov::op::v1::Transpose>({scatter_input, opp::any_input()});
     auto reshape = opp::wrap_type<ov::op::v1::Reshape>({transpose, opp::any_input()});
     auto unsqueeze = opp::wrap_type<ov::op::v0::Unsqueeze>({reshape, opp::any_input()});
-    return unsqueeze;
+    return {transpose, reshape, unsqueeze};
+}
+
+// Legacy wrapper — returns only the pattern root (Unsqueeze) for callers that do not isolate the tail.
+std::shared_ptr<ov::Node> build_shared_router_tail(const std::shared_ptr<ov::Node>& scatter_input) {
+    return build_shared_router_tail_nodes(scatter_input).unsqueeze;
 }
 
 // Builds the pattern graph and callback for a SwiGLU-style expert layer with a
@@ -242,6 +293,8 @@ std::pair<std::shared_ptr<opp::Matcher>, std::function<bool(opp::Matcher&)>> mak
         if (is_decoding) {
             isolate_reduce_sum_after(matched_output_multiply, isol_tag, node_to_gptr);
         }
+        // Isolate ScatterEU chain into Expert partition so it is dropped during transformation.
+        isolate_scatter_chain_from_multiply(matched_output_multiply, isol_tag, node_to_gptr);
 
         return false;
     };
@@ -386,6 +439,8 @@ GPTOSSExpert::GPTOSSExpert(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
             LOG_DEBUG("Decoding stage detected, searching for ReduceSum to isolate...");
             isolate_reduce_sum_after(matched_output_multiply, isol_tag, node_to_gptr);
         }
+        // Isolate ScatterEU chain into Expert partition so it is dropped during transformation.
+        isolate_scatter_chain_from_multiply(matched_output_multiply, isol_tag, node_to_gptr);
 
         return false;
     };
@@ -426,12 +481,13 @@ GPTOSSRouter::GPTOSSRouter([[maybe_unused]] const std::shared_ptr<ov::npuw::onli
     auto slice = opp::wrap_type<ov::op::v8::Slice>(
         {softmax, opp::any_input(), opp::any_input(), opp::any_input(), opp::any_input()});
 
-    // Pattern root. port 1: TopK indices (any_input() — wrap_type binds output(0) only).
+    // port 1: TopK indices (any_input() — wrap_type binds output(0) only).
     auto scatter = opp::wrap_type<ov::op::v12::ScatterElementsUpdate>(
         {opp::any_input(), opp::any_input(), slice, opp::any_input()});
+    auto tail = build_shared_router_tail_nodes(scatter);
 
-    // Shared across layers to detect inconsistent K values.
-    register_matcher(std::make_shared<opp::Matcher>(scatter, "TagGPTOSSRouter"),
+    // K-extraction only — ScatterEU chain is isolated in GPTOSSExpert callback instead.
+    register_matcher(std::make_shared<opp::Matcher>(tail.unsqueeze, "TagGPTOSSRouter"),
                      make_router_k_callback(topk, "GPTOSSRouter", [](const std::shared_ptr<ov::Node>& node) {
                          const auto& name = node->get_friendly_name();
                          return name.find(MLP_ROUTER_NAME) != std::string::npos ||
@@ -501,10 +557,10 @@ Qwen3Router::Qwen3Router([[maybe_unused]] const std::shared_ptr<ov::npuw::online
     // Scatter inputs: any_input() for zero_broadcast, topk_to_scatter for indices, divide_to_scatter for scores
     auto scatter_input = opp::wrap_type<ov::op::v12::ScatterElementsUpdate>(
         {opp::any_input(), topk_to_scatter, divide_to_scatter, opp::any_input()});
-    auto unsqueeze = build_shared_router_tail(scatter_input);
+    auto tail = build_shared_router_tail_nodes(scatter_input);
 
-    // Shared K-value extraction and validation callback.
-    register_matcher(std::make_shared<opp::Matcher>(unsqueeze, "TagQwen3Router"),
+    // K-extraction only — ScatterEU chain is isolated in Qwen3Expert callback instead.
+    register_matcher(std::make_shared<opp::Matcher>(tail.unsqueeze, "TagQwen3Router"),
                      make_router_k_callback(score_nodes.topk, "Qwen3Router"));
 }
 
@@ -563,8 +619,6 @@ Gemma4Router::Gemma4Router([[maybe_unused]] const std::shared_ptr<ov::npuw::onli
     auto score_nodes = build_shared_router_score_pattern();
 
     // Gemma4-specific: Per-expert learned scale via Gather, then Multiply and Slice
-    // TopK output(1) (indices) goes through Convert before Gather port 1;
-    // wrap_type can only express output(0), so both use any_input().
     auto gather = opp::wrap_type<ov::op::v8::Gather>({opp::any_input(), opp::any_input(), opp::any_input()});
     auto scores_multiply = opp::wrap_type<ov::op::v1::Multiply>({score_nodes.divide, gather});
     auto slice = opp::wrap_type<ov::op::v8::Slice>(
@@ -573,10 +627,10 @@ Gemma4Router::Gemma4Router([[maybe_unused]] const std::shared_ptr<ov::npuw::onli
     // Scatter inputs: any_input() for indices and zero_broadcast, slice for scores
     auto scatter_input = opp::wrap_type<ov::op::v12::ScatterElementsUpdate>(
         {opp::any_input(), opp::any_input(), slice, opp::any_input()});
-    auto unsqueeze = build_shared_router_tail(scatter_input);
+    auto tail = build_shared_router_tail_nodes(scatter_input);
 
-    // Shared K-value extraction and validation callback.
-    register_matcher(std::make_shared<opp::Matcher>(unsqueeze, "TagGemma4Router"),
+    // K-extraction only — ScatterEU chain is isolated in Gemma4Expert callback instead.
+    register_matcher(std::make_shared<opp::Matcher>(tail.unsqueeze, "TagGemma4Router"),
                      make_router_k_callback(score_nodes.topk, "Gemma4Router"));
 }
 

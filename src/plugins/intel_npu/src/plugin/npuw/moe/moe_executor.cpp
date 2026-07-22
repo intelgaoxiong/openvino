@@ -52,6 +52,10 @@ void MoEExecutor::prepare(size_t idx, size_t real_idx, size_t num_sublayers, siz
         m_config.router_scores.compiled = moe_experts->_router_scores.compiled;
         m_config.expert_input.original = moe_experts->_expert_input.original;
         m_config.expert_input.compiled = moe_experts->_expert_input.compiled;
+        m_config.compact_scores.original = moe_experts->_compact_scores.original;
+        m_config.compact_scores.compiled = moe_experts->_compact_scores.compiled;
+        m_config.compact_indices.original = moe_experts->_compact_indices.original;
+        m_config.compact_indices.compiled = moe_experts->_compact_indices.compiled;
         m_config.compiled_models = moe_experts->_compiled_models;
 
         // Validate configuration
@@ -141,21 +145,26 @@ bool MoEExecutor::function_prologue_moe_input(size_t idx,
 
     // MoE expert layer: handle router scores and expert inputs
     if (const auto* moe = get_compiled_experts(desc.pipeline.context)) {
-        // Router scores: store for later use in MoE inference
-        if (moe->_router_scores.original.has_value() && param_idx == moe->_router_scores.original.value()) {
+        // Compact scores [K, N] from Router Divide output
+        if (moe->_compact_scores.original.has_value() && param_idx == moe->_compact_scores.original.value()) {
             NPUW_ASSERT(idx < m_moe_io.size() && "MoEExecutor::prepare() must be called first");
-            m_moe_io[idx].router_scores = i_tensor;
-            return true;  // Handled by MoE
+            m_moe_io[idx].compact_scores = i_tensor;
+            return true;
         }
-
+        // Compact indices [K, N] from Router TopK.indices
+        if (moe->_compact_indices.original.has_value() && param_idx == moe->_compact_indices.original.value()) {
+            NPUW_ASSERT(idx < m_moe_io.size() && "MoEExecutor::prepare() must be called first");
+            m_moe_io[idx].compact_indices = i_tensor;
+            return true;
+        }
         // Expert inputs: store for later use (batch mode: cache binding, iterative mode: chunking)
         if (moe->_expert_input.original.has_value() && param_idx == moe->_expert_input.original.value()) {
             NPUW_ASSERT(idx < m_moe_io.size() && "MoEExecutor::prepare() must be called first");
             m_moe_io[idx].expert_input = i_tensor;
             return true;  // Handled by MoE
         }
-
-        // For expert layer, all param_base parameters should be router_scores or expert_input
+        // router_scores has no .original (synthetic param) — it is set directly in run_expert_iterative.
+        // For expert layer, all param_base parameters should be compact_scores, compact_indices or expert_input
         NPUW_ASSERT(false && "Unknown MoE expert parameter index");
         return false;  // Unreachable
     }
@@ -212,9 +221,9 @@ void MoEExecutor::run(size_t real_idx, size_t idx) {
     // Get I/O for this sublayer
     const auto& io = m_moe_io[idx];
 
-    if (!io.router_scores) {
-        OPENVINO_THROW("MoE: Router scores are required but not available");
-    }
+    // if (!io.router_scores) {
+    //     OPENVINO_THROW("MoE: Router scores are required but not available");
+    // }
 
     // Dispatch to appropriate inference function.
     // EXPERT_BATCH: parse upfront (single token, routing maps needed for cache lookup).
@@ -334,12 +343,29 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
         OPENVINO_THROW("MoE: Expert output accumulator is null");
     if (!io.expert_input)
         OPENVINO_THROW("MoE: Expert input tensor is not set — prologue must bind it before run()");
+    if (!io.compact_scores)
+        OPENVINO_THROW("MoE: compact_scores tensor not set — prologue must bind it before run()");
+    if (!io.compact_indices)
+        OPENVINO_THROW("MoE: compact_indices tensor not set — prologue must bind it before run()");
     if (!m_config.router_scores.compiled.has_value())
-        OPENVINO_THROW("MoE: Router scores index not available");
+        OPENVINO_THROW("MoE: Router scores compiled index not available");
     if (!m_config.expert_input.compiled.has_value())
         OPENVINO_THROW("MoE: Expert input parameter index not available");
     if (m_resources.sorted_chunk_sizes.empty())
         OPENVINO_THROW("MoE: Sorted chunk sizes cannot be empty");
+    NPUW_ASSERT(m_resources.dense_router_scores_buffer &&
+                "dense_router_scores_buffer not allocated — initialize_expert_iterative_mode must run first");
+
+    // Reconstruct dense [E,1,N,1] router scores from compact [K,N] format (HOST-side, once per layer).
+    // This eliminates ScatterElementsUpdate from the Router NPU model.
+    ov::npuw::moe::reconstruct_dense_router_scores(io.compact_scores,
+                                                   io.compact_indices,
+                                                   m_resources.dense_router_scores_buffer,
+                                                   m_config.num_experts,
+                                                   m_config.num_active_experts,
+                                                   m_config.input_token_count);
+    // Expose the reconstructed dense tensor as io.router_scores for gather_router_scores().
+    m_moe_io[idx].router_scores = m_resources.dense_router_scores_buffer;
 
 
     auto expert_input_source = io.expert_input;
@@ -614,7 +640,10 @@ void MoEExecutor::set_router_scores(size_t idx,
 
     // Validate router scores index is provided
     if (!m_config.router_scores.original.has_value()) {
-        OPENVINO_THROW("MoE: Router input parameter index not specified for expert model");
+        // Compact path: EXPERT_BATCH with compact ScatterEU removal is not yet implemented.
+        // Return without error — caller must not rely on router scores for this mode.
+        LOG_WARN("set_router_scores: router_scores.original is nullopt (compact path, EXPERT_BATCH TODO)");
+        return;
     }
 
     const auto original_router_idx = m_config.router_scores.original.value();

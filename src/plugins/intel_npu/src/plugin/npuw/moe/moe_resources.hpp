@@ -60,6 +60,11 @@ struct MoEResources {
     // Accumulates expert outputs before final reduction
     TensorPtr expert_output_accumulator;
 
+    // Dense router scores buffer for HOST-side compact→dense reconstruction.
+    // Allocated once in initialize_expert_iterative_mode; shape [E, 1, N, 1].
+    // Populated by reconstruct_dense_router_scores() before stream_and_run.
+    TensorPtr dense_router_scores_buffer;
+
     /**
      * @brief Initialize resources for expert iterative mode
      *

@@ -110,13 +110,18 @@ static std::optional<size_t> trace_to_parameter(const std::shared_ptr<ov::Node>&
             return std::nullopt;
         }
 
-        // Only skip Convert and Reshape nodes when tracing back
-        if (current_node->get_input_size() == 1) {
-            if (std::dynamic_pointer_cast<ov::op::v0::Convert>(current_node) ||
-                std::dynamic_pointer_cast<ov::op::v1::Reshape>(current_node)) {
-                current_node = current_node->input_value(0).get_node_shared_ptr();
-                continue;
-            }
+        // Follow single-input passthrough nodes (data at port 0)
+        if (std::dynamic_pointer_cast<ov::op::v0::Convert>(current_node) ||
+            std::dynamic_pointer_cast<ov::op::v1::Reshape>(current_node) ||
+            std::dynamic_pointer_cast<ov::op::v0::Unsqueeze>(current_node) ||
+            std::dynamic_pointer_cast<ov::op::v1::Transpose>(current_node)) {
+            current_node = current_node->input_value(0).get_node_shared_ptr();
+            continue;
+        }
+        // ScatterElementsUpdate: follow port 2 (values/scores — the Divide output)
+        if (std::dynamic_pointer_cast<ov::op::v12::ScatterElementsUpdate>(current_node)) {
+            current_node = current_node->input_value(2).get_node_shared_ptr();
+            continue;
         }
 
         // Cannot trace further through this node
@@ -174,27 +179,23 @@ static bool find_tile_and_extract_config(const std::shared_ptr<ov::Model>& model
     return false;
 }
 
-// Helper: Find router scores parameter from output path
-// Output path: Result <- [Convert] <- [ReduceSum] <- Multiply <- router_param
-static bool find_router_scores_from_output(const std::shared_ptr<ov::Model>& model, MoEStructureInfo& info) {
-    LOG_DEBUG("Detecting router scores parameter from output path...");
+// Helper: Find compact router parameters from the ScatterElementsUpdate chain inside Expert.
+// Expected path from output_multiply’s router_score input:
+//   Unsqueeze ← Reshape ← Transpose ← ScatterElementsUpdate
+//     ├─ input(2): values/scores (Divide output) → compact_scores_idx
+//     └─ input(1): indices (TopK.indices, possibly via Convert) → compact_indices_idx
+static bool find_compact_router_params_from_scatter(const std::shared_ptr<ov::Model>& model,
+                                                    MoEStructureInfo& info) {
+    LOG_DEBUG("Detecting compact router parameters from ScatterEU chain...");
 
     for (const auto& result_node : model->get_results()) {
         auto current = result_node->input_value(0).get_node_shared_ptr();
 
-        // Skip Convert node if present
-        if (auto convert_node = std::dynamic_pointer_cast<ov::op::v0::Convert>(current)) {
-            LOG_DEBUG("  Skipping Convert node before Result");
-            current = convert_node->input_value(0).get_node_shared_ptr();
-        }
+        if (auto c = std::dynamic_pointer_cast<ov::op::v0::Convert>(current))
+            current = c->input_value(0).get_node_shared_ptr();
+        if (auto rs = std::dynamic_pointer_cast<ov::op::v1::ReduceSum>(current))
+            current = rs->input_value(0).get_node_shared_ptr();
 
-        // Skip ReduceSum node if present
-        if (auto reduce_sum_node = std::dynamic_pointer_cast<ov::op::v1::ReduceSum>(current)) {
-            LOG_DEBUG("  Skipping ReduceSum node before Result");
-            current = reduce_sum_node->input_value(0).get_node_shared_ptr();
-        }
-
-        // Check for Multiply node
         auto multiply_node = std::dynamic_pointer_cast<ov::op::v1::Multiply>(current);
         if (!multiply_node)
             continue;
@@ -202,26 +203,46 @@ static bool find_router_scores_from_output(const std::shared_ptr<ov::Model>& mod
         LOG_DEBUG("  Found Multiply node before Result");
         info.router_scores_multiply_node = multiply_node;
 
-        // Multiply has two inputs, one is expert output (from Reshape), other is router scores
+        // Find the non-Reshape input (router_score side)
         for (size_t i = 0; i < 2; ++i) {
-            auto multiply_input = multiply_node->input_value(i).get_node_shared_ptr();
-
-            // Skip the Reshape input (expert output)
-            if (std::dynamic_pointer_cast<ov::op::v1::Reshape>(multiply_input)) {
+            auto inp = multiply_node->input_value(i).get_node_shared_ptr();
+            if (std::dynamic_pointer_cast<ov::op::v1::Reshape>(inp))
                 continue;
+
+            // Expect: Unsqueeze ← Reshape ← Transpose ← ScatterEU
+            auto unsqueeze = std::dynamic_pointer_cast<ov::op::v0::Unsqueeze>(inp);
+            if (!unsqueeze) {
+                LOG_WARN("Router score input is not Unsqueeze — ScatterEU chain not found in Expert model");
+                return false;
             }
+            auto reshape_node = std::dynamic_pointer_cast<ov::op::v1::Reshape>(
+                unsqueeze->input_value(0).get_node_shared_ptr());
+            if (!reshape_node)
+                return false;
+            auto transpose_node = std::dynamic_pointer_cast<ov::op::v1::Transpose>(
+                reshape_node->input_value(0).get_node_shared_ptr());
+            if (!transpose_node)
+                return false;
+            auto scatter_node = std::dynamic_pointer_cast<ov::op::v12::ScatterElementsUpdate>(
+                transpose_node->input_value(0).get_node_shared_ptr());
+            if (!scatter_node)
+                return false;
 
-            // Trace back to find Parameter (router scores)
-            info.router_scores_idx = trace_to_parameter(multiply_input, model);
+            // compact_scores: ScatterEU port 2 = values/scores (from Divide)
+            info.compact_scores_idx =
+                trace_to_parameter(scatter_node->input_value(2).get_node_shared_ptr(), model);
+            // compact_indices: ScatterEU port 1 = indices (from TopK, possibly via Convert)
+            info.compact_indices_idx =
+                trace_to_parameter(scatter_node->input_value(1).get_node_shared_ptr(), model);
 
-            if (info.router_scores_idx.has_value()) {
-                LOG_DEBUG("  Found router scores parameter at index " << info.router_scores_idx.value());
+            if (info.compact_scores_idx.has_value() && info.compact_indices_idx.has_value()) {
+                LOG_DEBUG("  compact_scores param idx: " << info.compact_scores_idx.value());
+                LOG_DEBUG("  compact_indices param idx: " << info.compact_indices_idx.value());
                 return true;
             }
         }
     }
-
-    LOG_WARN("Could not find router scores Multiply node in output path");
+    LOG_WARN("Could not find compact router params from ScatterEU chain");
     return false;
 }
 
@@ -237,8 +258,8 @@ std::optional<MoEStructureInfo> analyze_moe_structure(const std::shared_ptr<ov::
         return std::nullopt;
     }
 
-    // Step 2: Detect router_scores parameter from output path
-    if (!find_router_scores_from_output(model, info)) {
+    // Step 2: Detect compact router parameters from the ScatterEU chain
+    if (!find_compact_router_params_from_scatter(model, info)) {
         return std::nullopt;
     }
 
@@ -261,8 +282,11 @@ std::optional<MoEStructureInfo> analyze_moe_structure(const std::shared_ptr<ov::
     if (info.expert_input_param_idx.has_value()) {
         LOG_INFO("  - Expert input param idx: " << info.expert_input_param_idx.value());
     }
-    if (info.router_scores_idx.has_value()) {
-        LOG_INFO("  - Router scores param idx: " << info.router_scores_idx.value());
+    if (info.compact_scores_idx.has_value()) {
+        LOG_INFO("  - Compact scores param idx: " << info.compact_scores_idx.value());
+    }
+    if (info.compact_indices_idx.has_value()) {
+        LOG_INFO("  - Compact indices param idx: " << info.compact_indices_idx.value());
     }
 
     return info;
@@ -825,6 +849,53 @@ std::shared_ptr<ov::Model> MoEModelTransformer::apply_expert_transformation(
         return nullptr;
     }
 
+    // Step 0: Drop the ScatterEU chain from the Expert model and expose an explicit
+    // router_scores Parameter.  This removes ScatterElementsUpdate from the NPU Expert
+    // compiled model, saving ~25% of the Router subgraph execution time.
+    {
+        // Find the non-Reshape input of output_multiply (the router_score side)
+        int router_port = -1;
+        std::shared_ptr<ov::Node> router_input;
+        for (size_t i = 0; i < 2; ++i) {
+            auto inp = router_scores_multiply_op->input_value(i).get_node_shared_ptr();
+            if (!std::dynamic_pointer_cast<ov::op::v1::Reshape>(inp)) {
+                router_port = static_cast<int>(i);
+                router_input = inp;
+            }
+        }
+        if (router_port >= 0) {
+            // Expect Unsqueeze at the top of the ScatterEU chain
+            if (auto unsqueeze = std::dynamic_pointer_cast<ov::op::v0::Unsqueeze>(router_input)) {
+                const auto router_shape = unsqueeze->output(0).get_partial_shape();
+                const auto router_type  = unsqueeze->output(0).get_element_type();
+                // Create new explicit router_scores Parameter (same shape as Unsqueeze output)
+                auto new_router_param = std::make_shared<ov::op::v0::Parameter>(router_type, router_shape);
+                new_router_param->set_friendly_name("npuw_moe_router_scores_explicit");
+                new_router_param->get_rt_info()["npuw_moe_router_scores"] = true;
+                // Rewire: output_multiply now takes new_router_param directly
+                router_scores_multiply_op->input(static_cast<size_t>(router_port))
+                    .replace_source_output(new_router_param->output(0));
+                model->add_parameters({new_router_param});
+                LOG_INFO("Step 0: ScatterEU chain removed, explicit router_scores Parameter added");
+
+                // Tag compact_scores and compact_indices (orphaned but needed by prologue)
+                const auto& params = model->get_parameters();
+                if (m_structure_info.compact_scores_idx.has_value()) {
+                    const auto idx = m_structure_info.compact_scores_idx.value();
+                    if (idx < params.size())
+                        params[idx]->get_rt_info()["npuw_moe_compact_scores"] = true;
+                }
+                if (m_structure_info.compact_indices_idx.has_value()) {
+                    const auto idx = m_structure_info.compact_indices_idx.value();
+                    if (idx < params.size())
+                        params[idx]->get_rt_info()["npuw_moe_compact_indices"] = true;
+                }
+            } else {
+                LOG_WARN("Step 0: Expected Unsqueeze at router_score input — skipping ScatterEU drop");
+            }
+        }
+    }
+
     // Main transformation flow
     auto tile_input = expert_input_tile_op->input_value(0);
     auto tile_output = expert_input_tile_op->output(0);
@@ -889,10 +960,11 @@ std::optional<MoEExperts> MoEExperts::from(const std::shared_ptr<ov::Model>& mod
         }
     }
 
-    // Step 3: Tag activation parameters before transformation so we can re-locate them afterwards
-    // (transformations may shift parameter indices).
-    constexpr const char* expert_input_tag = "npuw_moe_expert_input";
-    constexpr const char* router_scores_tag = "npuw_moe_router_scores";
+    // Step 3: Tag activation parameters before transformation
+    constexpr const char* expert_input_tag   = "npuw_moe_expert_input";
+    constexpr const char* router_scores_tag  = "npuw_moe_router_scores";
+    constexpr const char* compact_scores_tag = "npuw_moe_compact_scores";
+    constexpr const char* compact_indices_tag= "npuw_moe_compact_indices";
     auto tag_param = [&](std::optional<size_t> idx, const char* tag) {
         if (idx.has_value()) {
             model->get_parameters()[idx.value()]->get_rt_info()[tag] = true;
@@ -900,7 +972,8 @@ std::optional<MoEExperts> MoEExperts::from(const std::shared_ptr<ov::Model>& mod
         }
     };
     tag_param(structure_info->expert_input_param_idx, expert_input_tag);
-    tag_param(structure_info->router_scores_idx, router_scores_tag);
+    tag_param(structure_info->compact_scores_idx,     compact_scores_tag);
+    tag_param(structure_info->compact_indices_idx,    compact_indices_tag);
 
     // Step 4: Transform models for each chunk size
     std::map<size_t, std::shared_ptr<ov::Model>> transformed_models;
@@ -926,14 +999,18 @@ std::optional<MoEExperts> MoEExperts::from(const std::shared_ptr<ov::Model>& mod
     }
 
     // Resolve compiled-model parameter indices via rt_info tags.
-    // All chunk-size variants share the same parameter ordering, so the first model suffices.
-    // router_scores may be absent in EXPERT_BATCH (unrolled into K closures); resolve_compiled_idx
-    // falls back to the original index, which is harmless since run_expert_batch uses param_mapping.
+    // (All tag constants were declared above in Step 3)
     const auto& first_transformed_model = transformed_models.begin()->second;
     const auto expert_input_compiled_idx =
         resolve_compiled_idx(first_transformed_model, expert_input_tag, structure_info->expert_input_param_idx);
+    // router_scores: synthetic param added in Step 0 — no original idx
     const auto router_scores_compiled_idx =
-        resolve_compiled_idx(first_transformed_model, router_scores_tag, structure_info->router_scores_idx);
+        resolve_compiled_idx(first_transformed_model, router_scores_tag, std::nullopt);
+    // compact params: orphaned after ScatterEU drop; resolve compiled idx for prologue mapping
+    const auto compact_scores_compiled_idx =
+        resolve_compiled_idx(first_transformed_model, compact_scores_tag, structure_info->compact_scores_idx);
+    const auto compact_indices_compiled_idx =
+        resolve_compiled_idx(first_transformed_model, compact_indices_tag, structure_info->compact_indices_idx);
 
     // Step 5: Build parameter mapping from any transformed model (all have same mapping)
     // Note: For EXPERT_ITERATIVE mode (single expert), no unrolling happens, so mapping will be empty
@@ -985,10 +1062,14 @@ std::optional<MoEExperts> MoEExperts::from(const std::shared_ptr<ov::Model>& mod
     moe_experts._chunk_token_count = structure_info->is_expert_batch_mode() ? 0 : iterative_chunk_size;
     moe_experts._num_active_experts = k_value;  // Store actual K from router
     moe_experts._transformed_models = std::move(transformed_models);
-    moe_experts._router_scores.original = structure_info->router_scores_idx;
+    moe_experts._router_scores.original = std::nullopt;  // synthetic, no original index
     moe_experts._router_scores.compiled = router_scores_compiled_idx;
     moe_experts._expert_input.original = structure_info->expert_input_param_idx;
     moe_experts._expert_input.compiled = expert_input_compiled_idx;
+    moe_experts._compact_scores.original = structure_info->compact_scores_idx;
+    moe_experts._compact_scores.compiled = compact_scores_compiled_idx;
+    moe_experts._compact_indices.original = structure_info->compact_indices_idx;
+    moe_experts._compact_indices.compiled = compact_indices_compiled_idx;
     moe_experts._param_mapping = std::move(param_mapping);
 
     if (!moe_experts.is_valid()) {
@@ -1027,6 +1108,10 @@ MoEExperts::MoEExperts(const function::MoEExperts& func_moe) {
     _router_scores.compiled = func_moe._router_scores.compiled;
     _expert_input.original = func_moe._expert_input.original;
     _expert_input.compiled = func_moe._expert_input.compiled;
+    _compact_scores.original = func_moe._compact_scores.original;
+    _compact_scores.compiled = func_moe._compact_scores.compiled;
+    _compact_indices.original = func_moe._compact_indices.original;
+    _compact_indices.compiled = func_moe._compact_indices.compiled;
     _param_mapping = func_moe._param_mapping;
 
     LOG_DEBUG("Created compiled::MoEExperts:");

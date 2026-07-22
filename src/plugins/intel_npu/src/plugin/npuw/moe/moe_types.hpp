@@ -91,8 +91,11 @@ inline const char* get_mode_name(MoEProcessingMode mode) {
  */
 struct MoEIO {
     std::vector<ov::SoPtr<ov::ITensor>> outputs;  // # of elements - # of subgraph outputs
-    ov::SoPtr<ov::ITensor> router_scores;         // Expert model input: router output for expert selection
+    ov::SoPtr<ov::ITensor> router_scores;         // Dense [E,1,N,1] reconstructed from compact
     ov::SoPtr<ov::ITensor> expert_input;          // Expert model input: token embeddings
+    // Compact router tensors received from Router NPU output (cross-boundary edges):
+    ov::SoPtr<ov::ITensor> compact_scores;        // [K, N] normalized scores from Divide
+    ov::SoPtr<ov::ITensor> compact_indices;       // [K, N] expert indices from TopK
 };
 
 }  // namespace npuw

@@ -42,8 +42,11 @@ struct MoEConfig {
         std::optional<size_t> original;  // index in original model
         std::optional<size_t> compiled;  // index in compiled/transformed model
     };
-    ParamIndex router_scores;  // router scores input parameter
+    ParamIndex router_scores;  // router scores input parameter (explicit, synthetic)
     ParamIndex expert_input;   // expert activation input parameter
+    // Compact router parameters (cross-boundary from Router partition):
+    ParamIndex compact_scores;   // Divide [K, N] — compact normalized scores
+    ParamIndex compact_indices;  // TopK.indices [K, N] — selected expert indices per token
 
     // Compiled models for different chunk sizes (for EXPERT_ITERATIVE mode)
     // Key: chunk_size (e.g., 256, 128, 64, 32, 16)
