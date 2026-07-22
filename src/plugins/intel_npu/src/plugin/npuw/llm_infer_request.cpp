@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <regex>
+#include <sstream>
 
 #include "infer_request_utils.hpp"
 #include "llm_block_kvcache_strategy.hpp"
@@ -859,6 +861,63 @@ void ov::npuw::LLMInferRequest::clear_chunk_prefill_kv_cache() {
     }
 }
 
+static void print_prefill_sublayer_timing_report(
+    const std::vector<std::map<std::size_t, float>>& chunk_timings,
+    const std::map<std::size_t, std::size_t>& call_counts,
+    const ov::npuw::IBaseInferRequest& req) {
+    if (chunk_timings.empty())
+        return;
+
+    std::vector<std::size_t> real_indices;
+    for (const auto& kv : call_counts)
+        real_indices.push_back(kv.first);
+    std::sort(real_indices.begin(), real_indices.end());
+
+    const std::size_t num_chunks = chunk_timings.size();
+    const int cw = 9;  // column width for each timing value
+
+    std::cerr << "\n=== Prefill Sublayer Timing (ms, grouped by real subgraph) ===\n";
+    std::cerr << std::left << std::setw(6) << " real" << std::setw(7) << " device" << std::setw(7) << " calls";
+    for (std::size_t c = 0; c < num_chunks; c++) {
+        std::ostringstream hdr;
+        hdr << " c" << c;
+        std::cerr << std::setw(cw) << hdr.str();
+    }
+    std::cerr << std::setw(cw) << " avg" << "\n";
+    const std::size_t sep_len =
+        static_cast<std::size_t>(6 + 7 + 7) + (num_chunks + 1) * static_cast<std::size_t>(cw);
+    std::cerr << std::string(sep_len, '-') << "\n";
+
+    std::vector<float> col_totals(num_chunks, 0.f);
+    for (const auto ridx : real_indices) {
+        const std::size_t calls = call_counts.count(ridx) ? call_counts.at(ridx) : 0u;
+        const auto device = req.sublayer_device(ridx);
+        float sum = 0.f;
+        std::cerr << std::left << std::setw(6) << ridx << std::setw(7) << device << std::setw(7) << calls;
+        for (std::size_t c = 0; c < num_chunks; c++) {
+            float t = 0.f;
+            const auto& ct = chunk_timings[c];
+            auto it = ct.find(ridx);
+            if (it != ct.end())
+                t = it->second;
+            col_totals[c] += t;
+            sum += t;
+            std::cerr << std::fixed << std::setprecision(1) << std::setw(cw) << t;
+        }
+        const float avg = num_chunks > 0 ? sum / static_cast<float>(num_chunks) : 0.f;
+        std::cerr << std::fixed << std::setprecision(1) << std::setw(cw) << avg << "\n";
+    }
+    std::cerr << std::string(sep_len, '-') << "\n";
+    std::cerr << std::left << std::setw(6) << "Total" << std::setw(7) << "" << std::setw(7) << "";
+    float grand_sum = 0.f;
+    for (std::size_t c = 0; c < num_chunks; c++) {
+        std::cerr << std::fixed << std::setprecision(1) << std::setw(cw) << col_totals[c];
+        grand_sum += col_totals[c];
+    }
+    const float grand_avg = num_chunks > 0 ? grand_sum / static_cast<float>(num_chunks) : 0.f;
+    std::cerr << std::fixed << std::setprecision(1) << std::setw(cw) << grand_avg << "\n\n";
+}
+
 void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> input_ids,
                                                       ov::SoPtr<ov::ITensor> attention_mask,
                                                       ov::SoPtr<ov::ITensor> position_ids,
@@ -911,6 +970,11 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
     // already been scattered so each chunk continues where the previous one left off.
     size_t visual_tokens_scattered =
         has_deepstack ? count_visual_tokens_before(visual_pos_masks, kvcache_desc.num_stored_tokens) : 0u;
+
+    // Sublayer timing: collect per-chunk timing grouped by real subgraph index.
+    const auto sublayer_counts = m_prefill_base_request->sublayer_call_counts();
+    std::vector<std::map<std::size_t, float>> chunk_timings;
+    m_prefill_base_request->enable_sublayer_timing();
 
     while (remaining_prompts > 0) {
         // NB: input_ids can be either fp32(VLM) or i64(LLM)
@@ -1020,6 +1084,8 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
             m_prefill_request->infer();
         });
 
+        chunk_timings.push_back(m_prefill_base_request->get_sublayer_timings());
+
         m_llm_profile["1/prefill:3c.post_chunk"].record([&]() {
             // Accumulate Eagle3 last_hidden_state from this chunk
             if (m_eagle3_ext.is_eagle3_model()) {
@@ -1063,6 +1129,9 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
     }
 
     LOG_DEBUG("Done.");
+
+    m_prefill_base_request->disable_sublayer_timing();
+    print_prefill_sublayer_timing_report(chunk_timings, sublayer_counts, *m_prefill_base_request);
 
     if (enable_prefix_caching) {
         prefix_caching_helper->print_cache_status();
