@@ -4,6 +4,7 @@
 
 #include "moe_executor.hpp"
 
+#include <future>
 #include <optional>
 
 #include "../compiled_model.hpp"  // For CompiledModel::CompiledModelDesc
@@ -340,10 +341,6 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
     if (m_resources.sorted_chunk_sizes.empty())
         OPENVINO_THROW("MoE: Sorted chunk sizes cannot be empty");
 
-    // Clear output accumulator before accumulating expert outputs
-    std::memset(m_resources.expert_output_accumulator->data(),
-                0,
-                m_resources.expert_output_accumulator->get_byte_size());
 
     auto expert_input_source = io.expert_input;
 
@@ -422,7 +419,13 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
     };
     std::optional<InflightItem> inflight;
 
-    // Drain the in-flight item referenced by `inflight` (wait + scatter).
+    // Async scatter: tracks the background scatter task launched by the previous do_drain.
+    // Pipeline depth is 1 — at most one scatter is in-flight at any time.
+    // The next do_drain() joins it after req->wait() (~122 μs later >> scatter ~20 μs),
+    // so the join is always a no-op and scatter is fully hidden in the NPU overlap window.
+    std::future<void> scatter_future;
+
+    // Drain the in-flight item referenced by `inflight` (wait + async scatter).
     // Called both inside the pipeline loop (to drain the previous item while NPU
     // runs the current one) and once after the loop to drain the final item.
     auto do_drain = [&]() {
@@ -431,18 +434,32 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
         m_profile->iterative["NPU Wait"].record([&]() {
             req->wait();
         });
+        // Join the previous scatter task.  By the time req->wait() returns the prior
+        // scatter (~20 μs) has long finished (~122 μs gap), so this is a no-op wait.
+        if (scatter_future.valid()) {
+            scatter_future.get();
+        }
         const auto& data = expert_ring[inflight->ring_idx & 1];
         const auto cm = m_config.compiled_models.at(inflight->cs);
         auto output = req->get_tensor(cm->outputs()[0]);
-        m_profile->iterative["Scatter Output"].record([&]() {
+        // Capture scatter inputs by value so the async task owns them independently of
+        // the ring buffer and inflight state (both advance immediately after this return).
+        std::vector<size_t> sc_tokens   = data.tokens;
+        std::vector<size_t> sc_slots    = data.slots;
+        const size_t sc_chunk_start     = inflight->chunk_start;
+        const size_t sc_chunk_tokens    = inflight->chunk_tokens;
+        auto         sc_accum           = m_resources.expert_output_accumulator;
+        const size_t sc_embed_dim       = embed_dim;
+        const size_t sc_num_tokens      = num_tokens;
+        scatter_future = std::async(std::launch::async, [=]() {
             ov::npuw::moe::scatter_expert_outputs(output,
-                                                  m_resources.expert_output_accumulator,
-                                                  data.tokens,
-                                                  inflight->chunk_start,
-                                                  inflight->chunk_tokens,
-                                                  embed_dim,
-                                                  num_tokens,
-                                                  data.slots);
+                                                  sc_accum,
+                                                  sc_tokens,
+                                                  sc_chunk_start,
+                                                  sc_chunk_tokens,
+                                                  sc_embed_dim,
+                                                  sc_num_tokens,
+                                                  sc_slots);
         });
     };
 
@@ -580,6 +597,12 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
 
     // Drain the last in-flight item
     do_drain();
+
+    // Join the final scatter task before returning — the accumulator is consumed
+    // immediately by the Downstream subgraph after this function.
+    if (scatter_future.valid()) {
+        scatter_future.get();
+    }
 }
 
 void MoEExecutor::set_router_scores(size_t idx,
