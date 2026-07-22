@@ -87,6 +87,17 @@ public:
         return needs_copy(idx);
     }
 
+    // Per-sublayer timing API (opt-in, prefill only).
+    // Call enable_sublayer_timing() before infer(), then disable_sublayer_timing() after all
+    // chunks are done. get_sublayer_timings() returns { real_idx -> total_ms } accumulated
+    // during the last infer() call. sublayer_device() and sublayer_call_counts() provide
+    // metadata for the report.
+    void enable_sublayer_timing();
+    void disable_sublayer_timing();
+    const std::map<std::size_t, float>& get_sublayer_timings() const;
+    std::string sublayer_device(std::size_t real_idx) const;
+    std::map<std::size_t, std::size_t> sublayer_call_counts() const;
+
 protected:
     int64_t m_history_size = 0;
 
@@ -223,6 +234,11 @@ protected:
     std::string iter_path_suffix(std::size_t idx) const;
     mutable std::optional<bool> m_iter_suffix_required;
     std::size_t m_run_iter = 0u;
+
+    // Per-sublayer timing state. The generate path never sets m_sublayer_timing_enabled,
+    // so this incurs zero overhead outside of prefill timing sessions.
+    bool m_sublayer_timing_enabled = false;
+    std::map<std::size_t, float> m_sublayer_timings_ms;  // real_idx -> accumulated ms
 
     bool needs_copy(std::size_t idx) const;
     bool needs_copy(std::size_t idx, std::size_t cidx) const;

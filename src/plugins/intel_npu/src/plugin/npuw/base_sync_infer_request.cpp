@@ -223,18 +223,53 @@ std::string ov::npuw::IBaseInferRequest::profile_tag(std::size_t idx) const {
     return m_npuw_model->submodel_device(real(idx));
 }
 
+void ov::npuw::IBaseInferRequest::enable_sublayer_timing() {
+    m_sublayer_timing_enabled = true;
+    m_sublayer_timings_ms.clear();
+}
+
+void ov::npuw::IBaseInferRequest::disable_sublayer_timing() {
+    m_sublayer_timing_enabled = false;
+}
+
+const std::map<std::size_t, float>& ov::npuw::IBaseInferRequest::get_sublayer_timings() const {
+    return m_sublayer_timings_ms;
+}
+
+std::string ov::npuw::IBaseInferRequest::sublayer_device(std::size_t real_idx) const {
+    return m_npuw_model->submodel_device(real_idx);
+}
+
+std::map<std::size_t, std::size_t> ov::npuw::IBaseInferRequest::sublayer_call_counts() const {
+    std::map<std::size_t, std::size_t> counts;
+    for (std::size_t idx = 0u; idx < m_num_submodels; idx++) {
+        counts[real(idx)]++;
+    }
+    return counts;
+}
+
 void ov::npuw::IBaseInferRequest::infer() {
     m_now_idx.reset();
     prepare_for_infer();
+    if (m_sublayer_timing_enabled) {
+        m_sublayer_timings_ms.clear();
+    }
     for (std::size_t idx = 0u; idx < m_num_submodels; idx++) {
         m_now_idx = idx;
         if (!valid_subrequest(idx)) {
             continue;
         }
         subscribe_subrequest(idx, [](std::exception_ptr) {});
-        m_profile[profile_tag(idx)].record([&]() {
-            run_subrequest_for_success(idx);
-        });
+        auto do_run = [&]() {
+            m_profile[profile_tag(idx)].record([&]() {
+                run_subrequest_for_success(idx);
+            });
+        };
+        if (m_sublayer_timing_enabled) {
+            m_sublayer_timings_ms[real(idx)] += perf::ms_to_run(do_run);
+        } else {
+            do_run();
+        }
         complete_subrequest(idx);
     }
 
