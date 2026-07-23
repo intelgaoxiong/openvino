@@ -119,6 +119,32 @@ void gather_expert_inputs(const ov::SoPtr<ov::ITensor>& input_source,
                           size_t chunk_size);
 
 /**
+ * @brief Gather router scores directly from compact [K,N] format.
+ *
+ * Replaces gather_router_scores (which required the dense [E,1,N,1] intermediate).
+ * Reads scores[k_slot, token_id] for each active token in the chunk.
+ *
+ * @param compact_scores  Compact scores tensor [K,N] or [N,K]
+ * @param router_dest     Destination: [chunk_size] scores for this expert's chunk
+ * @param token_ids       Active token indices for the current expert
+ * @param k_slots         Corresponding k-slot in compact_scores for each token
+ * @param chunk_start     Start offset in token_ids / k_slots
+ * @param chunk_size      Number of tokens to process
+ * @param num_tokens      N dimension (used to compute strides)
+ * @param num_active      K dimension (used when layout is [N,K])
+ * @param k_first         True if compact layout is [K,N], false if [N,K]
+ */
+void gather_router_scores_compact(const ov::SoPtr<ov::ITensor>& compact_scores,
+                                  const ov::SoPtr<ov::ITensor>& router_dest,
+                                  const std::vector<size_t>& token_ids,
+                                  const std::vector<size_t>& k_slots,
+                                  size_t chunk_start,
+                                  size_t chunk_size,
+                                  size_t num_tokens,
+                                  size_t num_active,
+                                  bool k_first);
+
+/**
  * @brief Scatter expert outputs back to global output buffer.
  *
  * Writes expert output for processed tokens to the correct positions in the global

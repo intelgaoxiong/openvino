@@ -243,6 +243,37 @@ void scatter_expert_outputs(const ov::SoPtr<ov::ITensor>& expert_output,
     }
 }
 
+void gather_router_scores_compact(const ov::SoPtr<ov::ITensor>& compact_scores,
+                                  const ov::SoPtr<ov::ITensor>& router_dest,
+                                  const std::vector<size_t>& token_ids,
+                                  const std::vector<size_t>& k_slots,
+                                  size_t chunk_start,
+                                  size_t chunk_size,
+                                  size_t num_tokens,
+                                  size_t num_active,
+                                  bool k_first) {
+    NPUW_ASSERT(token_ids.size() == k_slots.size());
+    // stride[k-dim], stride[n-dim] for both [K,N] and [N,K] layouts
+    const size_t K_stride = k_first ? num_tokens : 1;
+    const size_t N_stride = k_first ? 1 : num_active;
+
+    auto gather = [&](const auto* src, auto* dst) {
+        for (size_t i = 0; i < chunk_size; ++i) {
+            const size_t t = token_ids[chunk_start + i];
+            const size_t k = k_slots[chunk_start + i];
+            dst[i] = src[k * K_stride + t * N_stride];
+        }
+    };
+
+    const auto elem_type = compact_scores->get_element_type();
+    if (elem_type == ov::element::f16)
+        gather(compact_scores->data<ov::float16>(), router_dest->data<ov::float16>());
+    else if (elem_type == ov::element::f32)
+        gather(compact_scores->data<float>(), router_dest->data<float>());
+    else
+        NPUW_ASSERT(false && "Unsupported compact_scores element type for compact gather");
+}
+
 // ====================================================================================================
 // reconstruct_dense_router_scores
 // ====================================================================================================
