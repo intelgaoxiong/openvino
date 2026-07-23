@@ -221,10 +221,6 @@ void MoEExecutor::run(size_t real_idx, size_t idx) {
     // Get I/O for this sublayer
     const auto& io = m_moe_io[idx];
 
-    // if (!io.router_scores) {
-    //     OPENVINO_THROW("MoE: Router scores are required but not available");
-    // }
-
     // Dispatch to appropriate inference function.
     // EXPERT_BATCH: parse upfront (single token, routing maps needed for cache lookup).
     // EXPERT_ITERATIVE: parse is fused inside run_expert_iterative, expert-row by row,
@@ -353,25 +349,9 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
     if (m_resources.sorted_chunk_sizes.empty())
         OPENVINO_THROW("MoE: Sorted chunk sizes cannot be empty");
 
-    // Lazily (re)allocate the dense router scores buffer with the type that the Expert compiled
-    // model expects for its router_scores input port.  This may differ from compact_scores
-    // (e.g. compact f16 from Router but router_dest f32 from the explicit Parameter).
-    {
-        ov::element::Type router_dest_type = io.compact_scores->get_element_type();  // fallback
-        if (m_config.router_scores.compiled.has_value() && !m_config.compiled_models.empty()) {
-            const auto& first_cm = m_config.compiled_models.begin()->second;
-            const auto rs_idx = m_config.router_scores.compiled.value();
-            if (rs_idx < first_cm->inputs().size())
-                router_dest_type = first_cm->inputs()[rs_idx].get_element_type();
-        }
-        if (!m_resources.dense_router_scores_buffer ||
-            m_resources.dense_router_scores_buffer->get_element_type() != router_dest_type) {
-            const ov::Shape dense_shape{m_config.num_experts, 1, m_config.input_token_count, 1};
-            m_resources.dense_router_scores_buffer = m_allocator(router_dest_type, dense_shape, "CPU");
-            LOG_DEBUG("(Re)allocated dense_router_scores_buffer: type=" << router_dest_type
-                                                                        << ", shape=" << dense_shape);
-        }
-    }
+    // dense_router_scores_buffer is allocated once during initialize_expert_iterative_mode.
+    NPUW_ASSERT(m_resources.dense_router_scores_buffer &&
+                "dense_router_scores_buffer not allocated — initialize_expert_iterative_mode must run first");
     // Reconstruct dense [E,1,N,1] router scores from compact [K,N] format (HOST-side, once per layer).
     // This eliminates ScatterElementsUpdate from the Router NPU model.
     ov::npuw::moe::reconstruct_dense_router_scores(io.compact_scores,

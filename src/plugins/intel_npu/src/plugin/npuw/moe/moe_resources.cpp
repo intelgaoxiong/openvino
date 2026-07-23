@@ -92,12 +92,19 @@ void MoEResources::initialize_expert_iterative_mode(
     expert_output_accumulator = allocator(output_element_type, buffer_shape, device);
 
     // Allocate dense router scores buffer for HOST-side compact→dense reconstruction.
-    // Shape [E, 1, N, 1] mirrors the original ScatterEU output layout used by gather_router_scores.
+    // Type is read from the compact_scores parameter in the compiled Expert model so that
+    // it matches the compact_scores tensor the Router NPU will produce at runtime.
+    // This ensures no cross-type conversion is needed during reconstruct + gather.
+    ov::element::Type compact_type = output_element_type;  // safe fallback
+    if (config.compact_scores.compiled.has_value() && !config.compiled_models.empty()) {
+        const auto& cm = config.compiled_models.begin()->second;
+        const auto cs_idx = config.compact_scores.compiled.value();
+        if (cs_idx < cm->inputs().size())
+            compact_type = cm->inputs()[cs_idx].get_element_type();
+    }
     const size_t num_experts_val = config.num_experts;
     const ov::Shape dense_scores_shape{num_experts_val, 1, num_tokens, 1};
-    dense_router_scores_buffer = allocator(output_element_type, dense_scores_shape, "CPU");
-    LOG_DEBUG("Allocated dense_router_scores_buffer: shape=" << dense_scores_shape
-              << ", type=" << output_element_type << ", device=" << device);
+    dense_router_scores_buffer = allocator(compact_type, dense_scores_shape, "CPU");
 
     LOG_DEBUG("Expert iterative mode initialization completed");
 }
