@@ -148,17 +148,6 @@ public:
         return static_cast<uint32_t>(free_block_ids_.size());
     }
 
-    /**
-     * @brief Inject an externally-owned tensor directly into the block pool as a pre-allocated block.
-     *
-     * Used by prefix caching in Block KV mode to restore cached NPU block tensors
-     * without copying: the existing SoPtr is placed directly into the block pool.
-     *
-     * @param tensor  Tensor to inject (must have the same shape as a regular block tensor)
-     * @return Block ID assigned to the injected tensor
-     */
-    uint32_t allocate_block_with_tensor(ov::SoPtr<ov::ITensor> tensor);
-
 private:
     /**
      * @brief Represents a single block of KV cache memory
