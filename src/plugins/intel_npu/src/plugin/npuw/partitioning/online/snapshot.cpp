@@ -764,6 +764,7 @@ void Snapshot::earlyRegroup() {
                 HNDL_MOE(GPTOSSExpert);
                 HNDL_MOE(GPTOSSRouter);
                 HNDL_MOE(Qwen3Expert);
+                HNDL_MOE(Qwen3ExpertMergedBMM);
                 HNDL_MOE(Qwen3Router);
                 HNDL_FAKE(FakeConvert);
                 HNDL_FAKE(FakeQuantize);

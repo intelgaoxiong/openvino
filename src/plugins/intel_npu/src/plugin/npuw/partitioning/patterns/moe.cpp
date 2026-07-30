@@ -428,6 +428,105 @@ Qwen3Expert::Qwen3Expert(const std::shared_ptr<ov::npuw::online::Snapshot>& snap
 }
 
 /*
+    Qwen3 Expert Pattern — Merged BMM variant:
+
+    After MergeParallelDQMatMuls the gate and up projections share one MatMul:
+
+        tile → Reshape1 → MatMul_merged(merged_weights) → Slice_gate → Swish
+                                                        → Slice_up
+        Swish × Slice_up → multiply_swiglu
+        multiply_swiglu  → MatMul_down(down_weights) → Reshape2
+        Reshape2 × router_score → output_multiply   <-- pattern root
+*/
+Qwen3ExpertMergedBMM::Qwen3ExpertMergedBMM(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
+                                           const std::string& isol_tag) {
+    LOG_DEBUG("Qwen3ExpertMergedBMM pattern matcher registered with tag: " << isol_tag);
+
+    // Input preparation: Tile -> Reshape
+    auto tile = opp::wrap_type<ov::op::v0::Tile>({opp::any_input(), opp::any_input()});
+    auto reshape1 = opp::wrap_type<ov::op::v1::Reshape>({tile, opp::any_input()});
+
+    // Merged gate+up weights: Multiply(quantized weight, scale) -> Convert
+    auto merged_weights_multiply = opp::wrap_type<ov::op::v1::Multiply>({opp::any_input(), opp::any_input()});
+    auto merged_weights_convert = opp::wrap_type<ov::op::v0::Convert>({merged_weights_multiply});
+    // Single merged MatMul replaces both gate and up MatMuls
+    auto matmul_merged = opp::wrap_type<ov::op::v0::MatMul>({reshape1, merged_weights_convert});
+
+    // Slice_gate: extracts the gate half from MatMul_merged output (last dim, offset 0).
+    // 5 inputs: data, start, end, step, axes (MergeParallelDQMatMuls includes axes).
+    auto slice_gate = opp::wrap_type<ov::op::v8::Slice>(
+        {matmul_merged, opp::any_input(), opp::any_input(), opp::any_input(), opp::any_input()});
+    auto swish = opp::wrap_type<ov::op::v4::Swish>({slice_gate});
+
+    // Slice_up: extracts the up half from MatMul_merged output (last dim, offset out_size).
+    // Use any_input() for the data port to avoid a DAG pattern constraint that OV Matcher
+    // may not traverse correctly; we verify in the callback that it shares matmul_merged.
+    auto slice_up = opp::wrap_type<ov::op::v8::Slice>(
+        {opp::any_input(), opp::any_input(), opp::any_input(), opp::any_input(), opp::any_input()});
+
+    // SwiGLU: gate * up
+    auto multiply_swiglu = opp::wrap_type<ov::op::v1::Multiply>({swish, slice_up});
+
+    // Down projection weights: Multiply(quantized weight, scale) -> Convert
+    auto down_weights_multiply = opp::wrap_type<ov::op::v1::Multiply>({opp::any_input(), opp::any_input()});
+    auto down_weights_convert = opp::wrap_type<ov::op::v0::Convert>({down_weights_multiply});
+    // Down MatMul -> Reshape
+    auto matmul_down = opp::wrap_type<ov::op::v0::MatMul>({multiply_swiglu, down_weights_convert});
+    auto reshape2 = opp::wrap_type<ov::op::v1::Reshape>({matmul_down, opp::any_input()});
+
+    // Pattern root: expert_output * router_score
+    auto output_multiply = opp::wrap_type<ov::op::v1::Multiply>({reshape2, opp::any_input()});
+
+    auto node_to_gptr = snapshot->getNodeToGroupMap();
+
+    auto callback = [=](ov::pass::pattern::Matcher& m) {
+        auto& node_to_output = m.get_pattern_value_map();
+
+        auto matched_tile = node_to_output.at(tile).get_node_shared_ptr();
+        auto matched_matmul_merged = node_to_output.at(matmul_merged).get_node_shared_ptr();
+        auto matched_slice_gate = node_to_output.at(slice_gate).get_node_shared_ptr();
+        auto matched_slice_up = node_to_output.at(slice_up).get_node_shared_ptr();
+        auto matched_output_multiply = node_to_output.at(output_multiply).get_node_shared_ptr();
+
+        // Verify slice_up.data == matmul_merged (the DAG constraint we relaxed in the pattern).
+        if (matched_slice_up->input_value(0).get_node_shared_ptr() != matched_matmul_merged) {
+            return false;
+        }
+
+        const bool is_decoding = is_decoding_stage(matched_output_multiply);
+        LOG_DEBUG("Qwen3ExpertMergedBMM pattern matched (" << (is_decoding ? "Decoding" : "Prefill") << " stage)");
+
+        auto isolate = [&](const std::shared_ptr<ov::Node>& pattern_node) {
+            isolate_node(node_to_output.at(pattern_node).get_node_shared_ptr(), isol_tag, node_to_gptr);
+        };
+
+        isolate(tile);
+        isolate(reshape1);
+        isolate(merged_weights_multiply);
+        isolate(merged_weights_convert);
+        isolate(matmul_merged);
+        isolate(slice_gate);
+        isolate(swish);
+        isolate(slice_up);
+        isolate(multiply_swiglu);
+        isolate(down_weights_multiply);
+        isolate(down_weights_convert);
+        isolate(matmul_down);
+        isolate(reshape2);
+        isolate_node(matched_output_multiply, isol_tag, node_to_gptr);
+
+        if (is_decoding) {
+            LOG_DEBUG("Decoding stage detected, searching for ReduceSum to isolate...");
+            isolate_reduce_sum_after(matched_output_multiply, isol_tag, node_to_gptr);
+        }
+
+        return false;
+    };
+
+    register_matcher(std::make_shared<opp::Matcher>(output_multiply, "TagQwen3ExpertMergedBMM"), std::move(callback));
+}
+
+/*
     Qwen3 Router Pattern:
 
     Router weights (quantized, dequantized via weight chain):
