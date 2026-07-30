@@ -21,9 +21,34 @@
 #include "openvino/runtime/make_tensor.hpp"
 #include "openvino/util/common_util.hpp"
 #include "openvino/util/xml_parse_utils.hpp"
+#include "../npuw_transformations/merge_parallel_dq_matmuls.hpp"
 #include "patterns/dcoff.hpp"
 #include "patterns/opt.hpp"
 #include "traits.hpp"
+
+namespace {
+// Build an export-friendly LazyTensor for a constant closure input.
+// If the constant was created by MergeParallelDQMatMuls it carries a
+// MergedConstSources attribute listing the original source constants
+// (which have valid WeightlessCacheAttribute bin offsets).  In that case
+// we return a LazyTensor::Concat backed by those originals so that export
+// writes two plain bin-offset references instead of inlining 192 MB of data.
+// For ordinary constants we fall through to the single-node constructor.
+static ov::npuw::weights::LazyTensor make_closure_lazy_tensor(
+        const std::shared_ptr<ov::op::v0::Constant>& const_ptr) {
+    const auto& rt = const_ptr->get_rt_info();
+    auto it = rt.find(ov::npuw::kMergedSources);
+    if (it != rt.end()) {
+        const auto& attr = it->second.as<ov::npuw::MergedConstSources>();
+        std::vector<ov::npuw::weights::LazyTensor> parts;
+        parts.reserve(attr.consts.size());
+        for (const auto& src : attr.consts)
+            parts.push_back(ov::npuw::weights::LazyTensor(src));
+        return ov::npuw::weights::LazyTensor(parts, attr.axis);
+    }
+    return ov::npuw::weights::LazyTensor(const_ptr);
+}
+}  // namespace
 
 namespace ov {
 namespace npuw {
@@ -1815,7 +1840,7 @@ void Partitioner::createFunction(FunctionPipeline& func_ggg) {
 
                 LOG_DEBUG("Register " << prod_output << " in the function closure");
                 funcall._lazy_closure.push_back(
-                    LazyTensor(std::static_pointer_cast<ov::op::v0::Constant>(input_node)));  // (n)/1/i/c
+                    make_closure_lazy_tensor(std::static_pointer_cast<ov::op::v0::Constant>(input_node)));  // (n)/1/i/c
             } else if (ov::op::util::is_parameter(input_node)) {
                 LOG_DEBUG("Handling a Parameter input " << prod_output);
                 LOG_BLOCK();
@@ -1986,7 +2011,7 @@ void Partitioner::matchRepeatedSubgraphs(const std::string& func_name) {
                     LOG_DEBUG("Register " << prod_output << " in the function closure[" << param_idx
                                           << "] (via prototype " << proto_layer_name << ")");
                     funcall._lazy_closure[param_idx - function._param_offset] =
-                        LazyTensor(std::static_pointer_cast<ov::op::v0::Constant>(input_node));  // (t)/1/c
+                        make_closure_lazy_tensor(std::static_pointer_cast<ov::op::v0::Constant>(input_node));  // (t)/1/c
                 }
             }  // for (inputs)
         }  // for(nodes)

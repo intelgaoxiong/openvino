@@ -310,6 +310,19 @@ bool MergeParallelDQMatMuls::run_on_model(const std::shared_ptr<ov::Model>& mode
         new_w->set_friendly_name("NPUW/PMM/w_merged");
         new_s->set_friendly_name("NPUW/PMM/s_merged");
 
+        // Record source constants in RT info so that partitioning can build a
+        // LazyTensor::Concat backed by the original bin offsets instead of a
+        // synthesized (no-bin-offset) LazyTensor.  This makes export efficient:
+        // each source component serialises as a plain bin_offset reference.
+        MergedConstSources w_src, s_src;
+        w_src.axis = s_src.axis = key.axis;
+        for (const auto& c : cands) {
+            w_src.consts.push_back(c.w);
+            s_src.consts.push_back(c.s);
+        }
+        new_w->get_rt_info()[kMergedSources] = std::move(w_src);
+        new_s->get_rt_info()[kMergedSources] = std::move(s_src);
+
         // --- Step 4: rebuild DQ chain ---
         // Convert(new_w) → Multiply(_, new_s) → [Convert] → MatMul
         auto new_cvt_w = std::make_shared<ov::op::v0::Convert>(new_w, first.cvt_w_dst);
