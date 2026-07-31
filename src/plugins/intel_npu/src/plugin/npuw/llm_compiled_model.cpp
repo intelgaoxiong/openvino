@@ -12,7 +12,6 @@
 #include "logging.hpp"
 #include "moe_transformations/apply_moe_device_routed_transforms.hpp"
 #include "npuw_transformations/add_position_ids_param.hpp"
-#include "npuw_transformations/merge_parallel_dq_matmuls.hpp"
 #include "npuw_transformations/convert_kvcache_to_precision.hpp"
 #include "npuw_transformations/decompose_gqa.hpp"
 #include "npuw_transformations/lora_stateful_to_stateless.hpp"
@@ -490,10 +489,8 @@ void apply_moe_config(ov::AnyMap& stage_config,
                       const std::string& stage_name) {
     if (moe_hint == ::intel_npu::npuw::llm::MoEHint::HOST_ROUTED) {
         LOG_INFO("MoE config for " << stage_name << " stage: HOST_ROUTED (host-side expert routing)");
-        // Set NPUW_ONLINE_ISOLATE separately: append "MOE" and "MOE_MERGED_BMM" to any existing
-        // preset instead of using merge_config_with, which would silently overwrite it.
-        // MOE_MERGED_BMM registers Qwen3ExpertMergedBMM for models where gate+up MatMuls have
-        // been fused by MergeParallelDQMatMuls; MOE keeps Qwen3Expert as fallback for unfused models.
+        // Set NPUW_ONLINE_ISOLATE separately: append "MOE" to any existing preset (e.g. "ATTN")
+        // instead of using merge_config_with, which would silently overwrite it.
         const ov::AnyMap expert_opts = {
             {"NPUW_ONLINE_PIPELINE", "REP"},
             {"NPUW_ONLINE_KEEP_BLOCK_SIZE", "4"},
@@ -847,14 +844,6 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         ov::npuw::PatchSlidingWindowMask().run_on_model(kvcache_model);
     }
 
-    // Merge parallel DQ MatMuls (e.g. MoE gate+up expert pairs) once on the shared
-    // kvcache_model template before it is cloned for prefill and generate stages.
-    // Both clones inherit the merged structure; each stage then applies its own
-    // ReshapeToStatic.  Running here (dynamic shapes, pre-clone) avoids repeating
-    // the expensive constant concat per variant and ensures the merge happens before
-    // ApplyMoEDeviceRoutedTransforms (which would otherwise flatten the 3-D BMM).
-    ov::npuw::MergeParallelDQMatMuls().run_on_model(kvcache_model);
-
     LOG_DEBUG("Creating prefill model as clone of transformed kvcache one.");
     auto prefill_model = kvcache_model->clone();
     prefill_model->set_friendly_name(kvcache_model->get_friendly_name() + "_prefill");
@@ -1127,12 +1116,6 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             }
         }
     }
-
-    // // DEBUG: dump IR before MergeParallelDQMatMuls to inspect the actual DQ pattern (XML only, no BIN)
-    // ov::pass::Serialize("dbg_prefill_before_pmm.xml", "").run_on_model(prefill_model);
-    // if (!generate_model_variants.empty()) {
-    //     ov::pass::Serialize("dbg_generate_before_pmm.xml", "").run_on_model(generate_model_variants[0]);
-    // }
 
     if (is_moe) {
         // Apply MoE configuration for prefill stage

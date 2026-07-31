@@ -115,8 +115,6 @@ set(NPUW_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/decompose_gqa.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/drop_zp_subtract.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/drop_zp_subtract.hpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/merge_parallel_dq_matmuls.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/merge_parallel_dq_matmuls.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/right_align_mask_slice_for_conv.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/right_align_mask_slice_for_conv.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/kv_axes_position.hpp

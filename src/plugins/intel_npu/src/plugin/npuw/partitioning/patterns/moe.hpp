@@ -81,29 +81,6 @@ public:
     Qwen3Expert(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag);
 };
 
-// Variant of Qwen3Expert for models where MergeParallelDQMatMuls has fused the gate
-// and up projections into a single wider MatMul followed by Slice ops.
-//
-// Original:  reshape1 → MatMul_gate / MatMul_up  (two separate MatMuls)
-// Merged:    reshape1 → MatMul_merged → Slice_gate / Slice_up
-//
-// Triggered by the same isolation config key ("Qwen3Expert") so that the
-// partitioner finds expert subgraphs regardless of whether the merge ran.
-class Qwen3ExpertMergedBMM : public ov::pass::MatcherPass {
-public:
-    OPENVINO_MATCHER_PASS_RTTI("npuw::patterns::moe::Qwen3ExpertMergedBMM");
-    static constexpr const char* pattern_name() {
-        return "Qwen3ExpertMergedBMM";
-    }
-    static constexpr const char* isolation_tag() {
-        return EXPERT_TAG;
-    }
-    static constexpr const char* group_name() {
-        return "moe";
-    }
-    Qwen3ExpertMergedBMM(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag);
-};
-
 class Qwen3Router : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("npuw::patterns::moe::Qwen3Router");
