@@ -141,6 +141,8 @@ private:
     uint64_t m_eos_token_id = 0;
     size_t m_decomposed_sdpa_size = 0;
 
+    bool m_is_qwen3_asr = false;
+
     bool m_is_embedding = false;
 
     // Create generate model variants with different sizes

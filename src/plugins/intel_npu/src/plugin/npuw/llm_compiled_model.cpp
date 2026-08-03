@@ -415,7 +415,8 @@ void merge_config_with(ov::AnyMap& lhs, const ov::AnyMap& rhs) {
 
 void split_llm_properties(const ov::AnyMap& properties, ov::AnyMap& llm_properties, ov::AnyMap& other_properties) {
     for (auto it = properties.begin(); it != properties.end(); ++it) {
-        if (it->first.find("NPUW_LLM") != it->first.npos || it->first.find("NPUW_WHISPER") != it->first.npos) {
+        if (it->first.find("NPUW_LLM") != it->first.npos || it->first.find("NPUW_WHISPER") != it->first.npos ||
+            it->first.find("NPUW_QWEN3_ASR") != it->first.npos) {
             llm_properties.insert(*it);
         } else {
             other_properties.insert(*it);
@@ -633,6 +634,9 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
 
         // Set unique name for this variant
         generate_variant->set_friendly_name(generate_model->get_friendly_name() + "_kv" + std::to_string(kv_size));
+        LOG_DEBUG("Variant " << (i + 1) << " reshaped. Saving to "
+                             << (m_name + "_kvcache_kv" + std::to_string(kv_size) + "_static.xml"));
+        ov::save_model(generate_variant, m_name + "_kvcache_kv" + std::to_string(kv_size) + "_static.xml");
         generate_model_variants.push_back(generate_variant);
     }
     LOG_INFO("Created all generate model variants");
@@ -689,6 +693,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     LOG_BLOCK();
     ::intel_npu::registerNPUWLLMOptions(*m_options_desc);
 
+    std::cout << "LLMCompiledModel: model name = " << m_name << std::endl;
+
     ov::AnyMap npuw_llm_props;
     ov::AnyMap other_props;
     split_llm_properties(properties, npuw_llm_props, other_props);
@@ -734,6 +740,18 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         m_cfg.update({{"NPUW_LLM_OPTIMIZE_V_TENSORS", "NO"}});
 
         m_eos_token_id = m_cfg.get<::intel_npu::NPUW_WHISPER_EOS_TOKEN>();
+    }
+
+    // NB: Qwen3-ASR uses encoder_hidden_states for audio embedding injection.
+    // Chunked prefill is disabled to avoid audio token counter issues across chunks.
+    // SHARED_HEAD is intentionally kept enabled (split_llm separates the LM head);
+    // SliceOutEmbeds is skipped for Qwen3-ASR and the correct last-token slice is done
+    // manually at inference time (tokens are LEFT-aligned / right-padded with zeros).
+    m_is_qwen3_asr = m_cfg.get<::intel_npu::NPUW_QWEN3_ASR>();
+    if (m_is_qwen3_asr) {
+        m_cfg.update({{"NPUW_LLM_PREFILL_CHUNK_SIZE",  "0"}});
+        m_cfg.update({{"NPUW_LLM_CACHE_ROPE",          "NO"}});
+        m_cfg.update({{"NPUW_LLM_OPTIMIZE_V_TENSORS",  "NO"}});
     }
 
     m_is_eagle = use_eagle_key.value_or(false).as<bool>() == true;
@@ -825,6 +843,61 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         ov::npuw::RightAlignMaskSliceForConv().run_on_model(kvcache_model);
         LOG_DEBUG("Transform kvcache model from stateful to stateless.");
         ov::pass::StatefulToStateless().run_on_model(kvcache_model);
+
+        std::cout << "Qwen3-ASR model detected: " << (m_is_qwen3_asr ? "YES" : "NO") << std::endl;
+        if (1) {
+            // StatefulToStateless only handles beam_idx-gated KV-cache states.
+            // encoder_hidden_states state (used for audio embedding injection) is not handled.
+            // Convert remaining ReadValue nodes to their initial-value inputs (or new Parameters),
+            // and drop the corresponding Assign sinks.
+            LOG_DEBUG("[Qwen3-ASR] Removing residual state tensors (e.g. encoder_hidden_states).");
+            std::cout << "[Qwen3-ASR] Removing residual state tensors (e.g. encoder_hidden_states)." << std::endl;
+            const auto ops_snapshot = kvcache_model->get_ops();
+            for (const auto& op : ops_snapshot) {
+                auto read_value = ov::as_type_ptr<ov::op::util::ReadValueBase>(op);
+                if (!read_value)
+                    continue;
+                const auto var_id = read_value->get_variable_id();
+                std::shared_ptr<ov::Node> replacement;
+                if (read_value->get_input_size() > 0) {
+                    auto init_node = read_value->get_input_node_shared_ptr(0);
+                    if (ov::as_type_ptr<ov::op::v0::Parameter>(init_node)) {
+                        // Initial value is already a model Parameter — reuse it directly.
+                        // Creating a second Parameter with the same name would produce
+                        // a duplicate and leave one of them with a dynamic (unreshaped) shape.
+                        replacement = init_node;
+                        std::cout << "[Qwen3-ASR]   Replaced ReadValue '" << var_id
+                                  << "' with existing Parameter." << std::endl;
+                    }
+                }
+                if (!replacement) {
+                    // Initial value is a Constant or missing — create a new Parameter so
+                    // the state becomes a dynamic model input (e.g. for injection at runtime).
+                    auto param = std::make_shared<ov::op::v0::Parameter>(
+                        read_value->get_output_element_type(0),
+                        read_value->get_output_partial_shape(0));
+                    param->get_output_tensor(0).set_names({var_id});
+                    param->set_friendly_name(var_id);
+                    kvcache_model->add_parameters({param});
+                    replacement = param;
+                    std::cout << "[Qwen3-ASR]   Replaced ReadValue '" << var_id
+                              << "' with new Parameter." << std::endl;
+                }
+                ov::replace_node(read_value, replacement);
+                LOG_DEBUG("[Qwen3-ASR]   Replaced ReadValue '" << var_id << "' with parameter.");
+            }
+            // Remove remaining Assign sinks
+            std::vector<std::shared_ptr<ov::Node>> sinks_to_remove;
+            for (const auto& sink : kvcache_model->get_sinks()) {
+                if (ov::as_type_ptr<ov::op::util::AssignBase>(sink))
+                    sinks_to_remove.push_back(sink);
+            }
+            for (auto& s : sinks_to_remove)
+                kvcache_model->remove_sink(ov::as_type_ptr<ov::op::Sink>(s));
+            // Remove variable metadata
+            for (const auto& var : kvcache_model->get_variables())
+                kvcache_model->remove_variable(var);
+        }
     }
 
     ov::npuw::LoraStatefulToStatelessPass().run_on_model(kvcache_model);
@@ -852,6 +925,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         KVCacheDesc{max_prompt_len, max_prompt_len + min_response_len, 0u, seq_len_dim, max_generation_token_len};
 
     uint32_t whisper_lhs_seq_size = 0;  // Not applicable for LLMs/VLMs
+    if (1) {
+        whisper_lhs_seq_size = static_cast<uint32_t>(m_cfg.get<::intel_npu::NPUW_QWEN3_ASR_MAX_ENCODER_LEN>());
+        LOG_INFO("[Qwen3-ASR] encoder_hidden_states static seq_len = " << whisper_lhs_seq_size);
+        std::cout << "[Qwen3-ASR] encoder_hidden_states static seq_len = " << whisper_lhs_seq_size << std::endl;
+    }
     if (m_is_whisper) {
         axes = KVAxesPosition{whisper_batch_dim, whisper_seq_len_dim};
         m_kvcache_desc = KVCacheDesc{whisper_max_prompt_size, whisper_kvcache_size, 0u, whisper_seq_len_dim, 1u};
@@ -904,6 +982,10 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                                   true)
             .run_on_model(prefill_model);
     }
+    // if (1) {
+    //     ov::save_model(prefill_model, m_name + "_prefill_static.xml");
+    //     std::cout << "[Qwen3-ASR] Dumped static prefill model to " << m_name << "_prefill_static.xml" << std::endl;
+    // }
     LOG_DEBUG("Make kvcache model with static shapes");
 
     // Create generate model variants with different sizes
@@ -911,9 +993,19 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     if (lm_head_model) {
         LOG_DEBUG("Shared LM head: slice the prefill output");
-        // KVCache model is already reshaped to [1, max_generation_token_len, embed size],
-        // so only apply slice to the Prefill model:
-        ov::npuw::SliceOutEmbeds(axes.batch, m_kvcache_desc.max_generation_token_len).run_on_model(prefill_model);
+        if (!m_is_qwen3_asr) {
+            // Standard path: slice prefill output to the last position so the shared tensor
+            // is already [1, max_generation_token_len, embed_dim] before the LM head.
+            // KVCache model is already reshaped to [1, max_generation_token_len, embed size],
+            // so only apply slice to the Prefill model:
+            ov::npuw::SliceOutEmbeds(axes.batch, m_kvcache_desc.max_generation_token_len).run_on_model(prefill_model);
+        } else {
+            // Qwen3-ASR path: tokens are LEFT-aligned (right-padded with zeros) so we cannot
+            // slice at the last static position.  The full hidden-state sequence
+            // [1, max_prompt, embed_dim] is left as-is here; the correct token is extracted
+            // manually at inference time in LLMInferRequest::infer_prefill().
+            LOG_INFO("[Qwen3-ASR] Skipping SliceOutEmbeds — manual last-token slice will be done at inference time.");
+        }
         LOG_DEBUG("Make LM head model with static shapes");
         ov::npuw::ReshapeSlicedHeadToStatic(axes.batch, m_kvcache_desc.max_generation_token_len)
             .run_on_model(lm_head_model);
@@ -1203,13 +1295,16 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         }
     }
 
+    std::cout << "Compile kv model" << std::endl;
     // Compile multiple generate model variants with different sizes
     compile_generate_model_variants(generate_model_variants, plugin, generate_config);
 
+    std::cout << "Compile prefill model" << std::endl;
     m_prefill_compiled = m_compiled_model_factory(prefill_model, plugin, prefill_config);
     NPUW_ASSERT(m_prefill_compiled && "Can't create ov::npuw::CompiledModel for passed prefill "
                                       "model and its config, please check passed config.");
     if (lm_head_model) {
+        std::cout << "Compile lm head model" << std::endl;
         auto lm_head_config = get_default_lm_head_config(npudesc);
         merge_config_with(lm_head_config, other_props);
         auto lm_head_config_addition_value = lm_head_config_addition.value_or(ov::AnyMap{}).as<ov::AnyMap>();
@@ -1220,6 +1315,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         m_lm_head_compiled = m_compiled_model_factory(lm_head_model, plugin, lm_head_config);
         NPUW_ASSERT(m_lm_head_compiled);
     }
+
+    std::cout << "all compilation done" << std::endl;
 
     implement_properties();
     LOG_DEBUG("Done");

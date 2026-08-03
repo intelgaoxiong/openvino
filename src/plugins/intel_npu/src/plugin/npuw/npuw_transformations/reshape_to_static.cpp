@@ -76,10 +76,13 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
             // NB: Whisper case
             new_shape = ov::PartialShape({1});
         } else if (input_name.find("encoder_hidden_states") != std::string::npos) {
-            // NB: Whisper case
+            // NB: Whisper/Qwen3-ASR case
             const auto& partial_shape = input.get_partial_shape();
             new_shape = partial_shape;
             new_shape[0] = 1;  // batch_dim
+            if (lhs_seq_size > 0 && new_shape[1].is_dynamic()) {
+                new_shape[1] = lhs_seq_size;  // staticize audio token seq_len for NPU compilation
+            }
         } else if (ov::npuw::matchEagle3HiddenStatesString(input_name) ||
                    ov::npuw::matchEagle3TreeMaskString(input_name)) {
             new_shape = ov::npuw::Eagle3Extension::get_static_input(model, input, input_size, kvcache_size, is_prefill);

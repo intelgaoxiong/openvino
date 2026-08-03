@@ -102,6 +102,9 @@ protected:
                         ov::SoPtr<ov::ITensor> token_type_ids,
                         ov::SoPtr<ov::ITensor> per_layer_inputs);
 
+    // Qwen3-ASR: re-run prefill at each decode step (avoids static KV padding / attention mask issues)
+    void infer_generate_qwen3_asr(ov::SoPtr<ov::ITensor> input_ids);
+
     // Multiple generate inference request variants, each with a different KV cache size
     std::vector<std::shared_ptr<ov::IAsyncInferRequest>> m_generate_requests;
 
@@ -143,6 +146,9 @@ protected:
     std::string m_input_ids_name;
 
     bool m_generate_initialized = false;
+
+    // Qwen3-ASR: accumulated token buffer for re-prefill decode strategy
+    std::vector<int64_t> m_qwen3asr_token_buffer;
 
     // Index into m_generate_requests / m_kvcache_sizes for the currently active variant.
     // Updated in prepare_for_new_conversation() and try_switch_to_larger_variant().
