@@ -12,6 +12,7 @@
 #include "logging.hpp"
 #include "moe_transformations/apply_moe_device_routed_transforms.hpp"
 #include "npuw_transformations/add_position_ids_param.hpp"
+#include "npuw_transformations/qwen3_asr_kvcache_prep.hpp"
 #include "npuw_transformations/convert_kvcache_to_precision.hpp"
 #include "npuw_transformations/decompose_gqa.hpp"
 #include "npuw_transformations/lora_stateful_to_stateless.hpp"
@@ -634,9 +635,9 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
 
         // Set unique name for this variant
         generate_variant->set_friendly_name(generate_model->get_friendly_name() + "_kv" + std::to_string(kv_size));
-        LOG_DEBUG("Variant " << (i + 1) << " reshaped. Saving to "
-                             << (m_name + "_kvcache_kv" + std::to_string(kv_size) + "_static.xml"));
-        ov::save_model(generate_variant, m_name + "_kvcache_kv" + std::to_string(kv_size) + "_static.xml");
+        // LOG_DEBUG("Variant " << (i + 1) << " reshaped. Saving to "
+        //                      << (m_name + "_kvcache_kv" + std::to_string(kv_size) + "_static.xml"));
+        // ov::save_model(generate_variant, m_name + "_kvcache_kv" + std::to_string(kv_size) + "_static.xml");
         generate_model_variants.push_back(generate_variant);
     }
     LOG_INFO("Created all generate model variants");
@@ -845,7 +846,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         ov::pass::StatefulToStateless().run_on_model(kvcache_model);
 
         std::cout << "Qwen3-ASR model detected: " << (m_is_qwen3_asr ? "YES" : "NO") << std::endl;
-        if (1) {
+        if (m_is_qwen3_asr) {
             // StatefulToStateless only handles beam_idx-gated KV-cache states.
             // encoder_hidden_states state (used for audio embedding injection) is not handled.
             // Convert remaining ReadValue nodes to their initial-value inputs (or new Parameters),
@@ -898,6 +899,17 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             for (const auto& var : kvcache_model->get_variables())
                 kvcache_model->remove_variable(var);
         }
+    }
+
+    if (m_is_qwen3_asr) {
+        // Inject attention_mask and position_ids into the Qwen3-ASR KV-cache model.
+        // These are needed to correctly gate the causal mask (zero-padded KV slots
+        // must be masked out) and to provide proper RoPE positions at generate time.
+        // Must be applied BEFORE ReshapeToStatic so that the Range nodes are still dynamic.
+        LOG_INFO("[Qwen3-ASR] Injecting attention_mask into kvcache model.");
+        ov::npuw::Qwen3ASRAttentionMaskInput().run_on_model(kvcache_model);
+        LOG_INFO("[Qwen3-ASR] Injecting position_ids into kvcache model.");
+        ov::npuw::Qwen3ASRPositionIdsInput().run_on_model(kvcache_model);
     }
 
     ov::npuw::LoraStatefulToStatelessPass().run_on_model(kvcache_model);

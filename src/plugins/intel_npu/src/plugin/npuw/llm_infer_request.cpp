@@ -1201,10 +1201,6 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
             // Qwen3-ASR: LEFT-align tokens (right-pad with zeros).
             // Tokens occupy [0..N) so the causal mask lets them attend only to each other,
             // avoiding attention pollution from padding zeros.
-            //
-            // Also save the original prompt tokens for generate-step re-prefill.
-            m_qwen3asr_token_buffer.assign(input_ids->data<int64_t>(),
-                                           input_ids->data<int64_t>() + input_ids->get_size());
             std::copy_n(reinterpret_cast<uint8_t*>(input_ids->data()),
                         input_ids->get_byte_size(),
                         reinterpret_cast<uint8_t*>(padded_input->data()));
@@ -1429,65 +1425,108 @@ void ov::npuw::LLMInferRequest::infer_generate_qwen3_asr(ov::SoPtr<ov::ITensor> 
     namespace uu = ov::npuw::util;
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
 
-    // Accumulate the new token into our growing token buffer.
-    // input_ids is [1,1] (one new token per decode step).
-    OPENVINO_ASSERT(input_ids->get_element_type() == ov::element::i64,
-                    "Qwen3-ASR generate expects i64 input_ids");
-    OPENVINO_ASSERT(input_ids->get_size() == 1,
-                    "Qwen3-ASR generate expects single token input, got ", input_ids->get_size());
-    m_qwen3asr_token_buffer.push_back(input_ids->data<int64_t>()[0]);
+    // ------------------------------------------------------------------
+    // Initialization: copy KV from prefill, init attention_mask once.
+    // Convention (matches our Equal(am, 0) graph replacement):
+    //   attention_mask[k] = 0 -> attend, 1 -> mask
+    // Layout of the static generate model (capacity = total_size):
+    //   past_kv   [0 .. N-1]          : valid prefill/generate tokens
+    //   past_kv   [N .. total_size-2]  : zero-padded (masked)
+    //   present_kv[total_size-1]       : current token K, always attend
+    // ------------------------------------------------------------------
+    if (!m_generate_initialized) {
+        LOG_DEBUG("[Qwen3-ASR] First generate step: copying KV from prefill model.");
+        if (kvcache_desc.num_stored_tokens > 0) {
+            m_kvcache_strategy->on_generate_kv_init();
+        }
 
-    const size_t total_tokens = m_qwen3asr_token_buffer.size();
-    OPENVINO_ASSERT(total_tokens <= kvcache_desc.max_prompt_size,
-                    "Qwen3-ASR token buffer (", total_tokens, ") exceeds max_prompt_size (",
-                    kvcache_desc.max_prompt_size, ")");
+        // Prepare static tensors (input_ids, position_ids, encoder_hidden_states).
+        uu::fill_tensor_bytes(m_kvcache_request->get_tensor(m_kvcache_in_ports.at(m_input_ids_name)), 0u);
 
-    std::cout << "[Qwen3-ASR] infer_generate_qwen3_asr: total_tokens=" << total_tokens
-              << " new_token=" << m_qwen3asr_token_buffer.back() << std::endl;
+        // Init attention_mask: attend to valid prefill tokens, mask zero-padded slots,
+        // and ALWAYS attend to the last slot (current token K written there each step).
+        if (const auto attn_it = m_kvcache_in_ports.find(layer_names::attention_mask);
+            attn_it != m_kvcache_in_ports.end()) {
+            auto attn_mask = m_kvcache_request->get_tensor(attn_it->second);
+            auto* mask_data = attn_mask->data<int64_t>();
+            const auto cap = static_cast<int64_t>(attn_mask->get_size());
+            // attend (0) for valid prefill tokens
+            std::fill(mask_data, mask_data + kvcache_desc.num_stored_tokens, int64_t{0});
+            // mask (1) for zero-padded slots (all except the last)
+            if (kvcache_desc.num_stored_tokens < cap - 1) {
+                std::fill(mask_data + kvcache_desc.num_stored_tokens, mask_data + cap - 1, int64_t{1});
+            }
+            // always attend to the last slot (current token K)
+            mask_data[cap - 1] = int64_t{0};
+        }
 
-    // Pad full token sequence to static [1, max_prompt] (right-pad with zeros).
-    auto padded_input = m_prefill_request->get_tensor(m_prefill_in_ports.at(m_input_ids_name));
-    uu::fill_tensor_bytes(padded_input, 0u);
-    std::copy_n(m_qwen3asr_token_buffer.data(), total_tokens, padded_input->data<int64_t>());
+        m_generate_initialized = true;
+    }
 
-    // Re-inject encoder_hidden_states (same as infer_whole_prefill).
-    if (const auto enc_it = m_prefill_in_ports.find(layer_names::encoder_hidden_states);
-        enc_it != m_prefill_in_ports.end()) {
+    // ------------------------------------------------------------------
+    // Per-step: set input_ids, position_ids, encoder_hidden_states, infer.
+    // ------------------------------------------------------------------
+    OPENVINO_ASSERT(input_ids->get_size() == 1, "Qwen3-ASR generate expects single token input");
+
+    // Set input_ids (single token, static shape [1,1])
+    {
+        auto kv_input = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(m_input_ids_name));
+        std::copy_n(reinterpret_cast<const uint8_t*>(input_ids->data()),
+                    input_ids->get_byte_size(),
+                    reinterpret_cast<uint8_t*>(kv_input->data()));
+    }
+
+    // Set position_ids = absolute position of current token
+    if (const auto pos_it = m_kvcache_in_ports.find(layer_names::position_ids);
+        pos_it != m_kvcache_in_ports.end()) {
+        auto pos_ids = m_kvcache_request->get_tensor(pos_it->second);
+        OPENVINO_ASSERT(pos_ids->get_size() == 1, "Qwen3-ASR position_ids must be scalar [1]");
+        pos_ids->data<int64_t>()[0] = static_cast<int64_t>(kvcache_desc.num_stored_tokens);
+    }
+
+    // Inject encoder_hidden_states (cross-attention; same as standard generate path)
+    if (const auto enc_it = m_kvcache_in_ports.find(layer_names::encoder_hidden_states);
+        enc_it != m_kvcache_in_ports.end()) {
         auto outer_enc_port = uu::find_port_by_name(get_inputs(), layer_names::encoder_hidden_states);
         if (outer_enc_port.has_value()) {
             auto user_enc_hs = get_tensor(outer_enc_port.value());
-            auto padded_enc_hs = m_prefill_request->get_tensor(enc_it->second);
-            uu::fill_tensor_bytes(padded_enc_hs, 0u);
-            OPENVINO_ASSERT(user_enc_hs->get_byte_size() <= padded_enc_hs->get_byte_size(),
+            auto kv_enc_hs = m_kvcache_request->get_tensor(enc_it->second);
+            uu::fill_tensor_bytes(kv_enc_hs, 0u);
+            OPENVINO_ASSERT(user_enc_hs->get_byte_size() <= kv_enc_hs->get_byte_size(),
                             "encoder_hidden_states exceeds static enc_pad size");
             std::copy_n(reinterpret_cast<const uint8_t*>(user_enc_hs->data()),
                         user_enc_hs->get_byte_size(),
-                        reinterpret_cast<uint8_t*>(padded_enc_hs->data()));
+                        reinterpret_cast<uint8_t*>(kv_enc_hs->data()));
         }
     }
 
-    // Run the prefill model with full accumulated context.
-    m_prefill_request->infer();
+    m_kvcache_request->infer();
+    kvcache_desc.num_stored_tokens += 1u;
 
-    // Slice output_embeds at position (total_tokens - 1) and run LM head.
-    if (m_lm_head_request) {
-        auto full_embeds = m_prefill_request->get_tensor(
-            m_prefill_out_ports.at(layer_names::output_embeds));
-        auto lm_head_in = m_lm_head_request->get_tensor(m_lm_head_request->get_inputs()[0]);
-        const size_t embed_dim = full_embeds->get_shape()[2];
-        const size_t last_pos = total_tokens - 1;
-        const auto* src = reinterpret_cast<const uint8_t*>(full_embeds->data())
-                          + last_pos * embed_dim * full_embeds->get_element_type().size();
-        std::copy_n(src, embed_dim * lm_head_in->get_element_type().size(),
-                    reinterpret_cast<uint8_t*>(lm_head_in->data()));
-        m_lm_head_request->infer();
-        m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
+    // Copy newly computed K/V (present[last]) into past KV slot [N] for next step.
+    if (kvcache_desc.num_stored_tokens < kvcache_desc.total_size) {
+        m_kvcache_strategy->on_generate_step_done(1u);
     }
 
-    // Advance stored token count by one (one new token added this step).
-    kvcache_desc.num_stored_tokens++;
-    std::cout << "[Qwen3-ASR] infer_generate_qwen3_asr done, num_stored_tokens="
-              << kvcache_desc.num_stored_tokens << std::endl;
+    // Unlock attention for the slot that was just stored: am[N-1] = 0 (attend).
+    if (const auto attn_it = m_kvcache_in_ports.find(layer_names::attention_mask);
+        attn_it != m_kvcache_in_ports.end()) {
+        auto attn_mask = m_kvcache_request->get_tensor(attn_it->second);
+        const auto stored = static_cast<int64_t>(kvcache_desc.num_stored_tokens - 1u);
+        const auto cap    = static_cast<int64_t>(attn_mask->get_size());
+        if (stored >= 0 && stored < cap - 1) {
+            attn_mask->data<int64_t>()[stored] = int64_t{0};
+        }
+    }
+
+    // Get logits (via LM head if separate, otherwise from generate model output)
+    if (m_lm_head_request) {
+        m_lm_head_request->start_async();
+        m_lm_head_request->wait();
+        m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
+    } else {
+        m_logits = m_kvcache_request->get_tensor(m_kvcache_out_ports.at(layer_names::logits));
+    }
 }
 
 void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
