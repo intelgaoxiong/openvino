@@ -306,22 +306,16 @@ std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::ICompiledModel::create(
     auto config = properties;
     config.erase(ov::cache_dir.name());
 
-    std::cout << "ov::npuw::ICompiledModel::create: model name = " << model->get_friendly_name() << std::endl;
-
     if (properties.count(use_gqa_key) && properties.at(use_gqa_key).as<bool>() == true) {
         LOG_INFO("ov::npuw::GQACompiledModel will be created.");
-        std::cout << "ov::npuw::GQACompiledModel will be created." << std::endl;
         compiled_model = std::make_shared<ov::npuw::GQACompiledModel>(model, plugin, config);
     } else if (properties.count(use_llm_key) && properties.at(use_llm_key).as<bool>() == true) {
-        std::cout << "ov::npuw::LLMCompiledModel will be created." << std::endl;
         LOG_INFO("ov::npuw::LLMCompiledModel will be created.");
         compiled_model = std::make_shared<ov::npuw::LLMCompiledModel>(model, plugin, config);
     } else if (properties.count(use_kokoro_key) && properties.at(use_kokoro_key).as<bool>() == true) {
-        std::cout << "ov::npuw::KokoroCompiledModel will be created." << std::endl;
         LOG_INFO("ov::npuw::KokoroCompiledModel will be created.");
         compiled_model = std::make_shared<ov::npuw::KokoroCompiledModel>(model, plugin, config);
     } else {
-        std::cout << "ov::npuw::CompiledModel will be created." << std::endl;
         LOG_INFO("ov::npuw::CompiledModel will be created.");
         compiled_model = std::make_shared<ov::npuw::CompiledModel>(model, plugin, config);
     }

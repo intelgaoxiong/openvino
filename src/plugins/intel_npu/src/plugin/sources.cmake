@@ -126,8 +126,6 @@ set(NPUW_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/optimize_value_tensors.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/patch_sliding_window_mask.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/patch_sliding_window_mask.hpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/qwen3_asr_kvcache_prep.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/qwen3_asr_kvcache_prep.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/replace_deepstack_scatter_with_add.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/replace_deepstack_scatter_with_add.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/npuw_transformations/reshape_sliced_head_to_static.cpp
@@ -215,4 +213,8 @@ set(NPUW_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/whisper/prepare_whisper_model.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/whisper/whisper_infer_request.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/whisper/whisper_infer_request.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/npuw/qwen3asr/prepare_qwen3_asr_model.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/npuw/qwen3asr/prepare_qwen3_asr_model.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/npuw/qwen3asr/qwen3_asr_infer_request.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/npuw/qwen3asr/qwen3_asr_infer_request.hpp
 )

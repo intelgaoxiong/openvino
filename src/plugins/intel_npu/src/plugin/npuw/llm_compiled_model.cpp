@@ -17,13 +17,14 @@
 #include "npuw_transformations/lora_stateful_to_stateless.hpp"
 #include "npuw_transformations/optimize_value_tensors.hpp"
 #include "npuw_transformations/patch_sliding_window_mask.hpp"
-#include "npuw_transformations/qwen3_asr_kvcache_prep.hpp"
 #include "npuw_transformations/replace_deepstack_scatter_with_add.hpp"
 #include "npuw_transformations/reshape_sliced_head_to_static.hpp"
 #include "npuw_transformations/reshape_to_static.hpp"
 #include "npuw_transformations/right_align_mask_slice_for_conv.hpp"
 #include "npuw_transformations/slice_out_embeds.hpp"
 #include "npuw_transformations/split_kvcache_into_blocks.hpp"
+#include "qwen3asr/prepare_qwen3_asr_model.hpp"
+#include "qwen3asr/qwen3_asr_infer_request.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/greater.hpp"
 #include "openvino/op/ops.hpp"
@@ -700,8 +701,6 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     LOG_BLOCK();
     ::intel_npu::registerNPUWLLMOptions(*m_options_desc);
 
-    std::cout << "LLMCompiledModel: model name = " << m_name << std::endl;
-
     ov::AnyMap npuw_llm_props;
     ov::AnyMap other_props;
     split_llm_properties(properties, npuw_llm_props, other_props);
@@ -851,57 +850,12 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         LOG_DEBUG("Transform kvcache model from stateful to stateless.");
         ov::pass::StatefulToStateless().run_on_model(kvcache_model);
 
-        std::cout << "Qwen3-ASR model detected: " << (m_is_qwen3_asr ? "YES" : "NO") << std::endl;
         if (m_is_qwen3_asr) {
             // StatefulToStateless only handles beam_idx-gated KV-cache states.
-            // encoder_hidden_states state (used for audio embedding injection) is not handled.
-            // Convert remaining ReadValue nodes to their initial-value inputs (or new Parameters),
-            // and drop the corresponding Assign sinks.
+            // encoder_hidden_states state is not handled. PrepareQwen3ASRModel converts
+            // remaining ReadValue nodes to Parameters and removes Assign sinks.
             LOG_DEBUG("[Qwen3-ASR] Removing residual state tensors (e.g. encoder_hidden_states).");
-            std::cout << "[Qwen3-ASR] Removing residual state tensors (e.g. encoder_hidden_states)." << std::endl;
-            const auto ops_snapshot = kvcache_model->get_ops();
-            for (const auto& op : ops_snapshot) {
-                auto read_value = ov::as_type_ptr<ov::op::util::ReadValueBase>(op);
-                if (!read_value)
-                    continue;
-                const auto var_id = read_value->get_variable_id();
-                std::shared_ptr<ov::Node> replacement;
-                if (read_value->get_input_size() > 0) {
-                    auto init_node = read_value->get_input_node_shared_ptr(0);
-                    if (ov::as_type_ptr<ov::op::v0::Parameter>(init_node)) {
-                        // Initial value is already a model Parameter — reuse it directly.
-                        // Creating a second Parameter with the same name would produce
-                        // a duplicate and leave one of them with a dynamic (unreshaped) shape.
-                        replacement = init_node;
-                        std::cout << "[Qwen3-ASR]   Replaced ReadValue '" << var_id << "' with existing Parameter."
-                                  << std::endl;
-                    }
-                }
-                if (!replacement) {
-                    // Initial value is a Constant or missing — create a new Parameter so
-                    // the state becomes a dynamic model input (e.g. for injection at runtime).
-                    auto param = std::make_shared<ov::op::v0::Parameter>(read_value->get_output_element_type(0),
-                                                                         read_value->get_output_partial_shape(0));
-                    param->get_output_tensor(0).set_names({var_id});
-                    param->set_friendly_name(var_id);
-                    kvcache_model->add_parameters({param});
-                    replacement = param;
-                    std::cout << "[Qwen3-ASR]   Replaced ReadValue '" << var_id << "' with new Parameter." << std::endl;
-                }
-                ov::replace_node(read_value, replacement);
-                LOG_DEBUG("[Qwen3-ASR]   Replaced ReadValue '" << var_id << "' with parameter.");
-            }
-            // Remove remaining Assign sinks
-            std::vector<std::shared_ptr<ov::Node>> sinks_to_remove;
-            for (const auto& sink : kvcache_model->get_sinks()) {
-                if (ov::as_type_ptr<ov::op::util::AssignBase>(sink))
-                    sinks_to_remove.push_back(sink);
-            }
-            for (auto& s : sinks_to_remove)
-                kvcache_model->remove_sink(ov::as_type_ptr<ov::op::Sink>(s));
-            // Remove variable metadata
-            for (const auto& var : kvcache_model->get_variables())
-                kvcache_model->remove_variable(var);
+            ov::npuw::PrepareQwen3ASRModel().run_on_model(kvcache_model);
         }
     }
 
@@ -930,10 +884,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         // Inject attention_mask and position_ids into the Qwen3-ASR KV-cache model ONLY.
         // Must run AFTER the prefill clone (so prefill is unaffected) and BEFORE
         // ReshapeToStatic (so Range nodes are still dynamic when matched).
-        LOG_INFO("[Qwen3-ASR] Injecting attention_mask into kvcache model.");
-        ov::npuw::Qwen3ASRAttentionMaskInput().run_on_model(kvcache_model);
-        LOG_INFO("[Qwen3-ASR] Injecting position_ids into kvcache model.");
-        ov::npuw::Qwen3ASRPositionIdsInput().run_on_model(kvcache_model);
+        LOG_INFO("[Qwen3-ASR] Injecting attention_mask and position_ids into kvcache model.");
+        ov::npuw::PrepareQwen3ASRKVCacheModel().run_on_model(kvcache_model);
     }
 
     m_kvcache_desc =
@@ -1305,16 +1257,13 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         }
     }
 
-    std::cout << "Compile kv model" << std::endl;
     // Compile multiple generate model variants with different sizes
     compile_generate_model_variants(generate_model_variants, plugin, generate_config);
 
-    std::cout << "Compile prefill model" << std::endl;
     m_prefill_compiled = m_compiled_model_factory(prefill_model, plugin, prefill_config);
     NPUW_ASSERT(m_prefill_compiled && "Can't create ov::npuw::CompiledModel for passed prefill "
                                       "model and its config, please check passed config.");
     if (lm_head_model) {
-        std::cout << "Compile lm head model" << std::endl;
         auto lm_head_config = get_default_lm_head_config(npudesc);
         merge_config_with(lm_head_config, other_props);
         auto lm_head_config_addition_value = lm_head_config_addition.value_or(ov::AnyMap{}).as<ov::AnyMap>();
@@ -1325,8 +1274,6 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         m_lm_head_compiled = m_compiled_model_factory(lm_head_model, plugin, lm_head_config);
         NPUW_ASSERT(m_lm_head_compiled);
     }
-
-    std::cout << "all compilation done" << std::endl;
 
     implement_properties();
     LOG_DEBUG("Done");
@@ -1731,6 +1678,8 @@ std::shared_ptr<ov::ISyncInferRequest> ov::npuw::LLMCompiledModel::create_sync_i
     auto* non_const_this = const_cast<ov::npuw::LLMCompiledModel*>(this);  // because of const in API
     if (m_is_whisper) {
         return non_const_this->create_whisper_infer_request();
+    } else if (m_is_qwen3_asr) {
+        return non_const_this->create_qwen3_asr_infer_request();
     } else if (m_is_embedding) {
         return non_const_this->create_embedding_infer_request();
     } else {
@@ -1746,6 +1695,11 @@ std::shared_ptr<ov::ISyncInferRequest> ov::npuw::LLMCompiledModel::create_llm_in
 std::shared_ptr<ov::ISyncInferRequest> ov::npuw::LLMCompiledModel::create_whisper_infer_request() {
     auto this_sptr = std::static_pointer_cast<ov::npuw::LLMCompiledModel>(shared_from_this());
     return std::make_shared<ov::npuw::WhisperInferRequest>(this_sptr);
+}
+
+std::shared_ptr<ov::ISyncInferRequest> ov::npuw::LLMCompiledModel::create_qwen3_asr_infer_request() {
+    auto this_sptr = std::static_pointer_cast<ov::npuw::LLMCompiledModel>(shared_from_this());
+    return std::make_shared<ov::npuw::Qwen3ASRInferRequest>(this_sptr);
 }
 
 std::shared_ptr<ov::ISyncInferRequest> ov::npuw::LLMCompiledModel::create_embedding_infer_request() {

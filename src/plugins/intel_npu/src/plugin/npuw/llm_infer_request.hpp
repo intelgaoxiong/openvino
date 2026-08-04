@@ -102,8 +102,9 @@ protected:
                         ov::SoPtr<ov::ITensor> token_type_ids,
                         ov::SoPtr<ov::ITensor> per_layer_inputs);
 
-    // Qwen3-ASR: re-run prefill at each decode step (avoids static KV padding / attention mask issues)
-    void infer_generate_qwen3_asr(ov::SoPtr<ov::ITensor> input_ids);
+    // Returns [kv_start, kv_end) for copy_kvcache(): override in subclasses with different alignment.
+    // Default: right-aligned — tokens at [max_prompt - N, max_prompt).
+    virtual std::pair<uint32_t, uint32_t> get_prefill_kv_range() const;
 
     // Multiple generate inference request variants, each with a different KV cache size
     std::vector<std::shared_ptr<ov::IAsyncInferRequest>> m_generate_requests;
@@ -183,10 +184,6 @@ protected:
 
     // KV cache management strategy (set once in the constructor, valid for the object's lifetime)
     std::unique_ptr<LLMKVCacheStrategy> m_kvcache_strategy;
-
-    // Qwen3-ASR debug: stores actual prefill token IDs (populated in infer_whole_prefill)
-    // so infer_generate_qwen3_asr can reconstruct the prefill-baseline reference at step 0.
-    std::vector<int64_t> m_qwen3asr_dbg_prefill_tokens;
 
     // Friend declarations: strategies and PrefixCachingHelper need access to protected members
     friend class LLMContinuousKVCacheStrategy;

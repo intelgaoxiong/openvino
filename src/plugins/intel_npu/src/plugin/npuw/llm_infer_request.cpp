@@ -243,12 +243,6 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     : ov::npuw::LLMInferBaseRequest(compiled_model) {
     init_ports();
 
-    std::cout << "LLMInferRequest: create: " << std::endl;
-    std::cout << "[DBG] prefill model inputs:" << std::endl;
-    for (const auto& p : compiled_model->m_prefill_compiled->inputs()) {
-        std::cout << "[DBG]   " << p.get_any_name() << std::endl;
-    }
-
     auto input_ids_port =
         ov::npuw::util::find_port_by_name(compiled_model->m_prefill_compiled->inputs(), layer_names::input_ids);
     if (input_ids_port.has_value()) {
@@ -264,7 +258,6 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
             "Prefill model has no 'input_ids', 'decoder_input_ids', or 'inputs_embeds' input port");
         m_input_ids_name = layer_names::inputs_embeds;
     }
-    std::cout << "[DBG] m_input_ids_name = " << m_input_ids_name << std::endl;
 
     // Create and register all generate model variants.
     auto register_generate_request = [this](const std::shared_ptr<ov::IAsyncInferRequest>& req) {
@@ -272,8 +265,6 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
         PortsMap in_ports, out_ports;
         for (const auto& p : req->get_compiled_model()->inputs()) {
             in_ports.emplace(p.get_any_name(), p);
-            std::cout << "[DBG] generate model input: " << p.get_any_name()
-                      << " shape=" << p.get_partial_shape() << std::endl;
         }
         for (const auto& p : req->get_compiled_model()->outputs()) {
             for (const auto& name : p.get_names())
@@ -297,10 +288,6 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     // Set ports to ensure tensors aren't empty during bind_past_kv()
     m_kvcache_in_ports = m_generate_variant_in_ports.at(m_kvcache_request);
     m_kvcache_out_ports = m_generate_variant_out_ports.at(m_kvcache_request);
-    std::cout << "[DBG] m_kvcache_in_ports keys (" << m_kvcache_in_ports.size() << "):" << std::endl;
-    for (const auto& [k, _] : m_kvcache_in_ports)
-        std::cout << "[DBG]   " << k << std::endl;
-    std::cout << "[DBG] m_kvcache_past_names count=" << m_kvcache_past_names.size() << std::endl;
 
     m_prefill_base_request = compiled_model->m_prefill_compiled->create_base_infer_request();
     m_prefill_request = compiled_model->m_prefill_compiled->wrap_async_infer_request(m_prefill_base_request);
@@ -369,14 +356,17 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
         const ov::Output<const ov::Node> lm_head_embed_port = m_lm_head_request->get_inputs()[0];
         m_lm_head_logits_port = m_lm_head_request->get_outputs()[0];
 
-        if (!m_npuw_llm_compiled_model->m_is_qwen3_asr) {
-            // Standard path: prefill output is already sliced to [1,1,embed_dim] by SliceOutEmbeds,
-            // so we can share the tensor directly.
-            m_prefill_request->set_tensor(m_prefill_out_ports.at(layer_names::output_embeds),
-                                          m_lm_head_request->get_tensor(lm_head_embed_port));
+        {
+            // Share prefill output → LM head input only when sizes match (SliceOutEmbeds was applied).
+            // If the prefill output is a full sequence tensor (e.g. Qwen3-ASR skips SliceOutEmbeds),
+            // the subclass infer_prefill() will manually copy the last-token slice instead.
+            auto prefill_embed_tensor = m_prefill_request->get_tensor(m_prefill_out_ports.at(layer_names::output_embeds));
+            auto lm_head_embed_tensor = m_lm_head_request->get_tensor(lm_head_embed_port);
+            if (prefill_embed_tensor->get_byte_size() == lm_head_embed_tensor->get_byte_size()) {
+                m_prefill_request->set_tensor(m_prefill_out_ports.at(layer_names::output_embeds),
+                                              lm_head_embed_tensor);
+            }
         }
-        // Qwen3-ASR prefill: output is [1, max_prompt, embed_dim] (SliceOutEmbeds skipped).
-        // The correct last-token slice is copied manually in infer_prefill() before lm_head->infer().
 
         // Generate model outputs [1, max_generation_token_len=1, embed_dim] naturally,
         // so tensor sharing works for both standard and Qwen3-ASR paths.
@@ -657,6 +647,11 @@ void ov::npuw::LLMInferRequest::prepare_for_new_conversation(int64_t prompt_leng
         static_cast<size_t>(std::distance(reqs.begin(), std::find(reqs.begin(), reqs.end(), m_kvcache_request)));
 }
 
+std::pair<uint32_t, uint32_t> ov::npuw::LLMInferRequest::get_prefill_kv_range() const {
+    const auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
+    return {kvcache_desc.max_prompt_size - kvcache_desc.num_stored_tokens, kvcache_desc.max_prompt_size};
+}
+
 void ov::npuw::LLMInferRequest::copy_kvcache() {
     namespace uu = ov::npuw::util;
     LOG_DEBUG("Copying kv-cache from prefill to generate model.");
@@ -750,14 +745,7 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
 
             uu::copy_tensor_by_dim(prefill_present_kv_chunk, kvcache_last_kv_chunk, pre_kv_dim, gen_kv_dim);
         } else {
-            // Qwen3-ASR uses right-padding: tokens (and their KV states) are at positions [0, N).
-            // Standard models use left-padding: KV states are at positions [max-N, max).
-            const uint32_t kv_start = m_npuw_llm_compiled_model->m_is_qwen3_asr
-                                          ? 0u
-                                          : kvcache_desc.max_prompt_size - kvcache_desc.num_stored_tokens;
-            const uint32_t kv_end = m_npuw_llm_compiled_model->m_is_qwen3_asr
-                                        ? kvcache_desc.num_stored_tokens
-                                        : kvcache_desc.max_prompt_size;
+            const auto [kv_start, kv_end] = get_prefill_kv_range();
             auto prefill_out_slice =
                 uu::make_tensor_slice(prefill_out_tensor, pre_kv_dim, kv_start, kv_end);
 
@@ -1216,38 +1204,16 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
                                                     ov::SoPtr<ov::ITensor> deepstack_visual_embeds) {
     LOG_DEBUG("Calling inference for prefill model in a single launch.");
     LOG_BLOCK();
-    std::cout << "Calling inference for prefill model in a single launch." << std::endl;
 
-    std::cout << "[DBG] infer_whole_prefill(): start" << std::endl;
     m_llm_profile["1/prefill:3a.prepare"].record([&]() {
-        std::cout << "[DBG] infer_whole_prefill(): copy input_ids shape=" << input_ids->get_shape() << std::endl;
         // NB: padded_input can be either fp32(VLM) or i64(LLM)
         auto padded_input = m_prefill_request->get_tensor(m_prefill_in_ports.at(m_input_ids_name));
-        std::cout << "[DBG]   padded input_ids shape=" << padded_input->get_shape() << std::endl;
-        // Print first few token ids from input_ids to verify content
-        {
-            const auto* ids = input_ids->data<int64_t>();
-            const auto sz = std::min<size_t>(input_ids->get_size(), 8);
-            std::cout << "[DBG]   input_ids[0.." << sz-1 << "]=[ ";
-            for (size_t i = 0; i < sz; ++i) std::cout << ids[i] << " ";
-            std::cout << "]" << std::endl;
-            std::cout << "[DBG]   input_ids last token=" << ids[input_ids->get_size()-1] << std::endl;
-        }
-        if (m_npuw_llm_compiled_model->m_is_qwen3_asr) {
-            // Qwen3-ASR: LEFT-align tokens (right-pad with zeros).
-            // Tokens occupy [0..N) so the causal mask lets them attend only to each other,
-            // avoiding attention pollution from padding zeros.
-            std::copy_n(reinterpret_cast<uint8_t*>(input_ids->data()),
-                        input_ids->get_byte_size(),
-                        reinterpret_cast<uint8_t*>(padded_input->data()));
-        } else {
-            std::copy_n(reinterpret_cast<uint8_t*>(input_ids->data()),
-                        input_ids->get_byte_size(),
-                        reinterpret_cast<uint8_t*>(padded_input->data()) + padded_input->get_byte_size() -
-                            input_ids->get_byte_size());
-        }
+        // Right-align: copy tokens to the END of the padded buffer (left-pad with zeros).
+        std::copy_n(reinterpret_cast<uint8_t*>(input_ids->data()),
+                    input_ids->get_byte_size(),
+                    reinterpret_cast<uint8_t*>(padded_input->data()) + padded_input->get_byte_size() -
+                        input_ids->get_byte_size());
 
-        std::cout << "[DBG] infer_whole_prefill(): copy attention_mask" << std::endl;
         if (const auto attn_it = m_prefill_in_ports.find(layer_names::attention_mask);
             attn_it != m_prefill_in_ports.end()) {
             auto padded_attention_mask = m_prefill_request->get_tensor(attn_it->second);
@@ -1289,68 +1255,15 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
             auto dst = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::per_layer_inputs));
             ov::npuw::util::copy_to_right(per_layer_inputs, dst);
         }
-
-        // Qwen3-ASR: inject audio encoder hidden states.
-        // Alignment: LEFT-aligned (actual tokens at [0..actual_len), zeros at [actual_len..static_len)).
-        // The embedding layer uses Gather/index on encoder_hidden_states, so rows 0..actual_len-1
-        // must contain real data.
-        if (const auto enc_it = m_prefill_in_ports.find(layer_names::encoder_hidden_states);
-            enc_it != m_prefill_in_ports.end()) {
-            auto outer_enc_port = ov::npuw::util::find_port_by_name(get_inputs(), layer_names::encoder_hidden_states);
-            OPENVINO_ASSERT(outer_enc_port.has_value(),
-                            "encoder_hidden_states port exists in prefill model but not in outer model inputs");
-            auto user_enc_hs = get_tensor(outer_enc_port.value());
-            auto padded_enc_hs = m_prefill_request->get_tensor(enc_it->second);
-            std::cout << "[DBG] enc_hs injection:"
-                      << " src shape=" << user_enc_hs->get_shape()
-                      << " type=" << user_enc_hs->get_element_type()
-                      << "  dst shape=" << padded_enc_hs->get_shape()
-                      << " type=" << padded_enc_hs->get_element_type() << std::endl;
-            OPENVINO_ASSERT(user_enc_hs->get_element_type() == padded_enc_hs->get_element_type(),
-                            "encoder_hidden_states dtype mismatch: src=",
-                            user_enc_hs->get_element_type(),
-                            " dst=", padded_enc_hs->get_element_type(),
-                            ". Ensure genai side provides data in the same precision as the model.");
-            OPENVINO_ASSERT(user_enc_hs->get_byte_size() <= padded_enc_hs->get_byte_size(),
-                            "encoder_hidden_states tensor (", user_enc_hs->get_shape(),
-                            ") exceeds NPUW_QWEN3_ASR_MAX_ENCODER_LEN static size (",
-                            padded_enc_hs->get_shape(), ")");
-            // Zero-fill, then copy actual audio tokens left-aligned
-            ov::npuw::util::fill_tensor_bytes(padded_enc_hs, 0u);
-            std::copy_n(reinterpret_cast<const uint8_t*>(user_enc_hs->data()),
-                        user_enc_hs->get_byte_size(),
-                        reinterpret_cast<uint8_t*>(padded_enc_hs->data()));
-            // Sanity-check: first values must be non-zero if genai passed real audio features
-            {
-                const auto* src = reinterpret_cast<const float*>(user_enc_hs->data());
-                const auto* dst = reinterpret_cast<const float*>(padded_enc_hs->data());
-                std::cout << "[DBG] enc_hs[0..3] src=[" << src[0] << ", " << src[1] << ", " << src[2] << ", " << src[3] << "]"
-                          << "  dst=[" << dst[0] << ", " << dst[1] << ", " << dst[2] << ", " << dst[3] << "]" << std::endl;
-            }
-        } else {
-            std::cout << "[DBG] infer_whole_prefill(): no encoder_hidden_states port in prefill model" << std::endl;
-        }
     });
 
-    std::cout << "[DBG] infer_whole_prefill(): calling m_prefill_request->infer()" << std::endl;
     m_llm_profile["1/prefill:3b.infer"].record([&]() {
         m_prefill_request->infer();
     });
-    std::cout << "[DBG] infer_whole_prefill(): m_prefill_request->infer() done" << std::endl;
 
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
     kvcache_desc.num_stored_tokens += static_cast<uint32_t>(input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM]);
 
-    // Qwen3-ASR debug: save actual (non-padded) token IDs for later generate comparison.
-    if (m_npuw_llm_compiled_model->m_is_qwen3_asr) {
-        const size_t n = kvcache_desc.num_stored_tokens;
-        m_qwen3asr_dbg_prefill_tokens.resize(n);
-        const auto* ids = reinterpret_cast<const int64_t*>(input_ids->data());
-        std::copy_n(ids, n, m_qwen3asr_dbg_prefill_tokens.begin());
-        std::cout << "[DBG][Qwen3-ASR] Saved " << n << " prefill tokens for debug comparison." << std::endl;
-    }
-
-    std::cout << "Done prefill inference, num_stored_tokens=" << kvcache_desc.num_stored_tokens << std::endl;
     LOG_DEBUG("Done");
 }
 
@@ -1409,49 +1322,10 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
     m_llm_profile["1/prefill:4.lm_head"].record([&]() {
         if (m_lm_head_request) {
             LOG_DEBUG("Calling inference for LM head model.");
-            if (m_npuw_llm_compiled_model->m_is_qwen3_asr) {
-                // Qwen3-ASR: prefill body outputs full [1, max_prompt, embed_dim].
-                // Manually copy the hidden state at position (prompt_length-1) into
-                // the LM head's [1, 1, embed_dim] input tensor.
-                auto full_embeds = m_prefill_request->get_tensor(
-                    m_prefill_out_ports.at(layer_names::output_embeds));
-                auto lm_head_in = m_lm_head_request->get_tensor(
-                    m_lm_head_request->get_inputs()[0]);
-                const size_t embed_dim = full_embeds->get_shape()[2];
-                const size_t last_token_pos = prompt_length - 1;
-                std::cout << "[DBG] Qwen3-ASR lm_head slice: pos=" << last_token_pos
-                          << " embed_dim=" << embed_dim << std::endl;
-                OPENVINO_ASSERT(lm_head_in->get_size() == embed_dim,
-                                "lm_head input size mismatch: expected ", embed_dim,
-                                " got ", lm_head_in->get_size());
-                const auto* src = reinterpret_cast<const uint8_t*>(full_embeds->data())
-                                  + last_token_pos * embed_dim * full_embeds->get_element_type().size();
-                std::copy_n(src,
-                            embed_dim * lm_head_in->get_element_type().size(),
-                            reinterpret_cast<uint8_t*>(lm_head_in->data()));
-            }
             m_lm_head_request->infer();
             m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
         } else {
             m_logits = m_prefill_request->get_tensor(m_prefill_out_ports.at(layer_names::logits));
-        }
-
-        // DBG: dump logits shape and top-token at both first and last seq positions
-        {
-            const auto& lshape = m_logits->get_shape();
-            std::cout << "[DBG] prefill logits shape=" << lshape << " type=" << m_logits->get_element_type() << std::endl;
-            if (m_logits->get_element_type() == ov::element::f32 && lshape.size() == 3) {
-                const size_t seq = lshape[1], vocab = lshape[2];
-                const float* data = m_logits->data<float>();
-                // argmax at last position
-                const float* last_row = data + (seq - 1) * vocab;
-                int64_t top_last = std::max_element(last_row, last_row + vocab) - last_row;
-                // argmax at first position
-                const float* first_row = data;
-                int64_t top_first = std::max_element(first_row, first_row + vocab) - first_row;
-                std::cout << "[DBG] logits: top_token@pos[0]=" << top_first
-                          << "  top_token@pos[-1]=" << top_last << std::endl;
-            }
         }
 
         // Update last_hidden_state only for non-chunked prefill
@@ -1466,286 +1340,6 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
     LOG_DEBUG("Done");
 }
 
-void ov::npuw::LLMInferRequest::infer_generate_qwen3_asr(ov::SoPtr<ov::ITensor> input_ids) {
-    namespace uu = ov::npuw::util;
-    auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
-
-    // ------------------------------------------------------------------
-    // Initialization: copy KV from prefill, init attention_mask once.
-    // Convention (matches our Equal(am, 0) graph replacement):
-    //   attention_mask[k] = 0 -> attend, 1 -> mask
-    // Layout of the static generate model (capacity = total_size):
-    //   past_kv   [0 .. N-1]          : valid prefill/generate tokens
-    //   past_kv   [N .. total_size-2]  : zero-padded (masked)
-    //   present_kv[total_size-1]       : current token K, always attend
-    // ------------------------------------------------------------------
-    if (!m_generate_initialized) {
-        LOG_DEBUG("[Qwen3-ASR] First generate step: copying KV from prefill model.");
-        if (kvcache_desc.num_stored_tokens > 0) {
-            m_kvcache_strategy->on_generate_kv_init();
-        }
-
-        // Prepare static tensors (input_ids, position_ids, encoder_hidden_states).
-        uu::fill_tensor_bytes(m_kvcache_request->get_tensor(m_kvcache_in_ports.at(m_input_ids_name)), 0u);
-
-        // Init attention_mask: attend to valid prefill tokens, mask zero-padded slots,
-        // and ALWAYS attend to the last slot (current token K written there each step).
-        if (const auto attn_it = m_kvcache_in_ports.find(layer_names::attention_mask);
-            attn_it != m_kvcache_in_ports.end()) {
-            auto attn_mask = m_kvcache_request->get_tensor(attn_it->second);
-            auto* mask_data = attn_mask->data<int64_t>();
-            const auto cap = static_cast<int64_t>(attn_mask->get_size());
-            // attend (0) for valid prefill tokens
-            std::fill(mask_data, mask_data + kvcache_desc.num_stored_tokens, int64_t{0});
-            // mask (1) for zero-padded slots (all except the last)
-            if (kvcache_desc.num_stored_tokens < cap - 1) {
-                std::fill(mask_data + kvcache_desc.num_stored_tokens, mask_data + cap - 1, int64_t{1});
-            }
-            // always attend to the last slot (current token K)
-            mask_data[cap - 1] = int64_t{0};
-        }
-
-        m_generate_initialized = true;
-    }
-
-    // ------------------------------------------------------------------
-    // Per-step: set input_ids, position_ids, encoder_hidden_states, infer.
-    // ------------------------------------------------------------------
-    OPENVINO_ASSERT(input_ids->get_size() == 1, "Qwen3-ASR generate expects single token input");
-
-    // Set input_ids (single token, static shape [1,1])
-    {
-        auto kv_input = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(m_input_ids_name));
-        std::copy_n(reinterpret_cast<const uint8_t*>(input_ids->data()),
-                    input_ids->get_byte_size(),
-                    reinterpret_cast<uint8_t*>(kv_input->data()));
-    }
-
-    // Set position_ids = absolute position of current token
-    if (const auto pos_it = m_kvcache_in_ports.find(layer_names::position_ids);
-        pos_it != m_kvcache_in_ports.end()) {
-        auto pos_ids = m_kvcache_request->get_tensor(pos_it->second);
-        OPENVINO_ASSERT(pos_ids->get_size() == 1, "Qwen3-ASR position_ids must be scalar [1]");
-        pos_ids->data<int64_t>()[0] = static_cast<int64_t>(kvcache_desc.num_stored_tokens);
-    }
-
-    // Inject encoder_hidden_states (cross-attention; same as standard generate path)
-    if (const auto enc_it = m_kvcache_in_ports.find(layer_names::encoder_hidden_states);
-        enc_it != m_kvcache_in_ports.end()) {
-        auto outer_enc_port = uu::find_port_by_name(get_inputs(), layer_names::encoder_hidden_states);
-        if (outer_enc_port.has_value()) {
-            auto user_enc_hs = get_tensor(outer_enc_port.value());
-            auto kv_enc_hs = m_kvcache_request->get_tensor(enc_it->second);
-            uu::fill_tensor_bytes(kv_enc_hs, 0u);
-            OPENVINO_ASSERT(user_enc_hs->get_byte_size() <= kv_enc_hs->get_byte_size(),
-                            "encoder_hidden_states exceeds static enc_pad size");
-            std::copy_n(reinterpret_cast<const uint8_t*>(user_enc_hs->data()),
-                        user_enc_hs->get_byte_size(),
-                        reinterpret_cast<uint8_t*>(kv_enc_hs->data()));
-        }
-    }
-
-    m_kvcache_request->infer();
-    kvcache_desc.num_stored_tokens += 1u;
-
-    // Diagnostic: print state for the first few generate steps
-    static int qwen3_gen_step = 0;
-    if (qwen3_gen_step < 3) {
-        std::cout << "[Qwen3-ASR][GEN] step=" << qwen3_gen_step
-                  << " num_stored=" << kvcache_desc.num_stored_tokens << std::endl;
-        if (const auto pos_it = m_kvcache_in_ports.find(layer_names::position_ids);
-            pos_it != m_kvcache_in_ports.end()) {
-            auto pos_ids = m_kvcache_request->get_tensor(pos_it->second);
-            std::cout << "[Qwen3-ASR][GEN]   position_ids[0]=" << pos_ids->data<int64_t>()[0] << std::endl;
-        }
-        if (const auto attn_it = m_kvcache_in_ports.find(layer_names::attention_mask);
-            attn_it != m_kvcache_in_ports.end()) {
-            auto attn_mask = m_kvcache_request->get_tensor(attn_it->second);
-            const auto cap = attn_mask->get_size();
-            std::cout << "[Qwen3-ASR][GEN]   attention_mask size=" << cap << " first4=[";
-            for (size_t i = 0; i < std::min(cap, size_t{4}); ++i)
-                std::cout << attn_mask->data<int64_t>()[i] << (i+1<std::min(cap,size_t{4})?",":"");
-            std::cout << "] last4=[";
-            for (size_t i = cap >= 4 ? cap-4 : 0; i < cap; ++i)
-                std::cout << attn_mask->data<int64_t>()[i] << (i+1<cap?",":"");
-            std::cout << "]" << std::endl;
-        }
-        ++qwen3_gen_step;
-    }
-
-    // -------------------------------------------------------------------------
-    // DEBUG COMPARISON (step 0 only): compare kvcache-model embedding (act) vs
-    // prefill-model-with-full-context embedding (ref).
-    // Writes act_embed.bin, ref_embed.bin, and checks past_kv[0] is non-zero.
-    // -------------------------------------------------------------------------
-    if (qwen3_gen_step == 1) {  // first generate step just completed (counter already incremented)
-        namespace uu = ov::npuw::util;
-
-        // Helper: dump a tensor to a binary file
-        auto dump_bin = [](const std::string& path, ov::SoPtr<ov::ITensor> t) {
-            if (!t) { std::cout << "[DBG] dump_bin: null tensor for " << path << std::endl; return; }
-            std::ofstream f(path, std::ios::binary);
-            f.write(reinterpret_cast<const char*>(t->data()), static_cast<std::streamsize>(t->get_byte_size()));
-            std::cout << "[DBG] Saved " << path << " shape=" << t->get_shape()
-                      << " type=" << t->get_element_type()
-                      << " bytes=" << t->get_byte_size() << std::endl;
-        };
-
-        // 1) Dump act_embed: kvcache model output embedding (already computed above)
-        if (const auto embed_it = m_kvcache_out_ports.find(layer_names::output_embeds);
-            embed_it != m_kvcache_out_ports.end()) {
-            auto act_embed = m_kvcache_request->get_tensor(embed_it->second);
-            dump_bin("act_embed.bin", act_embed);
-            // Print first 4 float values for quick sanity check
-            if (act_embed && act_embed->get_element_type() == ov::element::f32 && act_embed->get_size() >= 4) {
-                const float* d = act_embed->data<float>();
-                std::cout << "[DBG] act_embed[0..3]=[" << d[0] << "," << d[1] << "," << d[2] << "," << d[3] << "]" << std::endl;
-            }
-        } else {
-            std::cout << "[DBG] act_embed: output_embeds port not found in kvcache out ports" << std::endl;
-        }
-
-        // 2) Sanity-check past_kv[0] is non-zero (confirms KV copy from prefill succeeded)
-        if (!m_kvcache_past_names.empty()) {
-            const auto& kv0_name = m_kvcache_past_names[0];
-            if (m_kvcache_in_ports.count(kv0_name)) {
-                auto kv0 = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(kv0_name));
-                if (kv0) {
-                    // Check first 64 raw bytes for non-zero content (type-agnostic)
-                    const auto* raw = reinterpret_cast<const uint8_t*>(kv0->data());
-                    const size_t check_bytes = std::min(kv0->get_byte_size(), size_t{64});
-                    bool all_zero = true;
-                    for (size_t i = 0; i < check_bytes; ++i) {
-                        if (raw[i] != 0) { all_zero = false; break; }
-                    }
-                    std::cout << "[DBG] past_kv[0] ('" << kv0_name << "')"
-                              << " type=" << kv0->get_element_type()
-                              << " shape=" << kv0->get_shape()
-                              << " first64bytes_all_zero=" << (all_zero ? "YES (KV copy FAILED!)" : "no (KV copy OK)")
-                              << std::endl;
-                    // Print first 4 f32 values if applicable
-                    if (kv0->get_element_type() == ov::element::f32 && kv0->get_size() >= 4) {
-                        const float* f = kv0->data<float>();
-                        std::cout << "[DBG] past_kv[0] f32[0..3]=[" << f[0] << "," << f[1] << "," << f[2] << "," << f[3] << "]" << std::endl;
-                    } else if (kv0->get_element_type() == ov::element::f16 && kv0->get_size() >= 4) {
-                        const uint16_t* h = reinterpret_cast<const uint16_t*>(kv0->data());
-                        std::cout << "[DBG] past_kv[0] f16[0..3] raw=[" << h[0] << "," << h[1] << "," << h[2] << "," << h[3] << "]" << std::endl;
-                    }
-                } else {
-                    std::cout << "[DBG] past_kv[0] ('" << kv0_name << "') tensor is null" << std::endl;
-                }
-            } else {
-                std::cout << "[DBG] past_kv[0] ('" << kv0_name << "') NOT in m_kvcache_in_ports" << std::endl;
-            }
-        } else {
-            std::cout << "[DBG] m_kvcache_past_names is empty, skipping past_kv[0] check" << std::endl;
-        }
-        // encoder_hidden_states check runs regardless of past_kv state
-        if (m_kvcache_in_ports.count(layer_names::encoder_hidden_states)) {
-            auto enc = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::encoder_hidden_states));
-            if (enc) {
-                const auto* raw = reinterpret_cast<const uint8_t*>(enc->data());
-                const size_t check_bytes = std::min(enc->get_byte_size(), size_t{64});
-                bool all_zero = true;
-                for (size_t i = 0; i < check_bytes; ++i) {
-                    if (raw[i] != 0) { all_zero = false; break; }
-                }
-                std::cout << "[DBG] kvcache encoder_hidden_states"
-                          << " type=" << enc->get_element_type()
-                          << " shape=" << enc->get_shape()
-                          << " first64bytes_all_zero=" << (all_zero ? "YES (enc not injected!)" : "no (enc OK)")
-                          << std::endl;
-            }
-        } else {
-            std::cout << "[DBG] encoder_hidden_states NOT in m_kvcache_in_ports" << std::endl;
-        }
-        // 3) Run prefill model with [prefill_tokens + first_generate_token] → ref_embed
-        if (!m_qwen3asr_dbg_prefill_tokens.empty()) {
-            const size_t P = m_qwen3asr_dbg_prefill_tokens.size();  // number of prefill tokens
-            // Build extended token buffer [prefill | generate_token_0]
-            const int64_t gen_tok = *reinterpret_cast<const int64_t*>(input_ids->data());
-            std::vector<int64_t> full_ctx(m_qwen3asr_dbg_prefill_tokens);
-            full_ctx.push_back(gen_tok);
-            const size_t full_len = full_ctx.size();  // P + 1
-
-            // Set input_ids on prefill model (left-aligned into the static buffer)
-            auto padded_ids = m_prefill_request->get_tensor(m_prefill_in_ports.at(m_input_ids_name));
-            uu::fill_tensor_bytes(padded_ids, 0u);
-            std::copy_n(reinterpret_cast<const uint8_t*>(full_ctx.data()),
-                        full_len * sizeof(int64_t),
-                        reinterpret_cast<uint8_t*>(padded_ids->data()));
-
-            // Inject encoder_hidden_states (same as in infer_whole_prefill)
-            if (const auto enc_it = m_prefill_in_ports.find(layer_names::encoder_hidden_states);
-                enc_it != m_prefill_in_ports.end()) {
-                auto outer_enc = uu::find_port_by_name(get_inputs(), layer_names::encoder_hidden_states);
-                if (outer_enc.has_value()) {
-                    auto user_enc = get_tensor(outer_enc.value());
-                    auto padded_enc = m_prefill_request->get_tensor(enc_it->second);
-                    uu::fill_tensor_bytes(padded_enc, 0u);
-                    std::copy_n(reinterpret_cast<const uint8_t*>(user_enc->data()),
-                                user_enc->get_byte_size(),
-                                reinterpret_cast<uint8_t*>(padded_enc->data()));
-                }
-            }
-
-            // Run prefill model
-            std::cout << "[DBG] Running prefill baseline with " << full_len << " tokens..." << std::endl;
-            m_prefill_request->infer();
-
-            // Extract embedding at position (full_len - 1) = last token = first generate token
-            if (const auto emb_it = m_prefill_out_ports.find(layer_names::output_embeds);
-                emb_it != m_prefill_out_ports.end()) {
-                auto full_embeds = m_prefill_request->get_tensor(emb_it->second);
-                // full_embeds shape: [1, max_prompt, embed_dim]
-                const size_t embed_dim = full_embeds->get_shape()[2];
-                const size_t ref_pos = full_len - 1;
-                // Create a slice tensor for position ref_pos
-                auto ref_embed = ov::make_tensor(full_embeds->get_element_type(), ov::Shape{1, 1, embed_dim});
-                const size_t elem_bytes = full_embeds->get_element_type().size();
-                std::copy_n(
-                    reinterpret_cast<const uint8_t*>(full_embeds->data()) + ref_pos * embed_dim * elem_bytes,
-                    embed_dim * elem_bytes,
-                    reinterpret_cast<uint8_t*>(ref_embed->data()));
-                dump_bin("ref_embed.bin", ov::SoPtr<ov::ITensor>{ref_embed, nullptr});
-                if (ref_embed->get_element_type() == ov::element::f32 && ref_embed->get_size() >= 4) {
-                    const float* d = ref_embed->data<float>();
-                    std::cout << "[DBG] ref_embed[0..3]=[" << d[0] << "," << d[1] << "," << d[2] << "," << d[3] << "]" << std::endl;
-                }
-            } else {
-                std::cout << "[DBG] ref_embed: output_embeds not found in prefill out ports" << std::endl;
-            }
-        } else {
-            std::cout << "[DBG] ref_embed: m_qwen3asr_dbg_prefill_tokens empty, skipping baseline" << std::endl;
-        }
-    }  // end step-0 debug comparison
-
-    // Copy newly computed K/V (present[last]) into past KV slot [N] for next step.
-    if (kvcache_desc.num_stored_tokens < kvcache_desc.total_size) {
-        m_kvcache_strategy->on_generate_step_done(1u);
-    }
-
-    // Unlock attention for the slot that was just stored: am[N-1] = 0 (attend).
-    if (const auto attn_it = m_kvcache_in_ports.find(layer_names::attention_mask);
-        attn_it != m_kvcache_in_ports.end()) {
-        auto attn_mask = m_kvcache_request->get_tensor(attn_it->second);
-        const auto stored = static_cast<int64_t>(kvcache_desc.num_stored_tokens - 1u);
-        const auto cap    = static_cast<int64_t>(attn_mask->get_size());
-        if (stored >= 0 && stored < cap - 1) {
-            attn_mask->data<int64_t>()[stored] = int64_t{0};
-        }
-    }
-
-    // Get logits (via LM head if separate, otherwise from generate model output)
-    if (m_lm_head_request) {
-        m_lm_head_request->start_async();
-        m_lm_head_request->wait();
-        m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
-    } else {
-        m_logits = m_kvcache_request->get_tensor(m_kvcache_out_ports.at(layer_names::logits));
-    }
-}
-
 void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
                                                ov::SoPtr<ov::ITensor> attention_mask,
                                                ov::SoPtr<ov::ITensor> position_ids,
@@ -1753,15 +1347,7 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
                                                ov::SoPtr<ov::ITensor> per_layer_inputs) {
     LOG_DEBUG("Calling inference for generate model...");
     LOG_BLOCK();
-    std::cout << "Calling inference for generate model..." << std::endl;
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
-
-    // Qwen3-ASR: skip KV cache model entirely; re-run prefill with full accumulated context.
-    // This avoids attention pollution from zero-padded past KV (model has no attention_mask).
-    if (m_npuw_llm_compiled_model->m_is_qwen3_asr) {
-        infer_generate_qwen3_asr(input_ids);
-        return;
-    }
 
     uint32_t input_tokens_len = static_cast<uint32_t>(input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM]);
     if (input_tokens_len > kvcache_desc.max_generation_token_len) {
@@ -1875,32 +1461,6 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
         }
 
         // Qwen3-ASR: inject encoder_hidden_states into generate model.
-        // The generate model also has encoder_hidden_states as a Parameter (from StatefulToStateless)
-        // and needs it set each decode step.
-        if (m_npuw_llm_compiled_model->m_is_qwen3_asr) {
-            if (const auto enc_it = m_kvcache_in_ports.find(layer_names::encoder_hidden_states);
-                enc_it != m_kvcache_in_ports.end()) {
-                auto outer_enc_port = ov::npuw::util::find_port_by_name(
-                    get_inputs(), layer_names::encoder_hidden_states);
-                if (outer_enc_port.has_value()) {
-                    auto user_enc_hs = get_tensor(outer_enc_port.value());
-                    // Generate model has static shape [1, enc_pad, 2048]; copy actual data in.
-                    // Same approach as infer_whole_prefill: zero-fill static buffer then copy.
-                    auto kv_enc_hs = m_kvcache_request->get_tensor(enc_it->second);
-                    ov::npuw::util::fill_tensor_bytes(kv_enc_hs, 0u);
-                    OPENVINO_ASSERT(user_enc_hs->get_byte_size() <= kv_enc_hs->get_byte_size(),
-                                    "encoder_hidden_states exceeds static enc_pad size");
-                    std::copy_n(reinterpret_cast<const uint8_t*>(user_enc_hs->data()),
-                                user_enc_hs->get_byte_size(),
-                                reinterpret_cast<uint8_t*>(kv_enc_hs->data()));
-                } else {
-                    std::cout << "[DBG] infer_generate: encoder_hidden_states NOT found in outer inputs!" << std::endl;
-                }
-            } else {
-                std::cout << "[DBG] infer_generate: encoder_hidden_states NOT in kvcache_in_ports!" << std::endl;
-            }
-        }
-
         if (m_eagle3_ext.is_eagle3_model()) {
             m_eagle3_ext.prepare_inputs(m_kvcache_request, m_kvcache_in_ports);
         }
@@ -1953,32 +1513,19 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
         m_eagle3_ext.update_last_hidden_state(m_kvcache_request, m_kvcache_out_ports);
     }
 
-    std::cout << "Done generate inference, num_stored_tokens=" << kvcache_desc.num_stored_tokens << std::endl;
-
     LOG_DEBUG("Done");
 }
 
 void ov::npuw::LLMInferRequest::infer() {
     const auto& inputs = get_inputs();
-    std::cout << "[DBG] infer(): outer inputs count=" << inputs.size() << std::endl;
-    for (const auto& p : inputs) {
-        std::cout << "[DBG]   input port: " << p.get_any_name() << std::endl;
-    }
-
-    std::cout << "[DBG] infer(): finding " << m_input_ids_name << std::endl;
     auto input_ids = get_tensor(ov::npuw::util::find_port_by_name(inputs, m_input_ids_name).value());
-    std::cout << "[DBG] infer(): input_ids found, shape=" << input_ids->get_shape() << std::endl;
 
-    std::cout << "[DBG] infer(): finding attention_mask" << std::endl;
     auto attention_mask_opt = ov::npuw::util::find_port_by_name(inputs, layer_names::attention_mask);
     ov::SoPtr<ov::ITensor> attention_mask;
     if (attention_mask_opt.has_value()) {
         attention_mask = get_tensor(attention_mask_opt.value());
-        std::cout << "[DBG] infer(): attention_mask found, shape=" << attention_mask->get_shape() << std::endl;
     } else {
-        // Qwen3-ASR (and similar models) have no explicit attention_mask input.
         // Synthesize a full-ones mask matching input_ids seq_len.
-        std::cout << "[DBG] infer(): no attention_mask in outer inputs, synthesizing" << std::endl;
         const auto seq_len = input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM];
         attention_mask = ov::make_tensor(ov::element::i64, ov::Shape{1, seq_len});
         std::fill_n(attention_mask->data<int64_t>(), seq_len, 1);

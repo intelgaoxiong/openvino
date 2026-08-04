@@ -22,6 +22,7 @@ namespace npuw {
 
 class LLMInferRequest;
 class WhisperInferRequest;
+class Qwen3ASRInferRequest;
 class LLMBlockKVCacheStrategy;
 class LLMContinuousKVCacheStrategy;
 struct PrefixCacheRestorationContext;
@@ -84,6 +85,7 @@ private:
     friend class LLMInferBaseRequest;
     friend class LLMInferRequest;
     friend class WhisperInferRequest;
+    friend class Qwen3ASRInferRequest;
     friend class EmbeddingInferRequest;
     friend class LLMBlockKVCacheStrategy;
     friend class LLMContinuousKVCacheStrategy;
@@ -91,6 +93,7 @@ private:
 
     std::shared_ptr<ov::ISyncInferRequest> create_llm_infer_request();
     std::shared_ptr<ov::ISyncInferRequest> create_whisper_infer_request();
+    std::shared_ptr<ov::ISyncInferRequest> create_qwen3_asr_infer_request();
     std::shared_ptr<ov::ISyncInferRequest> create_embedding_infer_request();
     std::shared_ptr<ov::ISyncInferRequest> create_sync_infer_request() const override;
     void implement_properties();
