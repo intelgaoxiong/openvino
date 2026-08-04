@@ -221,18 +221,22 @@ void ov::npuw::Qwen3ASRInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input
     m_kvcache_request->infer();
     kvcache_desc.num_stored_tokens += 1u;
 
+    // Kick off LM head asynchronously so KV update + mask unlock can overlap with it.
+    if (m_lm_head_request) {
+        m_lm_head_request->start_async();
+    }
+
     // Persist the new token's KV outputs into the past_key_values input buffer
     // so the next generate step sees the updated context.
     if (kvcache_desc.num_stored_tokens < kvcache_desc.total_size) {
         m_kvcache_strategy->on_generate_step_done(1u);
     }
 
-    // Unlock the newly stored KV slot by clearing its attention_mask bit
+    // Unlock the newly stored KV slot by clearing its attention_mask bit.
+    // on_generate_step_done wrote the new token's KV to slot (num_stored_tokens - 1).
     if (const auto attn_it = m_kvcache_in_ports.find(layer_names::attention_mask);
         attn_it != m_kvcache_in_ports.end()) {
         auto attn_mask = m_kvcache_request->get_tensor(attn_it->second);
-        // on_generate_step_done wrote the new token's KV to slot (num_stored_tokens - 1).
-        // Unlock that slot so the next step can attend to it via the past_kv buffer.
         const auto new_slot = static_cast<int64_t>(kvcache_desc.num_stored_tokens) - 1;
         if (new_slot >= 0) {
             attn_mask->data<int64_t>()[new_slot] = int64_t{0};
@@ -240,7 +244,7 @@ void ov::npuw::Qwen3ASRInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input
     }
 
     if (m_lm_head_request) {
-        m_lm_head_request->infer();
+        m_lm_head_request->wait();
         m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
     } else {
         m_logits = m_kvcache_request->get_tensor(m_kvcache_out_ports.at(layer_names::logits));
