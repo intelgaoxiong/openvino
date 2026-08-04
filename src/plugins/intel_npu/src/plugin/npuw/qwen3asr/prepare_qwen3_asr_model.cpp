@@ -20,26 +20,31 @@ namespace opp = ov::pass::pattern;
 namespace {
 
 // ---------------------------------------------------------------------------
-// Replaces:
-//   Range_k(0, stop, 1) -> Unsqueeze x3 -> (optional Convert) -> LessEqual
-// with:
-//   attention_mask [1, capacity] -> Unsqueeze(1) -> Unsqueeze(2) -> Equal(_, 0)
+// Injects attention_mask [1, -1] and combines it with the existing causal mask:
+//   combined = LogicalAnd(LessEqual(key_pos, query_pos),
+//                         Equal(Unsqueeze(Unsqueeze(attention_mask,1),2), 0))
 //
-// Boolean semantics preserved:
-//   attention_mask[k] == 0 -> True  -> attend
-//   attention_mask[k] != 0 -> False -> mask out
+// This single matcher works correctly for both models:
+//   - generate model: only 1 query token, so LessEqual is True for all past keys;
+//     LogicalAnd reduces to just Equal(am,0) — same result as before.
+//   - prefill model: N query tokens; LogicalAnd preserves causality while also
+//     masking padding keys (attention_mask[k] != 0).
+//
+// Boolean semantics:
+//   attention_mask[k] == 0 -> attend (real token)
+//   attention_mask[k] != 0 -> mask out (padding)
 // ---------------------------------------------------------------------------
 class Qwen3ASRAttentionMaskMatcher : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("ov::npuw::Qwen3ASRAttentionMaskMatcher");
 
     explicit Qwen3ASRAttentionMaskMatcher(std::shared_ptr<ov::Model> model) {
-        auto range_k     = opp::wrap_type<ov::op::v4::Range>();
-        auto unsq1       = opp::wrap_type<ov::op::v0::Unsqueeze>({range_k, opp::any_input()});
-        auto unsq2       = opp::wrap_type<ov::op::v0::Unsqueeze>({unsq1,   opp::any_input()});
-        auto unsq3       = opp::wrap_type<ov::op::v0::Unsqueeze>({unsq2,   opp::any_input()});
+        auto range_k = opp::wrap_type<ov::op::v4::Range>();
+        auto unsq1 = opp::wrap_type<ov::op::v0::Unsqueeze>({range_k, opp::any_input()});
+        auto unsq2 = opp::wrap_type<ov::op::v0::Unsqueeze>({unsq1, opp::any_input()});
+        auto unsq3 = opp::wrap_type<ov::op::v0::Unsqueeze>({unsq2, opp::any_input()});
         auto opt_convert = opp::optional<ov::op::v0::Convert>({unsq3->output(0)});
-        auto le          = opp::wrap_type<ov::op::v1::LessEqual>({opt_convert, opp::any_input()});
+        auto le = opp::wrap_type<ov::op::v1::LessEqual>({opt_convert, opp::any_input()});
 
         register_matcher(
             std::make_shared<opp::Matcher>(le, this->get_type_info().name),
@@ -49,8 +54,7 @@ public:
                 // Guard: Range start must be Constant 0 (= K-side positions)
                 auto& pmap = m.get_pattern_value_map();
                 auto range_node = pmap.at(range_k).get_node_shared_ptr();
-                auto start_node = range_node->get_input_node_shared_ptr(0);
-                auto start_const = ov::as_type_ptr<ov::op::v0::Constant>(start_node);
+                auto start_const = ov::as_type_ptr<ov::op::v0::Constant>(range_node->get_input_node_shared_ptr(0));
                 if (!start_const)
                     return false;
                 auto start_vals = start_const->cast_vector<int64_t>();
@@ -58,24 +62,35 @@ public:
                     return false;
 
                 // Inject attention_mask [1, -1] parameter
-                auto attention_mask = std::make_shared<ov::op::v0::Parameter>(
-                    ov::element::i64, ov::PartialShape{1, -1});
+                auto attention_mask =
+                    std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{1, -1});
                 attention_mask->get_output_tensor(0).set_names({"attention_mask"});
                 attention_mask->set_friendly_name("attention_mask");
                 model->add_parameters({attention_mask});
 
-                // Build Equal(Unsqueeze(Unsqueeze(attention_mask, 1), 2), 0)
-                // [1,N] -> [1,1,1,N] to match original 4D causal mask shape.
-                auto c0 = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0});
-                auto c1 = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {1});
-                auto c2 = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {2});
+                // padding_not_masked = Equal(Unsqueeze(Unsqueeze(am, 1), 2), 0)
+                // [1,N] -> [1,1,1,N] — broadcasts over [1,heads,Q,N]
+                auto c0 = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0LL});
+                auto c1 = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {1LL});
+                auto c2 = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {2LL});
+                auto am_u1 = std::make_shared<ov::op::v0::Unsqueeze>(attention_mask->output(0), c1);
+                auto am_u2 = std::make_shared<ov::op::v0::Unsqueeze>(am_u1->output(0), c2);
+                auto equal = std::make_shared<ov::op::v1::Equal>(am_u2->output(0), c0);
 
-                auto am_unsq1 = std::make_shared<ov::op::v0::Unsqueeze>(attention_mask->output(0), c1);
-                auto am_unsq2 = std::make_shared<ov::op::v0::Unsqueeze>(am_unsq1->output(0), c2);
-                auto equal    = std::make_shared<ov::op::v1::Equal>(am_unsq2->output(0), c0);
+                // Collect original consumers BEFORE creating the AND node to avoid
+                // rerouting the AND's own input back to itself.
+                std::vector<ov::Input<ov::Node>> consumers;
+                for (const auto& in : le_node->output(0).get_target_inputs())
+                    consumers.push_back(in);
 
-                ov::replace_node(le_node, equal);
-                return false;  // allow other matchers to continue
+                // combined = causal_mask AND padding_not_masked
+                auto combined = std::make_shared<ov::op::v1::LogicalAnd>(le_node->output(0), equal->output(0));
+
+                // Redirect original consumers to the combined output
+                for (auto& in : consumers)
+                    in.replace_source_output(combined->output(0));
+
+                return false;
             });
     }
 };
@@ -91,32 +106,80 @@ public:
     OPENVINO_MATCHER_PASS_RTTI("ov::npuw::Qwen3ASRPositionIdsMatcher");
 
     explicit Qwen3ASRPositionIdsMatcher(std::shared_ptr<ov::Model> model) {
-        auto gather  = opp::wrap_type<ov::op::v8::Gather>(
-            {opp::any_input(), opp::any_input(), opp::any_input()});
-        auto range_q = opp::wrap_type<ov::op::v4::Range>(
-            {gather, opp::any_input(), opp::any_input()});
+        auto gather = opp::wrap_type<ov::op::v8::Gather>({opp::any_input(), opp::any_input(), opp::any_input()});
+        auto range_q = opp::wrap_type<ov::op::v4::Range>({gather, opp::any_input(), opp::any_input()});
+        auto reshape = opp::wrap_type<ov::op::v1::Reshape>({range_q, opp::any_input()});
+
+        register_matcher(std::make_shared<opp::Matcher>(reshape, this->get_type_info().name),
+                         [model, gather](opp::Matcher& m) {
+                             auto reshape_node = m.get_match_root();
+
+                             // Guard: Gather must consume a ShapeOf (= derives position from tensor shape)
+                             auto& pmap = m.get_pattern_value_map();
+                             auto gather_node = pmap.at(gather).get_node_shared_ptr();
+                             auto gather_src = gather_node->get_input_node_shared_ptr(0);
+                             if (gather_src->get_type_name() != std::string("ShapeOf"))
+                                 return false;
+
+                             // Inject position_ids [1] parameter
+                             auto position_ids =
+                                 std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::Shape{1});
+                             position_ids->get_output_tensor(0).set_names({"position_ids"});
+                             position_ids->set_friendly_name("position_ids");
+                             model->add_parameters({position_ids});
+
+                             // Redirect: position_ids -> existing Reshape (preserves shape constant)
+                             reshape_node->input(0).replace_source_output(position_ids->output(0));
+                             return false;
+                         });
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Injects position_ids [-1] for the prefill model (full-sequence positions).
+// Same structural pattern as Qwen3ASRPositionIdsMatcher but with dynamic shape
+// to accommodate the full max_prompt positions at inference time.
+// ---------------------------------------------------------------------------
+class Qwen3ASRPrefillPositionIdsMatcher : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("ov::npuw::Qwen3ASRPrefillPositionIdsMatcher");
+
+    explicit Qwen3ASRPrefillPositionIdsMatcher(std::shared_ptr<ov::Model> model) {
+        auto gather = opp::wrap_type<ov::op::v8::Gather>({opp::any_input(), opp::any_input(), opp::any_input()});
+        auto range_q = opp::wrap_type<ov::op::v4::Range>({gather, opp::any_input(), opp::any_input()});
         auto reshape = opp::wrap_type<ov::op::v1::Reshape>({range_q, opp::any_input()});
 
         register_matcher(
             std::make_shared<opp::Matcher>(reshape, this->get_type_info().name),
             [model, gather](opp::Matcher& m) {
                 auto reshape_node = m.get_match_root();
-
-                // Guard: Gather must consume a ShapeOf (= derives position from tensor shape)
                 auto& pmap = m.get_pattern_value_map();
                 auto gather_node = pmap.at(gather).get_node_shared_ptr();
                 auto gather_src = gather_node->get_input_node_shared_ptr(0);
                 if (gather_src->get_type_name() != std::string("ShapeOf"))
                     return false;
 
-                // Inject position_ids [1] parameter
-                auto position_ids = std::make_shared<ov::op::v0::Parameter>(
-                    ov::element::i64, ov::Shape{1});
+                // Also update the Reshape shape constant: make the last (seq-len) dim dynamic
+                // so ReshapeToStatic can correctly resolve it to max_prompt_size later.
+                // Without this fix, [1, 1, 1] stays [1, 1, 1] and position_ids ends up [1].
+                auto shape_const = ov::as_type_ptr<ov::op::v0::Constant>(reshape_node->get_input_node_shared_ptr(1));
+                if (shape_const) {
+                    auto shape_vals = shape_const->cast_vector<int64_t>();
+                    shape_vals.back() = -1LL;  // last dim = dynamic (seq len)
+                    auto new_shape_const =
+                        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{shape_vals.size()}, shape_vals);
+                    reshape_node->input(1).replace_source_output(new_shape_const->output(0));
+                }
+
+                std::cout << "[Qwen3-ASR] Injecting position_ids [-1] for prefill model (full-sequence positions)."
+                          << std::endl;
+                // Inject position_ids [-1] — filled with full-sequence positions at inference.
+                auto position_ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{-1});
                 position_ids->get_output_tensor(0).set_names({"position_ids"});
                 position_ids->set_friendly_name("position_ids");
                 model->add_parameters({position_ids});
 
-                // Redirect: position_ids -> existing Reshape (preserves shape constant)
+                // Redirect: position_ids -> Reshape (whose last dim is now -1)
                 reshape_node->input(0).replace_source_output(position_ids->output(0));
                 return false;
             });
@@ -154,7 +217,7 @@ bool ov::npuw::PrepareQwen3ASRModel::run_on_model(const std::shared_ptr<ov::Mode
         if (!replacement) {
             // Initial value is a Constant or missing — create a new Parameter.
             auto param = std::make_shared<ov::op::v0::Parameter>(read_value->get_output_element_type(0),
-                                                                  read_value->get_output_partial_shape(0));
+                                                                 read_value->get_output_partial_shape(0));
             param->get_output_tensor(0).set_names({var_id});
             param->set_friendly_name(var_id);
             model->add_parameters({param});
@@ -192,6 +255,38 @@ bool ov::npuw::PrepareQwen3ASRKVCacheModel::run_on_model(const std::shared_ptr<o
     rewr.add_matcher<Qwen3ASRAttentionMaskMatcher>(model);
     rewr.add_matcher<Qwen3ASRPositionIdsMatcher>(model);
     rewr.run_on_model(model);
+
+    ov::pass::Validate().run_on_model(model);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// PrepareQwen3ASRPrefillModel — Step 3 (post-clone, prefill model only)
+// Injects attention_mask [1, max_prompt] and position_ids [-1] Parameters so
+// standard left-padding (right-aligned tokens) can be used with SliceOutEmbeds.
+// ---------------------------------------------------------------------------
+bool ov::npuw::PrepareQwen3ASRPrefillModel::run_on_model(const std::shared_ptr<ov::Model>& model) {
+    LOG_DEBUG("[Qwen3-ASR] Injecting causal+padding attention_mask and position_ids into prefill model.");
+
+    ov::pass::GraphRewrite rewr;
+    rewr.add_matcher<Qwen3ASRAttentionMaskMatcher>(model);
+    rewr.add_matcher<Qwen3ASRPrefillPositionIdsMatcher>(model);
+    rewr.run_on_model(model);
+
+    // Fallback: if the exported prefill model already has position_ids as a static [1]
+    // Parameter (the matcher found no Gather→Range→Reshape to replace), widen it to
+    // [-1] so ReshapeToStatic can resolve it to max_prompt_size.
+    for (auto& param : model->get_parameters()) {
+        if (param->get_friendly_name() != "position_ids")
+            continue;
+        const auto& ps = param->get_partial_shape();
+        if (ps.is_static() && ps.rank().get_length() == 1 && ps[0].get_length() == 1) {
+            LOG_DEBUG("[Qwen3-ASR] position_ids is static [1]; widening to dynamic [-1].");
+            param->set_partial_shape(ov::PartialShape{-1});
+            param->validate_and_infer_types();
+            break;
+        }
+    }
 
     ov::pass::Validate().run_on_model(model);
     return true;

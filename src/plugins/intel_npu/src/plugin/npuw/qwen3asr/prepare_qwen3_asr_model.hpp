@@ -33,5 +33,16 @@ public:
     bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
 };
 
+// Step 3 — applied AFTER cloning (to prefill model only).
+// Injects attention_mask [1, max_prompt] and position_ids [-1] Parameters so that
+// standard left-padding (right-aligned tokens) can be used and SliceOutEmbeds works normally.
+// Must run BEFORE ReshapeToStatic so that the dynamic Range/Gather nodes are still present.
+class PrepareQwen3ASRPrefillModel : public ov::pass::ModelPass {
+public:
+    OPENVINO_MODEL_PASS_RTTI("ov::npuw::PrepareQwen3ASRPrefillModel");
+    PrepareQwen3ASRPrefillModel() = default;
+    bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
+};
+
 }  // namespace npuw
 }  // namespace ov

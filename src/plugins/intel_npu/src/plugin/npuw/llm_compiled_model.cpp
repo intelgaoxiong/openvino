@@ -751,8 +751,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     // NB: Qwen3-ASR uses encoder_hidden_states for audio embedding injection.
     // Chunked prefill is disabled to avoid audio token counter issues across chunks.
     // SHARED_HEAD is intentionally kept enabled (split_llm separates the LM head);
-    // SliceOutEmbeds is skipped for Qwen3-ASR and the correct last-token slice is done
-    // manually at inference time (tokens are LEFT-aligned / right-padded with zeros).
+    // SliceOutEmbeds extracts the last real token (right-aligned → always at max_prompt-1).
     m_is_qwen3_asr = m_cfg.get<::intel_npu::NPUW_QWEN3_ASR>();
     if (m_is_qwen3_asr) {
         m_cfg.update({{"NPUW_LLM_PREFILL_CHUNK_SIZE", "0"}});
@@ -881,11 +880,12 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     prefill_model->set_friendly_name(kvcache_model->get_friendly_name() + "_prefill");
 
     if (m_is_qwen3_asr) {
-        // Inject attention_mask and position_ids into the Qwen3-ASR KV-cache model ONLY.
-        // Must run AFTER the prefill clone (so prefill is unaffected) and BEFORE
-        // ReshapeToStatic (so Range nodes are still dynamic when matched).
+        // Must run AFTER the prefill clone (so models diverge) and BEFORE ReshapeToStatic
+        // (so Range/Gather nodes are still dynamic when matched).
         LOG_INFO("[Qwen3-ASR] Injecting attention_mask and position_ids into kvcache model.");
         ov::npuw::PrepareQwen3ASRKVCacheModel().run_on_model(kvcache_model);
+        LOG_INFO("[Qwen3-ASR] Injecting attention_mask and position_ids into prefill model.");
+        ov::npuw::PrepareQwen3ASRPrefillModel().run_on_model(prefill_model);
     }
 
     m_kvcache_desc =
@@ -955,19 +955,10 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     if (lm_head_model) {
         LOG_DEBUG("Shared LM head: slice the prefill output");
-        if (!m_is_qwen3_asr) {
-            // Standard path: slice prefill output to the last position so the shared tensor
-            // is already [1, max_generation_token_len, embed_dim] before the LM head.
-            // KVCache model is already reshaped to [1, max_generation_token_len, embed size],
-            // so only apply slice to the Prefill model:
-            ov::npuw::SliceOutEmbeds(axes.batch, m_kvcache_desc.max_generation_token_len).run_on_model(prefill_model);
-        } else {
-            // Qwen3-ASR path: tokens are LEFT-aligned (right-padded with zeros) so we cannot
-            // slice at the last static position.  The full hidden-state sequence
-            // [1, max_prompt, embed_dim] is left as-is here; the correct token is extracted
-            // manually at inference time in LLMInferRequest::infer_prefill().
-            LOG_INFO("[Qwen3-ASR] Skipping SliceOutEmbeds — manual last-token slice will be done at inference time.");
-        }
+        // Slice prefill output to the last max_generation_token_len positions.
+        // For Qwen3-ASR, tokens are right-aligned (left-padded), so the last real token
+        // is always at max_prompt-1 — SliceOutEmbeds works identically.
+        ov::npuw::SliceOutEmbeds(axes.batch, m_kvcache_desc.max_generation_token_len).run_on_model(prefill_model);
         LOG_DEBUG("Make LM head model with static shapes");
         ov::npuw::ReshapeSlicedHeadToStatic(axes.batch, m_kvcache_desc.max_generation_token_len)
             .run_on_model(lm_head_model);

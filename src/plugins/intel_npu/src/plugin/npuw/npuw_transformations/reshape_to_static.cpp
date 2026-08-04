@@ -73,8 +73,9 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
             // NB: Qwen3-ASR generate uses 1D position_ids [1] (single scalar per step).
             NPUW_ASSERT(partial_shape_size == 3u || partial_shape_size == 2u || partial_shape_size == 1u);
             if (partial_shape_size == 1u) {
-                // Qwen3-ASR: position_ids is a single scalar [1], static size is always 1.
-                new_shape = ov::PartialShape({1});
+                // Qwen3-ASR generate: single scalar per step → always [1].
+                // Qwen3-ASR prefill: full sequence → [input_size].
+                new_shape = is_prefill ? ov::PartialShape({input_size}) : ov::PartialShape({1});
             } else {
                 auto first_dim_value = input.get_partial_shape()[0];
                 new_shape = partial_shape_size == 3u ? ov::PartialShape({first_dim_value, 1, input_size})
