@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include "openvino/pass/model_pass.hpp"
+#include "openvino/pass/pass.hpp"
 
 namespace ov {
 namespace npuw {

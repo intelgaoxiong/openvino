@@ -276,7 +276,10 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
                       << " shape=" << p.get_partial_shape() << std::endl;
         }
         for (const auto& p : req->get_compiled_model()->outputs()) {
-            out_ports.emplace(p.get_any_name(), p);
+            for (const auto& name : p.get_names())
+                out_ports.emplace(name, p);
+            if (p.get_names().empty())
+                out_ports.emplace(p.get_any_name(), p);
         }
         m_generate_variant_in_ports.emplace(req, std::move(in_ports));
         m_generate_variant_out_ports.emplace(req, std::move(out_ports));
@@ -294,6 +297,10 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     // Set ports to ensure tensors aren't empty during bind_past_kv()
     m_kvcache_in_ports = m_generate_variant_in_ports.at(m_kvcache_request);
     m_kvcache_out_ports = m_generate_variant_out_ports.at(m_kvcache_request);
+    std::cout << "[DBG] m_kvcache_in_ports keys (" << m_kvcache_in_ports.size() << "):" << std::endl;
+    for (const auto& [k, _] : m_kvcache_in_ports)
+        std::cout << "[DBG]   " << k << std::endl;
+    std::cout << "[DBG] m_kvcache_past_names count=" << m_kvcache_past_names.size() << std::endl;
 
     m_prefill_base_request = compiled_model->m_prefill_compiled->create_base_infer_request();
     m_prefill_request = compiled_model->m_prefill_compiled->wrap_async_infer_request(m_prefill_base_request);
@@ -301,14 +308,24 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     for (const auto& input_port : m_prefill_request->get_compiled_model()->inputs()) {
         m_prefill_in_ports.emplace(input_port.get_any_name(), input_port);
     }
+    // A single output port carries multiple tensor names simultaneously:
+    //   - a numeric node ID (e.g. "433") from the original IR Assign layer
+    //   - "key_states.N" / "value_states.N" added by NPUW whisper model preparation
+    //   - "output_restored.<variable_id>" added by StatefulToStateless
+    // get_any_name() returns the numeric one arbitrarily; iterate all names so that
+    // copy_kvcache() can look up by the "output_restored.*" friendly name.
     for (const auto& output_port : m_prefill_request->get_compiled_model()->outputs()) {
-        m_prefill_out_ports.emplace(output_port.get_any_name(), output_port);
+        for (const auto& name : output_port.get_names())
+            m_prefill_out_ports.emplace(name, output_port);
+        if (output_port.get_names().empty())
+            m_prefill_out_ports.emplace(output_port.get_any_name(), output_port);
     }
 
     for (const auto& input_port : m_kvcache_request->get_compiled_model()->inputs()) {
         const auto& all_names = input_port.get_names();
         for (const auto& name : all_names) {
-            if (ov::npuw::util::starts_with(name, layer_names::past_key_values)) {
+            if (ov::npuw::util::starts_with(name, layer_names::past_key_values) ||
+                ov::npuw::util::starts_with(name, "input_restored." + std::string(layer_names::past_key_values))) {
                 m_kvcache_past_names.push_back(name);
                 break;
             }
@@ -650,14 +667,26 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
         const auto& input_name = m_kvcache_past_names[out_idx];
         auto kvcache_in_tensor = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(input_name));
 
-        const auto& output_name = std::regex_replace(input_name, std::regex(layer_names::past_key_values), "present");
+        // Derive the output-side name from the past-side input name.
+        // StatefulToStateless convention:
+        //   input:  "input_restored.<variable_id>"
+        //   output: "output_restored.<variable_id>"
+        // For standard LLMs without that prefix:
+        //   input:  "past_key_values.N.key"  → "present.N.key"  (regex)
+        static const std::string in_pfx = "input_restored.";
+        static const std::string out_pfx = "output_restored.";
+        const std::string output_name = ov::npuw::util::starts_with(input_name, in_pfx)
+            ? out_pfx + input_name.substr(in_pfx.size())
+            : std::regex_replace(input_name, std::regex(layer_names::past_key_values), "present");
         OPENVINO_ASSERT(m_prefill_out_ports.find(output_name) != m_prefill_out_ports.end(),
                         "Incosistent input/output naming for KV cache: ",
                         output_name,
                         " not found in prefill model outputs.");
         auto prefill_out_tensor = m_prefill_request->get_tensor(m_prefill_out_ports.at(output_name));
 
-        const auto is_value_tensor = output_name.find("value") != std::string::npos;
+        // Check .value suffix (not just contains "value" — "key_values" would false-positive).
+        const auto is_value_tensor = output_name.size() >= 6 &&
+                                     output_name.compare(output_name.size() - 6, 6, ".value") == 0;
         const auto kv_dim = [&](bool v_trans) -> uint32_t {
             return (is_value_tensor && v_trans) ? 3u : kvcache_desc.dim;
         };
@@ -756,14 +785,21 @@ void ov::npuw::LLMInferRequest::update_kvcache_for(
                         "There is no ",
                         input_name,
                         " in input ports map, while it is expected!");
-        const auto& output_name = std::regex_replace(input_name, std::regex(layer_names::past_key_values), "present");
+        // Derive the output-side name (same convention as copy_kvcache).
+        static const std::string in_pfx = "input_restored.";
+        static const std::string out_pfx = "output_restored.";
+        const std::string output_name = ov::npuw::util::starts_with(input_name, in_pfx)
+            ? out_pfx + input_name.substr(in_pfx.size())
+            : std::regex_replace(input_name, std::regex(layer_names::past_key_values), "present");
         OPENVINO_ASSERT(out_ports.find(output_name) != out_ports.end(),
                         "There is no ",
                         output_name,
                         " in output ports map, while it is expected!");
 
         auto dst_tensor = request->get_tensor(in_ports.at(input_name));
-        const auto& kv_dim = (output_name.find("value") != std::string::npos && v_transposed) ? 3u : kvcache_desc.dim;
+        const bool is_value = output_name.size() >= 6 &&
+                              output_name.compare(output_name.size() - 6, 6, ".value") == 0;
+        const auto& kv_dim = (is_value && v_transposed) ? 3u : kvcache_desc.dim;
         auto dst_slice = uu::make_tensor_slice(dst_tensor,
                                                kv_dim,
                                                kvcache_desc.num_stored_tokens - num_tokens,
@@ -1305,6 +1341,15 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
     kvcache_desc.num_stored_tokens += static_cast<uint32_t>(input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM]);
 
+    // Qwen3-ASR debug: save actual (non-padded) token IDs for later generate comparison.
+    if (m_npuw_llm_compiled_model->m_is_qwen3_asr) {
+        const size_t n = kvcache_desc.num_stored_tokens;
+        m_qwen3asr_dbg_prefill_tokens.resize(n);
+        const auto* ids = reinterpret_cast<const int64_t*>(input_ids->data());
+        std::copy_n(ids, n, m_qwen3asr_dbg_prefill_tokens.begin());
+        std::cout << "[DBG][Qwen3-ASR] Saved " << n << " prefill tokens for debug comparison." << std::endl;
+    }
+
     std::cout << "Done prefill inference, num_stored_tokens=" << kvcache_desc.num_stored_tokens << std::endl;
     LOG_DEBUG("Done");
 }
@@ -1502,6 +1547,178 @@ void ov::npuw::LLMInferRequest::infer_generate_qwen3_asr(ov::SoPtr<ov::ITensor> 
 
     m_kvcache_request->infer();
     kvcache_desc.num_stored_tokens += 1u;
+
+    // Diagnostic: print state for the first few generate steps
+    static int qwen3_gen_step = 0;
+    if (qwen3_gen_step < 3) {
+        std::cout << "[Qwen3-ASR][GEN] step=" << qwen3_gen_step
+                  << " num_stored=" << kvcache_desc.num_stored_tokens << std::endl;
+        if (const auto pos_it = m_kvcache_in_ports.find(layer_names::position_ids);
+            pos_it != m_kvcache_in_ports.end()) {
+            auto pos_ids = m_kvcache_request->get_tensor(pos_it->second);
+            std::cout << "[Qwen3-ASR][GEN]   position_ids[0]=" << pos_ids->data<int64_t>()[0] << std::endl;
+        }
+        if (const auto attn_it = m_kvcache_in_ports.find(layer_names::attention_mask);
+            attn_it != m_kvcache_in_ports.end()) {
+            auto attn_mask = m_kvcache_request->get_tensor(attn_it->second);
+            const auto cap = attn_mask->get_size();
+            std::cout << "[Qwen3-ASR][GEN]   attention_mask size=" << cap << " first4=[";
+            for (size_t i = 0; i < std::min(cap, size_t{4}); ++i)
+                std::cout << attn_mask->data<int64_t>()[i] << (i+1<std::min(cap,size_t{4})?",":"");
+            std::cout << "] last4=[";
+            for (size_t i = cap >= 4 ? cap-4 : 0; i < cap; ++i)
+                std::cout << attn_mask->data<int64_t>()[i] << (i+1<cap?",":"");
+            std::cout << "]" << std::endl;
+        }
+        ++qwen3_gen_step;
+    }
+
+    // -------------------------------------------------------------------------
+    // DEBUG COMPARISON (step 0 only): compare kvcache-model embedding (act) vs
+    // prefill-model-with-full-context embedding (ref).
+    // Writes act_embed.bin, ref_embed.bin, and checks past_kv[0] is non-zero.
+    // -------------------------------------------------------------------------
+    if (qwen3_gen_step == 1) {  // first generate step just completed (counter already incremented)
+        namespace uu = ov::npuw::util;
+
+        // Helper: dump a tensor to a binary file
+        auto dump_bin = [](const std::string& path, ov::SoPtr<ov::ITensor> t) {
+            if (!t) { std::cout << "[DBG] dump_bin: null tensor for " << path << std::endl; return; }
+            std::ofstream f(path, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(t->data()), static_cast<std::streamsize>(t->get_byte_size()));
+            std::cout << "[DBG] Saved " << path << " shape=" << t->get_shape()
+                      << " type=" << t->get_element_type()
+                      << " bytes=" << t->get_byte_size() << std::endl;
+        };
+
+        // 1) Dump act_embed: kvcache model output embedding (already computed above)
+        if (const auto embed_it = m_kvcache_out_ports.find(layer_names::output_embeds);
+            embed_it != m_kvcache_out_ports.end()) {
+            auto act_embed = m_kvcache_request->get_tensor(embed_it->second);
+            dump_bin("act_embed.bin", act_embed);
+            // Print first 4 float values for quick sanity check
+            if (act_embed && act_embed->get_element_type() == ov::element::f32 && act_embed->get_size() >= 4) {
+                const float* d = act_embed->data<float>();
+                std::cout << "[DBG] act_embed[0..3]=[" << d[0] << "," << d[1] << "," << d[2] << "," << d[3] << "]" << std::endl;
+            }
+        } else {
+            std::cout << "[DBG] act_embed: output_embeds port not found in kvcache out ports" << std::endl;
+        }
+
+        // 2) Sanity-check past_kv[0] is non-zero (confirms KV copy from prefill succeeded)
+        if (!m_kvcache_past_names.empty()) {
+            const auto& kv0_name = m_kvcache_past_names[0];
+            if (m_kvcache_in_ports.count(kv0_name)) {
+                auto kv0 = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(kv0_name));
+                if (kv0) {
+                    // Check first 64 raw bytes for non-zero content (type-agnostic)
+                    const auto* raw = reinterpret_cast<const uint8_t*>(kv0->data());
+                    const size_t check_bytes = std::min(kv0->get_byte_size(), size_t{64});
+                    bool all_zero = true;
+                    for (size_t i = 0; i < check_bytes; ++i) {
+                        if (raw[i] != 0) { all_zero = false; break; }
+                    }
+                    std::cout << "[DBG] past_kv[0] ('" << kv0_name << "')"
+                              << " type=" << kv0->get_element_type()
+                              << " shape=" << kv0->get_shape()
+                              << " first64bytes_all_zero=" << (all_zero ? "YES (KV copy FAILED!)" : "no (KV copy OK)")
+                              << std::endl;
+                    // Print first 4 f32 values if applicable
+                    if (kv0->get_element_type() == ov::element::f32 && kv0->get_size() >= 4) {
+                        const float* f = kv0->data<float>();
+                        std::cout << "[DBG] past_kv[0] f32[0..3]=[" << f[0] << "," << f[1] << "," << f[2] << "," << f[3] << "]" << std::endl;
+                    } else if (kv0->get_element_type() == ov::element::f16 && kv0->get_size() >= 4) {
+                        const uint16_t* h = reinterpret_cast<const uint16_t*>(kv0->data());
+                        std::cout << "[DBG] past_kv[0] f16[0..3] raw=[" << h[0] << "," << h[1] << "," << h[2] << "," << h[3] << "]" << std::endl;
+                    }
+                } else {
+                    std::cout << "[DBG] past_kv[0] ('" << kv0_name << "') tensor is null" << std::endl;
+                }
+            } else {
+                std::cout << "[DBG] past_kv[0] ('" << kv0_name << "') NOT in m_kvcache_in_ports" << std::endl;
+            }
+        } else {
+            std::cout << "[DBG] m_kvcache_past_names is empty, skipping past_kv[0] check" << std::endl;
+        }
+        // encoder_hidden_states check runs regardless of past_kv state
+        if (m_kvcache_in_ports.count(layer_names::encoder_hidden_states)) {
+            auto enc = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::encoder_hidden_states));
+            if (enc) {
+                const auto* raw = reinterpret_cast<const uint8_t*>(enc->data());
+                const size_t check_bytes = std::min(enc->get_byte_size(), size_t{64});
+                bool all_zero = true;
+                for (size_t i = 0; i < check_bytes; ++i) {
+                    if (raw[i] != 0) { all_zero = false; break; }
+                }
+                std::cout << "[DBG] kvcache encoder_hidden_states"
+                          << " type=" << enc->get_element_type()
+                          << " shape=" << enc->get_shape()
+                          << " first64bytes_all_zero=" << (all_zero ? "YES (enc not injected!)" : "no (enc OK)")
+                          << std::endl;
+            }
+        } else {
+            std::cout << "[DBG] encoder_hidden_states NOT in m_kvcache_in_ports" << std::endl;
+        }
+        // 3) Run prefill model with [prefill_tokens + first_generate_token] → ref_embed
+        if (!m_qwen3asr_dbg_prefill_tokens.empty()) {
+            const size_t P = m_qwen3asr_dbg_prefill_tokens.size();  // number of prefill tokens
+            // Build extended token buffer [prefill | generate_token_0]
+            const int64_t gen_tok = *reinterpret_cast<const int64_t*>(input_ids->data());
+            std::vector<int64_t> full_ctx(m_qwen3asr_dbg_prefill_tokens);
+            full_ctx.push_back(gen_tok);
+            const size_t full_len = full_ctx.size();  // P + 1
+
+            // Set input_ids on prefill model (left-aligned into the static buffer)
+            auto padded_ids = m_prefill_request->get_tensor(m_prefill_in_ports.at(m_input_ids_name));
+            uu::fill_tensor_bytes(padded_ids, 0u);
+            std::copy_n(reinterpret_cast<const uint8_t*>(full_ctx.data()),
+                        full_len * sizeof(int64_t),
+                        reinterpret_cast<uint8_t*>(padded_ids->data()));
+
+            // Inject encoder_hidden_states (same as in infer_whole_prefill)
+            if (const auto enc_it = m_prefill_in_ports.find(layer_names::encoder_hidden_states);
+                enc_it != m_prefill_in_ports.end()) {
+                auto outer_enc = uu::find_port_by_name(get_inputs(), layer_names::encoder_hidden_states);
+                if (outer_enc.has_value()) {
+                    auto user_enc = get_tensor(outer_enc.value());
+                    auto padded_enc = m_prefill_request->get_tensor(enc_it->second);
+                    uu::fill_tensor_bytes(padded_enc, 0u);
+                    std::copy_n(reinterpret_cast<const uint8_t*>(user_enc->data()),
+                                user_enc->get_byte_size(),
+                                reinterpret_cast<uint8_t*>(padded_enc->data()));
+                }
+            }
+
+            // Run prefill model
+            std::cout << "[DBG] Running prefill baseline with " << full_len << " tokens..." << std::endl;
+            m_prefill_request->infer();
+
+            // Extract embedding at position (full_len - 1) = last token = first generate token
+            if (const auto emb_it = m_prefill_out_ports.find(layer_names::output_embeds);
+                emb_it != m_prefill_out_ports.end()) {
+                auto full_embeds = m_prefill_request->get_tensor(emb_it->second);
+                // full_embeds shape: [1, max_prompt, embed_dim]
+                const size_t embed_dim = full_embeds->get_shape()[2];
+                const size_t ref_pos = full_len - 1;
+                // Create a slice tensor for position ref_pos
+                auto ref_embed = ov::make_tensor(full_embeds->get_element_type(), ov::Shape{1, 1, embed_dim});
+                const size_t elem_bytes = full_embeds->get_element_type().size();
+                std::copy_n(
+                    reinterpret_cast<const uint8_t*>(full_embeds->data()) + ref_pos * embed_dim * elem_bytes,
+                    embed_dim * elem_bytes,
+                    reinterpret_cast<uint8_t*>(ref_embed->data()));
+                dump_bin("ref_embed.bin", ov::SoPtr<ov::ITensor>{ref_embed, nullptr});
+                if (ref_embed->get_element_type() == ov::element::f32 && ref_embed->get_size() >= 4) {
+                    const float* d = ref_embed->data<float>();
+                    std::cout << "[DBG] ref_embed[0..3]=[" << d[0] << "," << d[1] << "," << d[2] << "," << d[3] << "]" << std::endl;
+                }
+            } else {
+                std::cout << "[DBG] ref_embed: output_embeds not found in prefill out ports" << std::endl;
+            }
+        } else {
+            std::cout << "[DBG] ref_embed: m_qwen3asr_dbg_prefill_tokens empty, skipping baseline" << std::endl;
+        }
+    }  // end step-0 debug comparison
 
     // Copy newly computed K/V (present[last]) into past KV slot [N] for next step.
     if (kvcache_desc.num_stored_tokens < kvcache_desc.total_size) {

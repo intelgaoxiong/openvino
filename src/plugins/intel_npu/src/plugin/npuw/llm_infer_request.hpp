@@ -147,9 +147,6 @@ protected:
 
     bool m_generate_initialized = false;
 
-    // Qwen3-ASR: accumulated token buffer for re-prefill decode strategy
-    std::vector<int64_t> m_qwen3asr_token_buffer;
-
     // Index into m_generate_requests / m_kvcache_sizes for the currently active variant.
     // Updated in prepare_for_new_conversation() and try_switch_to_larger_variant().
     size_t m_kvcache_variant_idx = 0;
@@ -186,6 +183,10 @@ protected:
 
     // KV cache management strategy (set once in the constructor, valid for the object's lifetime)
     std::unique_ptr<LLMKVCacheStrategy> m_kvcache_strategy;
+
+    // Qwen3-ASR debug: stores actual prefill token IDs (populated in infer_whole_prefill)
+    // so infer_generate_qwen3_asr can reconstruct the prefill-baseline reference at step 0.
+    std::vector<int64_t> m_qwen3asr_dbg_prefill_tokens;
 
     // Friend declarations: strategies and PrefixCachingHelper need access to protected members
     friend class LLMContinuousKVCacheStrategy;
