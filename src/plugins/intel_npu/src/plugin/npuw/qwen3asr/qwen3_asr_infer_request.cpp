@@ -214,6 +214,12 @@ void ov::npuw::Qwen3ASRInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input
     m_kvcache_request->infer();
     kvcache_desc.num_stored_tokens += 1u;
 
+    // Persist the new token's KV outputs into the past_key_values input buffer
+    // so the next generate step sees the updated context.
+    if (kvcache_desc.num_stored_tokens < kvcache_desc.total_size) {
+        m_kvcache_strategy->on_generate_step_done(1u);
+    }
+
     // Unlock the newly stored KV slot by clearing its attention_mask bit
     if (const auto attn_it = m_kvcache_in_ports.find(layer_names::attention_mask);
         attn_it != m_kvcache_in_ports.end()) {
