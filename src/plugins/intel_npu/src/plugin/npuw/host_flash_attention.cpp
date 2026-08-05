@@ -238,6 +238,7 @@ static FlashAttentionResults execute_fused_flash_attention(const HFATileF32Nodes
                                                                                   f32_nodes.past_acc_f32,
                                                                                   past_max_squeezed,
                                                                                   past_sum_squeezed,
+                                                                                  f32_nodes.mask_tile_f32,
                                                                                   config);
     }
 
@@ -648,7 +649,7 @@ static std::shared_ptr<ov::Model> create_hfa_tile_model(const ov::Shape& q_shape
     // Convert all inputs to f32.
     // For the fused operation only the final tile uses a mask (regular tiles skip mask for performance)
     // For the non-fused operation all tiles require mask conversion
-    const bool use_mask = is_final_tile || !fused_flash_attention;
+    const bool use_mask = true;
     auto f32_nodes = convert_inputs_to_f32(inputs, mask_dtype, compute_dtype, use_mask);
 
     FlashAttentionResults results;
