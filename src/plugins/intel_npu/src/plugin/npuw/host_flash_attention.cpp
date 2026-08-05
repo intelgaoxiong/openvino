@@ -1114,31 +1114,15 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
              << ", block_kv=" << block_kv_dtype
              << ", present_kv=" << present_kv_dtype
              << ", q=" << q_dtype);
-
-    // Regular tile always uses host (non-fused) computation so the attention mask is
-    // applied via Add(QK, mask) inside execute_host_flash_attention.
-    //
-    // This is required for correctness with Sliding Window Attention (SWA): when the
-    // total context exceeds the SWA window, past KV positions outside the window carry
-    // -inf in the attention mask.  The fused FlashAttentionTile NPU op (non-tail form)
-    // does not accept a mask, so fused regular tiles would incorrectly attend to all
-    // past tokens regardless of the window.  Non-fused tiles (use_mask = true) correctly
-    // zero-out those out-of-window contributions via the softmax.
-    //
-    // Note: the non-fused and fused state tensors (acc/max/d) are layout-compatible:
-    //   - non-fused regular tile outputs maxx as [B,H,seq,1] (keepdims ReduceMax)
-    //   - fused final tile inputs past_max as [B,H,seq,1] and Squeezes it internally
-    // so the regular→final state handoff is transparent.
-    constexpr bool regular_tile_fused = false;  // force host path to ensure mask is applied
     auto tile_model = create_hfa_tile_model(q_shape_static,
-                                            block_kv_dtype,  // state_dtype
-                                            block_kv_dtype,  // kv_tile_dtype (past KV blocks, f16)
+                                            block_kv_dtype,   // state_dtype
+                                            block_kv_dtype,   // kv_tile_dtype (past blocks)
                                             q_dtype,
                                             mask_dtype,
                                             query_size,
                                             kv_num_heads,
-                                            false,               // is_final_tile
-                                            regular_tile_fused,  // non-fused: mask applied
+                                            false,
+                                            fused_flash_attention,
                                             v_transposed);
     if (!tile_model) {
         LOG_WARN("Failed to create HFA tile model");
