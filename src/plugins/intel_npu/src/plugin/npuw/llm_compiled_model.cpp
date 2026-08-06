@@ -22,6 +22,7 @@
 #include "npuw_transformations/reshape_to_static.hpp"
 #include "npuw_transformations/right_align_mask_slice_for_conv.hpp"
 #include "npuw_transformations/slice_out_embeds.hpp"
+#include "npuw_transformations/duplicate_shared_kv_concat.hpp"
 #include "npuw_transformations/split_kvcache_into_blocks.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/greater.hpp"
@@ -902,6 +903,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
     LOG_DEBUG("Make kvcache model with static shapes");
 
+    // ov::save_model(prefill_model, "prefill_model_debug.xml", "prefill_model_debug.bin");
+
     // Create generate model variants with different sizes
     auto generate_model_variants = create_generate_model_variants(kvcache_model, axes, whisper_lhs_seq_size);
 
@@ -1171,6 +1174,15 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                     mgr.register_pass<ov::npuw::pass::SplitKVCacheIntoBlocks>(block_size, v_transposed);
                     if (mgr.run_passes(model)) {
                         LOG_INFO("SplitKVCacheIntoBlocks applied: " << tag);
+                        // Duplicate shared KV broadcast chains so that each downstream
+                        // SDPA (e.g. Gemma-4 layers 15-33 reusing L13 KV) gets its own
+                        // independent Concat chain.  This makes TagSDPA/SDPADecomposed
+                        // able to isolate and convert each SDPA to HFA independently.
+                        // Runs after SplitKVCacheIntoBlocks so block Parameters are
+                        // already in place and are shared (zero extra memory).
+                        if (ov::npuw::pass::DuplicateSharedKVConcat().run_on_model(model)) {
+                            LOG_INFO("DuplicateSharedKVConcat applied: " << tag);
+                        }
                     } else {
                         LOG_WARN("SplitKVCacheIntoBlocks had no effect: " << tag);
                         all_transformed = false;
@@ -1198,6 +1210,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                      "Falling back to monolithic (continuous) KV cache.");
         }
     }
+
+
+    // ov::save_model(prefill_model, "prefill_model_block_split.xml", "prefill_model_block_split.bin");
 
     // Compile multiple generate model variants with different sizes
     compile_generate_model_variants(generate_model_variants, plugin, generate_config);
