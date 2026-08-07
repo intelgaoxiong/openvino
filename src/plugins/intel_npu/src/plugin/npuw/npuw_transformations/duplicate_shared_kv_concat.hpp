@@ -18,29 +18,30 @@ namespace pass {
  *
  *   Concat(past_K_blocks…, current_K)
  *       → [Unsqueeze] → [Broadcast] → Reshape ─┬─→ SDPA_L13
- *                                               ├─→ SDPA_L15
- *                                               ├─→ SDPA_L16
- *                                               └─→ …
+ *                                              ├─→ SDPA_L15
+ *                                              ├─→ SDPA_L16
+ *                                              └─→ …
  *
  * The high fan-out prevents NPUW's ATTN isolation patterns (TagSDPA /
  * SDPADecomposed) from tagging each SDPA independently, because every tagging
  * attempt would claim the shared Reshape (and its ancestors) as part of its
  * own partition, creating conflicting assignments.
  *
- * This pass duplicates the Concat → [Unsqueeze] → [Broadcast] → Reshape chain
- * for every extra consumer beyond the first, giving each SDPA its own local
- * chain:
+ * This pass duplicates the [Convert →] Concat → [Unsqueeze] → [Broadcast] → Reshape
+ * chain for every extra consumer beyond the first, giving each SDPA its own
+ * local chain:
  *
- *   same past_K_blocks…, current_K → new_Concat_L15 → … → new_Reshape_L15 → SDPA_L15
- *   same past_K_blocks…, current_K → new_Concat_L16 → … → new_Reshape_L16 → SDPA_L16
+ *   same past_K_blocks… → [new_Convert] → new_Concat_L15 → … → new_Reshape_L15 → SDPA_L15
+ *   same past_K_blocks… → [new_Convert] → new_Concat_L16 → … → new_Reshape_L16 → SDPA_L16
  *   …
  *
- * All duplicate chains reference the same Parameter (block) nodes → zero
- * additional memory allocation.  The same current_K computation node is also
- * shared → zero extra compute.
- *
- * Must be run AFTER SplitKVCacheIntoBlocks so that the block Parameters are
- * already present and will be shared across all duplicate chains.
+ * All duplicate chains share the same bare Parameter (block) nodes and the same
+ * current_K subgraph.  However, any Convert nodes that directly wrap past-KV
+ * Parameters are cloned independently for each new chain.  Without this,
+ * subgraph-isolation passes (e.g. SDPADecomposed) would pull the shared
+ * Convert nodes into the first SDPA's subgraph group, creating spurious
+ * cross-subgraph pass-through outputs on the producer subgraph and mismatching
+ * the output count expected by HFA tile compilation.
  */
 class DuplicateSharedKVConcat : public ov::pass::ModelPass {
 public:
