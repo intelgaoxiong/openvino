@@ -19,6 +19,7 @@
 #include "npuw_transformations/duplicate_shared_kv_concat.hpp"
 #include "npuw_transformations/lora_stateful_to_stateless.hpp"
 #include "npuw_transformations/optimize_value_tensors.hpp"
+#include "npuw_transformations/patch_sliding_window_kv_layout.hpp"
 #include "npuw_transformations/patch_sliding_window_mask.hpp"
 #include "npuw_transformations/remove_token_type_ids.hpp"
 #include "npuw_transformations/replace_deepstack_scatter_with_add.hpp"
@@ -605,6 +606,15 @@ std::shared_ptr<ov::Model> check_and_cut_lm_head(const std::shared_ptr<ov::Model
 
 }  // namespace
 
+bool ov::npuw::LLMCompiledModel::is_swa_layer(size_t layer_idx) const {
+    return m_swa_layout.is_sliding(layer_idx);
+}
+
+bool ov::npuw::LLMCompiledModel::is_swa_past_key_values_name(const std::string& name) const {
+    const auto layer_idx = ov::npuw::util::isPastKeyValuesContiguous(name);
+    return layer_idx.has_value() && is_swa_layer(static_cast<size_t>(*layer_idx));
+}
+
 // Apply DEVICE_ROUTED MoE transformations to models
 std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_generate_model_variants(
     const std::shared_ptr<ov::Model>& generate_model,
@@ -666,6 +676,13 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
         // Reshape to target size
         ov::npuw::ReshapeToStatic(max_generation_token_len, kv_size, axes, m_max_lora_rank, whisper_lhs_seq_size)
             .run_on_model(generate_variant);
+
+        if (m_swa_layout.enabled()) {
+            LOG_DEBUG("[SWA] Applying sliding-window KV-cache reduction to generate variant (kv_size=" << kv_size
+                                                                                                       << ").");
+            ov::npuw::PatchSlidingWindowKVLayout(m_swa_layout, kv_size, max_generation_token_len, axes)
+                .run_on_model(generate_variant);
+        }
 
         // Set unique name for this variant
         generate_variant->set_friendly_name(generate_model->get_friendly_name() + "_kv" + std::to_string(kv_size));
@@ -934,9 +951,25 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     ov::npuw::DetectAttentionMask().run_on_model(kvcache_model);
     ov::npuw::log_detected_masks(kvcache_model);
 
+    // A model with sliding window attention (e.g. Phi-3, Gemma-2/3/4) needs its mask exposed one
+    // of two ways:
+    //  1. In-graph patch: rewrite the mask formula subgraph in place, if a known pattern matches.
+    //  2. Host-controlled input: externalize the sliding-window mask to a dedicated model input,
+    //     with the host computing/writing it per step.
+    // (1) is the older path and always takes priority when its pattern matches. Only when it
+    // finds nothing to patch (currently: Gemma4 26B A4B and Gemma4 12B, whose graphs don't match
+    // this pattern) does the fallback to (2) kick in.
+    // TODO: (1) is pattern-based and brittle to maintain, while (2) may behave inconsistently
+    // with it in edge cases. One approach should eventually be picked and unified on.
     if (!m_is_whisper) {
         LOG_DEBUG("Try patch sliding window attention mask (Phi-3, Gemma-2, Gemma-3, Gemma-4), if it exists.");
-        ov::npuw::PatchSlidingWindowMask().run_on_model(kvcache_model);
+        const bool patched_in_graph = ov::npuw::PatchSlidingWindowMask().run_on_model(kvcache_model);
+        if (!patched_in_graph) {
+            LOG_DEBUG("No sliding window mask pattern matched, falling back to host-controlled SWA mask input.");
+            m_swa_layout = ov::npuw::util::detect_swa_layout(kvcache_model);
+        } else {
+            LOG_DEBUG("Sliding window mask pattern patched in-graph.");
+        }
     }
 
     LOG_DEBUG("Creating prefill model as clone of transformed kvcache one.");
@@ -982,21 +1015,23 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     LOG_DEBUG("Make prefill model with static shapes");
     m_max_lora_rank = m_cfg.get<::intel_npu::NPUW_LLM_MAX_LORA_RANK>();
+    const uint32_t prefill_input_size =
+        m_use_chunk_prefill ? static_cast<uint32_t>(m_prefill_chunk_size) : m_kvcache_desc.max_prompt_size;
     if (m_use_chunk_prefill) {
-        ov::npuw::ReshapeToStatic(static_cast<uint32_t>(m_prefill_chunk_size),
-                                  m_kvcache_desc.max_prompt_size,
-                                  axes,
-                                  m_max_lora_rank,
-                                  0,
-                                  true)
+        ov::npuw::ReshapeToStatic(prefill_input_size, m_kvcache_desc.max_prompt_size, axes, m_max_lora_rank, 0, true)
             .run_on_model(prefill_model);
     } else {
-        ov::npuw::ReshapeToStatic(m_kvcache_desc.max_prompt_size,
+        ov::npuw::ReshapeToStatic(prefill_input_size,
                                   m_kvcache_desc.max_prompt_size,
                                   axes,
                                   m_max_lora_rank,
                                   whisper_lhs_seq_size,
                                   true)
+            .run_on_model(prefill_model);
+    }
+    if (m_swa_layout.enabled()) {
+        LOG_DEBUG("[SWA] Applying sliding-window KV-cache reduction to prefill model.");
+        ov::npuw::PatchSlidingWindowKVLayout(m_swa_layout, m_kvcache_desc.max_prompt_size, prefill_input_size, axes)
             .run_on_model(prefill_model);
     }
     LOG_DEBUG("Make kvcache model with static shapes");
@@ -1490,7 +1525,8 @@ void ov::npuw::LLMCompiledModel::serialize(std::ostream& raw_stream, const ov::n
             m_kvcache_desc.v_tensors_transposed_gen & m_prefill_chunk_size & m_use_chunk_prefill & m_max_lora_rank &
             m_enable_prefix_caching & m_prefix_caching_block_size & m_prefix_caching_max_num_blocks &
             m_longrope_context_limit & m_is_whisper & m_eos_token_id & m_decomposed_sdpa_size & m_is_eagle &
-            m_is_embedding & m_is_block_kv_cache & m_is_encoder_embedding;
+            m_is_embedding & m_is_block_kv_cache & m_is_encoder_embedding & m_swa_layout.window_size &
+            m_swa_layout.layer_is_sliding;
 
         // LongRoPE cos/sin tables: the transformed graphs have npuw_lr_cos/npuw_lr_sin
         // inputs the host must fill every call, but deserialization imports already-
@@ -1724,7 +1760,8 @@ std::shared_ptr<ov::npuw::LLMCompiledModel> ov::npuw::LLMCompiledModel::deserial
             compiled->m_prefix_caching_block_size & compiled->m_prefix_caching_max_num_blocks &
             compiled->m_longrope_context_limit & compiled->m_is_whisper & compiled->m_eos_token_id &
             compiled->m_decomposed_sdpa_size & compiled->m_is_eagle & compiled->m_is_embedding &
-            compiled->m_is_block_kv_cache & compiled->m_is_encoder_embedding;
+            compiled->m_is_block_kv_cache & compiled->m_is_encoder_embedding & compiled->m_swa_layout.window_size &
+            compiled->m_swa_layout.layer_is_sliding;
 
         // LongRoPE cos/sin tables - see the matching comment in serialize()
         stream & compiled->m_longrope_tables;
