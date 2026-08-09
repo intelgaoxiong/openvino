@@ -287,6 +287,7 @@ ov::AnyMap get_baseline_common_config(const std::optional<NPUDesc>& npudesc) {
         {"NPU_COMPILATION_MODE_PARAMS", "compute-layers-with-higher-precision=Sqrt,Power,ReduceMean,Add_RMSNorm"},
         {"NPUW_DEVICES", "NPU"},
         {"NPU_USE_NPUW", "YES"},
+        {"PERF_COUNT", "YES"},
         {"NPUW_FOLD", "YES"},
         {"NPUW_DCOFF_TYPE", "f16"},
         {"NPUW_DCOFF_SCALE", "YES"},
