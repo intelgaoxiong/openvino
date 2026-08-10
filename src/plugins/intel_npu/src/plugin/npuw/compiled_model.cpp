@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <fstream>
 #include <memory>
 #include <set>
 #include <string>
@@ -1949,22 +1948,7 @@ ov::SoPtr<ov::ICompiledModel> ov::npuw::CompiledModel::compile_submodel(const st
             device_config.insert(ov::internal::exclusive_async_requests(true));
         }
     }  // if(subgraphs > 1)
-
-    auto compiled = core->compile_model(submodel, device, device_config);
-
-    // Export compiled blob to the current working directory
-    std::string device_tag = device;
-    std::replace(device_tag.begin(), device_tag.end(), '.', '_');
-    const std::string blob_name = submodel->get_friendly_name() + "_" + device_tag + ".blob";
-    std::ofstream blob_file(blob_name, std::ios::binary);
-    if (blob_file.is_open()) {
-        compiled->export_model(blob_file);
-        LOG_INFO("Exported compiled blob: " << blob_name);
-    } else {
-        LOG_WARN("Failed to open file for blob export: " << blob_name);
-    }
-
-    return compiled;
+    return core->compile_model(submodel, device, device_config);
 }
 
 void ov::npuw::CompiledModel::dump_on_fail(std::size_t id, const std::string& device_to_try, const char* extra) {
