@@ -18,6 +18,7 @@ namespace npuw {
 class UnfoldInferRequest final : public IBaseInferRequest {
 public:
     explicit UnfoldInferRequest(const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model);
+    ~UnfoldInferRequest();
 
     ////////////////////////////////////
     // implement IBaseInferRequest - nether of these are required here
@@ -36,6 +37,11 @@ public:
 
 private:
     void infer() override;
+
+    // Per-real-subgraph timing accumulated across all generate decode steps.
+    std::map<std::size_t, float> m_generate_timings_ms;   // real_idx -> total ms
+    std::map<std::size_t, std::size_t> m_generate_call_counts;  // real_idx -> total calls
+    std::size_t m_generate_infer_count = 0u;               // number of infer() invocations
 };
 
 }  // namespace npuw
