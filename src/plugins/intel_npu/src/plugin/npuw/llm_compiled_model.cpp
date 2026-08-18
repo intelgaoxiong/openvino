@@ -472,15 +472,34 @@ std::map<std::string, std::string> any_copy(const ov::AnyMap& params) {
     return result;
 }
 
-// Detect Gemma-4 E2B/E4B by the presence of "per_layer_inputs" model inputs
+// Detect Gemma-4 E2B/E4B by a consumed "per_layer_inputs" input with nonzero PLE dim.
+// Gemma4 26B A4B (MoE) also has this input, but dangling (proj_dim==0, unconsumed).
 bool has_per_layer_inputs(const std::shared_ptr<ov::Model>& model) {
-    for (const auto& param : model->get_parameters()) {
-        if (param->get_friendly_name().find("per_layer_inputs") != std::string::npos) {
-            LOG_INFO("Detected cross-group KV sharing model (Gemma-4 E2B/E4B): "
-                     "found per_layer_inputs parameter - "
-                     << param->get_friendly_name());
-            return true;
+    for (const auto& input : model->inputs()) {
+        const auto& input_name = input.get_any_name();
+        if (input_name.find("per_layer_inputs") == std::string::npos) {
+            continue;
         }
+        const auto& partial_shape = input.get_partial_shape();
+        if (partial_shape.size() != 4u) {
+            continue;
+        }
+        const auto& proj_dim = partial_shape[3];
+        if (proj_dim.is_static() && proj_dim.get_length() == 0) {
+            // Dangling PLE (e.g. Gemma4 26B A4B MoE) - not a real per-layer input.
+            LOG_DEBUG("Found per_layer_inputs parameter with proj_dim==0 (dangling PLE, MoE model), skipping - "
+                      << input_name);
+            continue;
+        }
+        if (input.get_target_inputs().empty()) {
+            // Not actually consumed anywhere in the graph.
+            LOG_DEBUG("Found per_layer_inputs parameter with no consumers, skipping - " << input_name);
+            continue;
+        }
+        LOG_INFO("Detected cross-group KV sharing model (Gemma-4 E2B/E4B): "
+                 "found consumed per_layer_inputs parameter with nonzero PLE dim - "
+                 << input_name);
+        return true;
     }
     return false;
 }
@@ -596,10 +615,8 @@ void ov::npuw::LLMCompiledModel::parse_swa_config() {
 
     const std::string layer_types = m_cfg.get<::intel_npu::NPUW_LLM_LAYER_TYPES>();
     if (m_swa_window_size == 0 || layer_types.empty()) {
-        LOG_DEBUG("[SWA] Sliding Window Attention is disabled (window_size=" << m_swa_window_size
-                                                                             << ", layer_types is "
-                                                                             << (layer_types.empty() ? "empty" : "set")
-                                                                             << ").");
+        LOG_DEBUG("[SWA] Sliding Window Attention is disabled (window_size="
+                  << m_swa_window_size << ", layer_types is " << (layer_types.empty() ? "empty" : "set") << ").");
         return;
     }
 
@@ -621,10 +638,9 @@ void ov::npuw::LLMCompiledModel::parse_swa_config() {
         pattern.push_back(is_sliding ? 'S' : 'F');
         num_sliding += is_sliding ? 1 : 0;
     }
-    LOG_INFO("[SWA] Sliding Window Attention is ENABLED: window_size=" << m_swa_window_size << ", "
-                                                                       << m_swa_layer_is_sliding.size()
-                                                                       << " layers total, " << num_sliding
-                                                                       << " sliding-window layer(s).");
+    LOG_INFO("[SWA] Sliding Window Attention is ENABLED: window_size="
+             << m_swa_window_size << ", " << m_swa_layer_is_sliding.size() << " layers total, " << num_sliding
+             << " sliding-window layer(s).");
     LOG_DEBUG("[SWA] Layer pattern (S=sliding, F=full attention): " << pattern);
 }
 
@@ -713,7 +729,7 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
 
         if (m_swa_window_size > 0) {
             LOG_DEBUG("[SWA] Applying sliding-window KV-cache reduction to generate variant (kv_size=" << kv_size
-                                                                                                        << ").");
+                                                                                                       << ").");
             ov::npuw::PatchSlidingWindowKVCache(m_swa_window_size,
                                                 m_swa_layer_is_sliding,
                                                 kv_size,
@@ -1063,8 +1079,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         // banded per-query-position by PatchSlidingWindowMask above) - only shrink the
         // past_key_values buffers here (a no-op for non-chunked prefill, where the past
         // buffer is always empty), never trim the mask.
-        const uint32_t prefill_input_size = m_use_chunk_prefill ? static_cast<uint32_t>(m_prefill_chunk_size)
-                                                                : m_kvcache_desc.max_prompt_size;
+        const uint32_t prefill_input_size =
+            m_use_chunk_prefill ? static_cast<uint32_t>(m_prefill_chunk_size) : m_kvcache_desc.max_prompt_size;
         LOG_DEBUG("[SWA] Applying sliding-window KV-cache reduction to prefill model.");
         ov::npuw::PatchSlidingWindowKVCache(m_swa_window_size,
                                             m_swa_layer_is_sliding,
