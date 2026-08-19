@@ -886,6 +886,38 @@ void ov::npuw::LLMInferRequest::clear_chunk_prefill_kv_cache() {
     }
 }
 
+void ov::npuw::LLMInferRequest::fill_attention_masks(const std::shared_ptr<ov::IAsyncInferRequest>& request,
+                                                     const PortsMap& in_ports,
+                                                     uint32_t num_stored_tokens_before,
+                                                     uint32_t num_real_new_tokens,
+                                                     const int64_t* token_type_ids_real) {
+    // See the declaration's doc comment (llm_infer_request.hpp) and
+    // ov::npuw::util::fill_causal_sliding_mask()'s doc comment (infer_request_utils.hpp) for the
+    // full design. Every non-hybrid model has neither port, so this is a no-op there.
+    struct MaskPortSpec {
+        const char* name;
+        bool is_sliding;
+    };
+    const MaskPortSpec specs[] = {{layer_names::global_attention_mask, false},
+                                  {layer_names::sliding_window_attention_mask, true}};
+    for (const auto& spec : specs) {
+        const auto it = in_ports.find(spec.name);
+        if (it == in_ports.end()) {
+            continue;
+        }
+        const std::optional<uint32_t> window_size =
+            spec.is_sliding ? std::optional<uint32_t>(m_npuw_llm_compiled_model->m_swa_window_size) : std::nullopt;
+        auto mask_tensor = request->get_tensor(it->second);
+        ov::npuw::util::fill_causal_sliding_mask(mask_tensor,
+                                                 num_stored_tokens_before,
+                                                 num_real_new_tokens,
+                                                 window_size);
+        if (token_type_ids_real != nullptr) {
+            ov::npuw::util::overlay_vision_bidirectional_mask(mask_tensor, token_type_ids_real, num_real_new_tokens);
+        }
+    }
+}
+
 void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> input_ids,
                                                       ov::SoPtr<ov::ITensor> attention_mask,
                                                       ov::SoPtr<ov::ITensor> position_ids,
@@ -1068,6 +1100,15 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
             m_kvcache_strategy->on_prefill_chunk_begin(static_cast<uint32_t>(current_prompts_len));
         });
 
+        const int64_t* chunk_token_type_ids_real =
+            has_token_type_ids
+                ? token_type_ids_in_tensor->data<int64_t>() + token_type_ids_in_tensor->get_size() - current_prompts_len
+                : nullptr;
+        fill_attention_masks(m_prefill_request,
+                             m_prefill_in_ports,
+                             kvcache_desc.num_stored_tokens,
+                             static_cast<uint32_t>(current_prompts_len),
+                             chunk_token_type_ids_real);
         m_llm_profile["1/prefill:3b.infer"].record([&]() {
             m_prefill_request->infer();
         });
@@ -1176,6 +1217,12 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
         }
     });
 
+    const int64_t* whole_prefill_token_type_ids_real = token_type_ids ? token_type_ids->data<int64_t>() : nullptr;
+    fill_attention_masks(m_prefill_request,
+                         m_prefill_in_ports,
+                         m_npuw_llm_compiled_model->m_kvcache_desc.num_stored_tokens,
+                         static_cast<uint32_t>(attention_mask->get_size()),
+                         whole_prefill_token_type_ids_real);
     m_llm_profile["1/prefill:3b.infer"].record([&]() {
         m_prefill_request->infer();
     });
@@ -1367,6 +1414,7 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
         }
     });
 
+    fill_attention_masks(m_kvcache_request, m_kvcache_in_ports, kvcache_desc.num_stored_tokens, input_tokens_len);
     m_llm_profile["N/generate:2.infer"].record([&]() {
         m_kvcache_request->infer();
     });

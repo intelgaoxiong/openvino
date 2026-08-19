@@ -407,3 +407,131 @@ void ov::npuw::util::copy_per_layer_inputs_chunk_to_right(const ov::SoPtr<ov::IT
                 chunk_bytes,
                 reinterpret_cast<uint8_t*>(dst->data()) + dst->get_byte_size() - chunk_bytes);
 }
+
+void ov::npuw::util::fill_causal_sliding_mask(ov::SoPtr<ov::ITensor> mask_tensor,
+                                              uint32_t num_stored_tokens_before,
+                                              uint32_t num_real_new_tokens,
+                                              std::optional<uint32_t> window_size) {
+    OPENVINO_ASSERT(mask_tensor->get_element_type() == ov::element::f32,
+                    "Attention mask tensor is expected to be f32, got: ",
+                    mask_tensor->get_element_type());
+    const auto& shape = mask_tensor->get_shape();
+    OPENVINO_ASSERT(shape.size() >= 2, "Attention mask tensor rank must be >= 2, got shape: ", shape);
+    const uint32_t row_dim = static_cast<uint32_t>(shape[shape.size() - 2]);
+    const uint32_t col_dim = static_cast<uint32_t>(shape[shape.size() - 1]);
+    OPENVINO_ASSERT(col_dim >= row_dim,
+                    "Attention mask's key axis (",
+                    col_dim,
+                    ") must be >= its query axis (",
+                    row_dim,
+                    ")");
+    OPENVINO_ASSERT(num_real_new_tokens <= row_dim,
+                    "num_real_new_tokens (",
+                    num_real_new_tokens,
+                    ") exceeds the mask's query axis (",
+                    row_dim,
+                    ")");
+    const uint32_t past_width = col_dim - row_dim;
+    const uint32_t row_pad = row_dim - num_real_new_tokens;  // rows/current-cols < row_pad are pad.
+    const uint32_t P = num_stored_tokens_before;
+
+    constexpr float kAttend = 0.0f;
+    const float kMasked = std::numeric_limits<float>::lowest();
+
+    float* data = mask_tensor->data<float>();
+
+    for (uint32_t row = 0; row < row_dim; ++row) {
+        float* row_ptr = data + static_cast<size_t>(row) * col_dim;
+
+        // Past columns: c in [0, past_width).
+        if (!window_size.has_value()) {
+            // global_attention_mask: past K/V is never physically shrunk, so column index c
+            // IS the absolute key position. Causality is automatic (any already-stored past
+            // token always precedes any current-call query), so validity is the only check.
+            for (uint32_t c = 0; c < past_width; ++c) {
+                row_ptr[c] = (c < P) ? kAttend : kMasked;
+            }
+        } else {
+            // sliding_window_attention_mask: past K/V is physically shrunk to `window_size`
+            // columns, always holding the most recent min(P, past_width) tokens left-aligned-
+            // by-recency (write_kv_slice_sliding()'s invariant). row_local is this row's local
+            // index within the real/right-aligned current-chunk segment (may be "negative" for
+            // pad rows - harmless, see fn doc comment).
+            const uint32_t w_valid = std::min(P, past_width);
+            const int64_t row_local = static_cast<int64_t>(row) - static_cast<int64_t>(row_pad);
+            for (uint32_t c = 0; c < past_width; ++c) {
+                const bool valid = c >= (past_width - w_valid);
+                // Window distance check: derived to `c > row_local` - the row_pad
+                // right-alignment offset cancels algebraically because past_width == window_size
+                // by construction for this (narrowed) buffer. See session plan for the derivation.
+                const bool attend = valid && (static_cast<int64_t>(c) > row_local);
+                row_ptr[c] = attend ? kAttend : kMasked;
+            }
+        }
+
+        // Current-chunk diagonal columns: local_c in [0, row_dim), mapped to c = past_width +
+        // local_c. Both axes share the same row_pad right-alignment offset, so it cancels
+        // identically in both the causal and window comparisons below - raw indices suffice.
+        for (uint32_t local_c = 0; local_c < row_dim; ++local_c) {
+            const bool valid_key = local_c >= row_pad;
+            const bool causal = local_c <= row;
+            const bool window_ok = !window_size.has_value() || (causal && (row - local_c) < *window_size);
+            const bool attend = valid_key && causal && window_ok;
+            row_ptr[past_width + local_c] = attend ? kAttend : kMasked;
+        }
+    }
+}
+
+void ov::npuw::util::overlay_vision_bidirectional_mask(ov::SoPtr<ov::ITensor> mask_tensor,
+                                                        const int64_t* token_type_ids_real,
+                                                        uint32_t num_real_new_tokens) {
+    if (num_real_new_tokens == 0) {
+        return;
+    }
+    OPENVINO_ASSERT(mask_tensor->get_element_type() == ov::element::f32,
+                    "Attention mask tensor is expected to be f32, got: ",
+                    mask_tensor->get_element_type());
+    const auto& shape = mask_tensor->get_shape();
+    OPENVINO_ASSERT(shape.size() >= 2, "Attention mask tensor rank must be >= 2, got shape: ", shape);
+    const uint32_t row_dim = static_cast<uint32_t>(shape[shape.size() - 2]);
+    const uint32_t col_dim = static_cast<uint32_t>(shape[shape.size() - 1]);
+    OPENVINO_ASSERT(num_real_new_tokens <= row_dim,
+                    "num_real_new_tokens (",
+                    num_real_new_tokens,
+                    ") exceeds the mask's query axis (",
+                    row_dim,
+                    ")");
+    const uint32_t past_width = col_dim - row_dim;
+    const uint32_t row_pad = row_dim - num_real_new_tokens;
+
+    // Assign each real token a group id: bumped every time a new contiguous run of
+    // token_type_ids == 1 starts; -1 ("no group") for text tokens (token_type_ids == 0).
+    std::vector<int32_t> group_id(num_real_new_tokens, -1);
+    int32_t current_group = -1;
+    bool in_run = false;
+    for (uint32_t i = 0; i < num_real_new_tokens; ++i) {
+        if (token_type_ids_real[i] == 1) {
+            if (!in_run) {
+                ++current_group;
+                in_run = true;
+            }
+            group_id[i] = current_group;
+        } else {
+            in_run = false;
+        }
+    }
+
+    constexpr float kAttend = 0.0f;
+    float* data = mask_tensor->data<float>();
+    for (uint32_t i = 0; i < num_real_new_tokens; ++i) {
+        if (group_id[i] < 0) {
+            continue;
+        }
+        float* row_ptr = data + static_cast<size_t>(row_pad + i) * col_dim;
+        for (uint32_t j = 0; j < num_real_new_tokens; ++j) {
+            if (group_id[j] == group_id[i]) {
+                row_ptr[past_width + row_pad + j] = kAttend;
+            }
+        }
+    }
+}

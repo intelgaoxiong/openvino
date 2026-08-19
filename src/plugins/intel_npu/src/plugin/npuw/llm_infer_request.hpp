@@ -103,6 +103,24 @@ protected:
                         ov::SoPtr<ov::ITensor> position_ids,
                         ov::SoPtr<ov::ITensor> per_layer_inputs);
 
+    // For a genuine hybrid SWA model, `global_attention_mask`/`sliding_window_attention_mask`
+    // are required model inputs (see npuw_transformations/patch_sliding_window_kvcache.hpp) whose
+    // real (additive f32, 0.0f=attend / lowest()=masked) content is derived here from this call's
+    // `num_stored_tokens_before`/`num_real_new_tokens` bookkeeping plus each mask tensor's own
+    // runtime shape - see `ov::npuw::util::fill_causal_sliding_mask()`'s doc comment (
+    // infer_request_utils.hpp) for the full derivation. When `token_type_ids_real` is non-null
+    // (VLM prefill only - the generate model has no token_type_ids port), also overlays extra
+    // bidirectional visibility for same-image vision tokens within THIS call's own current-chunk
+    // block (see `ov::npuw::util::overlay_vision_bidirectional_mask()`; cross-chunk images are out
+    // of scope). Must be called, for a given `request`/`in_ports`, right before that request's
+    // `infer()` call. No-op (and free) for every non-hybrid model, since the two ports are simply
+    // absent from `in_ports` there.
+    void fill_attention_masks(const std::shared_ptr<ov::IAsyncInferRequest>& request,
+                              const PortsMap& in_ports,
+                              uint32_t num_stored_tokens_before,
+                              uint32_t num_real_new_tokens,
+                              const int64_t* token_type_ids_real = nullptr);
+
     // Multiple generate inference request variants, each with a different KV cache size
     std::vector<std::shared_ptr<ov::IAsyncInferRequest>> m_generate_requests;
 
