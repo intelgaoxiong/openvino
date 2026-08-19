@@ -1434,7 +1434,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             auto apply_block_kv_transform =
                 [&](std::shared_ptr<ov::Model>& model, bool v_transposed, const std::string& tag) {
                     ov::pass::Manager mgr(tag);
-                    mgr.register_pass<ov::npuw::pass::SplitKVCacheIntoBlocks>(block_size, v_transposed);
+                    mgr.register_pass<ov::npuw::pass::SplitKVCacheIntoBlocks>(block_size,
+                                                                              v_transposed,
+                                                                              m_swa_layer_is_sliding);
                     if (mgr.run_passes(model)) {
                         LOG_INFO("SplitKVCacheIntoBlocks applied: " << tag);
                     } else {

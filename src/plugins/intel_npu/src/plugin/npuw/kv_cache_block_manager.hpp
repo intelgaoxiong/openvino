@@ -5,7 +5,6 @@
 #pragma once
 
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <optional>
 #include <stack>
@@ -98,8 +97,7 @@ public:
     uint32_t get_block_tokens(uint32_t block_id) const;
 
     /**
-     * @brief Get list of all currently allocated block IDs, in allocation order
-     * (oldest first).
+     * @brief Get list of all currently allocated block IDs
      *
      * @return Vector of block IDs
      */
@@ -178,11 +176,6 @@ private:
     uint32_t max_blocks_;                  ///< Maximum blocks in pool
     std::vector<Block> blocks_;            ///< All blocks (free + allocated)
     std::stack<uint32_t> free_block_ids_;  ///< Stack of free block IDs (LIFO for better reuse)
-
-    /// Allocated block IDs in allocation order (oldest first). Backs get_allocated_blocks().
-    /// For managers that never evict (the only kind that exists today), this always equals
-    /// ascending block-ID order.
-    std::deque<uint32_t> allocated_order_;
 
     ov::element::Type element_type_;             ///< Element type for tensors
     ov::Shape block_shape_;                      ///< Shape for block tensors
