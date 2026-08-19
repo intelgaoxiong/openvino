@@ -134,50 +134,6 @@ std::vector<uint32_t> KVCacheBlockManager::get_allocated_blocks() const {
     return std::vector<uint32_t>(allocated_order_.begin(), allocated_order_.end());
 }
 
-void KVCacheBlockManager::ensure_blocks_up_to(uint32_t up_to_index) {
-    // evicted_count_ + allocated_order_.size() is the total number of chronological
-    // blocks ever allocated by this manager - keep allocating (evicting the oldest
-    // resident block once the pool is full) until it covers up_to_index.
-    //
-    // NB: when the pool is already full, this is the EXPECTED steady-state path for a
-    // sliding-window layer (happens once per new chronological block, i.e. once every
-    // block_size tokens) - so eviction is done directly here, without ever going through
-    // allocate_block()'s "pool exhausted" warning (that warning is reserved for the
-    // genuinely-unexpected exhaustion of a non-evicting, e.g. full-attention, manager).
-    while (evicted_count_ + allocated_order_.size() <= up_to_index) {
-        if (free_block_ids_.empty()) {
-            OPENVINO_ASSERT(!allocated_order_.empty(),
-                            "KVCacheBlockManager: pool exhausted (max_blocks=",
-                            max_blocks_,
-                            ") and no resident block available to evict");
-
-            const uint32_t oldest_id = allocated_order_.front();
-            allocated_order_.pop_front();
-            auto& oldest_block = blocks_[oldest_id];
-            oldest_block.is_allocated = false;
-            oldest_block.num_tokens = 0;
-            free_block_ids_.push(oldest_id);
-            ++evicted_count_;
-            LOG_VERB("KVCacheBlockManager: Evicted oldest block " << oldest_id << " (evicted_count=" << evicted_count_
-                                                                  << ")");
-        }
-
-        const auto block_id = allocate_block();
-        OPENVINO_ASSERT(block_id.has_value(),
-                        "KVCacheBlockManager: unexpected allocate_block() failure right after eviction");
-    }
-}
-
-uint32_t KVCacheBlockManager::resident_index(uint32_t chronological_index) const {
-    OPENVINO_ASSERT(chronological_index >= evicted_count_,
-                    "KVCacheBlockManager: block ",
-                    chronological_index,
-                    " has already been evicted (evicted_count=",
-                    evicted_count_,
-                    ")");
-    return chronological_index - evicted_count_;
-}
-
 void KVCacheBlockManager::release(uint32_t keep_warm_count) {
     LOG_DEBUG("KVCacheBlockManager: Resetting blocks (keep_warm_count=" << keep_warm_count << ")");
 
@@ -201,7 +157,6 @@ void KVCacheBlockManager::release(uint32_t keep_warm_count) {
     }
 
     allocated_order_.clear();
-    evicted_count_ = 0;
     rebuild_free_block_ids();
 }
 

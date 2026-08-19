@@ -8,6 +8,7 @@
 #include <regex>
 
 #include "infer_request_utils.hpp"
+#include "kv_cache_sliding_window_manager.hpp"
 #include "llm_compiled_model.hpp"
 #include "llm_infer_base_request.hpp"
 #include "llm_infer_request.hpp"
@@ -367,14 +368,11 @@ void LLMBlockKVCacheStrategy::on_reset(uint32_t next_prompt_length) {
     // write_kv_slice_sliding() only ever reads/writes the logically-valid prefix, but kept
     // for defense-in-depth against stale reads).
     for (auto& [layer_idx, layer_managers] : m_kv_cache_block_managers) {
-        if (!layer_managers.is_sliding) {
-            continue;
+        if (layer_managers.key_sliding_manager) {
+            layer_managers.key_sliding_manager->reset();
         }
-        if (layer_managers.swa_key_window) {
-            ov::npuw::util::fill_tensor_bytes(layer_managers.swa_key_window, 0u);
-        }
-        if (layer_managers.swa_value_window) {
-            ov::npuw::util::fill_tensor_bytes(layer_managers.swa_value_window, 0u);
+        if (layer_managers.value_sliding_manager) {
+            layer_managers.value_sliding_manager->reset();
         }
     }
     bind_swa_window_views();
@@ -563,12 +561,12 @@ void LLMBlockKVCacheStrategy::on_generate_step_done(uint32_t input_tokens_len) {
 // either keep too many or too few tokens whenever the window doesn't land on a block
 // boundary ("torn" mid-block positions).
 //
-// Instead, each SWA layer gets ONE persistent, contiguous window_size-wide buffer per
-// key/value (swa_key_window / swa_value_window), allocated once in
-// create_block_managers_and_helpers(). Its k = window_size/block_size numbered ports are
-// bound ONCE (bind_swa_window_views()) as adjacent VIEWS into this single buffer and are
-// NEVER rebound again - only the buffer's CONTENT is updated in place, each prefill chunk
-// and each generate step, via the shared write_kv_slice_sliding() utility.
+// Instead, each SWA layer owns ONE persistent KVCacheSlidingWindowManager per key/value
+// (key_sliding_manager / value_sliding_manager, see kv_cache_sliding_window_manager.hpp),
+// constructed once in create_block_managers_and_helpers(). Its k = window_size/block_size
+// numbered ports are bound ONCE (bind_swa_window_views()) to the manager's per-slot VIEWS
+// and are NEVER rebound again - only the buffer's CONTENT is updated in place, each
+// prefill chunk and each generate step, via KVCacheSlidingWindowManager::update().
 //
 // IMPORTANT: ports must stay bound to a FIXED address for their entire lifetime. An
 // oversized-buffer + periodic-compaction + "slide the view forward every step" scheme was
@@ -579,7 +577,7 @@ void LLMBlockKVCacheStrategy::on_generate_step_done(uint32_t input_tokens_len) {
 // perf work on this code path must keep every port's binding fixed.
 //
 // Physical layout: the window buffer's content is maintained with
-// SlidingBufferLayout::Circular (see infer_request_utils.hpp) instead of the
+// SlidingBufferLayout::Circular (see kv_cache_sliding_window_manager.hpp) instead of the
 // LeftAligned/shift-based layout used by the sibling LLMContinuousKVCacheStrategy. Once
 // saturated, token at absolute position p always lives at physical index (p %
 // window_size) - new tokens simply overwrite their circular slot, no existing content is
@@ -606,23 +604,16 @@ void LLMBlockKVCacheStrategy::on_generate_step_done(uint32_t input_tokens_len) {
 // ============================================================================
 
 void LLMBlockKVCacheStrategy::bind_swa_window_views() {
-    namespace uu = ov::npuw::util;
     for (auto& [layer_idx, layer_managers] : m_kv_cache_block_managers) {
-        if (!layer_managers.is_sliding) {
-            continue;
-        }
         const std::string layer_idx_str = std::to_string(layer_idx);
 
-        auto bind_one = [&](const ov::SoPtr<ov::ITensor>& window, uint32_t kv_dim, const char* kv_type) {
-            if (!window) {
+        auto bind_one = [&](KVCacheSlidingWindowManager* mgr, const char* kv_type) {
+            if (!mgr) {
                 return;
             }
-            const uint32_t num_slots = static_cast<uint32_t>(window->get_shape()[kv_dim]) / m_block_size;
-            for (uint32_t block_idx = 0; block_idx < num_slots; ++block_idx) {
+            for (uint32_t block_idx = 0; block_idx < mgr->num_slots(); ++block_idx) {
                 const std::string input_name = make_numbered_block_input_name(kv_type, layer_idx_str, block_idx);
-                const uint32_t start = block_idx * m_block_size;
-                const uint32_t end = start + m_block_size;
-                auto view = uu::make_tensor_slice(window, kv_dim, start, end);
+                auto view = mgr->get_slot_view(block_idx);
 
                 auto prefill_it = m_prefill_classified_in_ports.find(input_name);
                 if (prefill_it != m_prefill_classified_in_ports.end()) {
@@ -636,17 +627,16 @@ void LLMBlockKVCacheStrategy::bind_swa_window_views() {
                     }
                 }
             }
-            LOG_VERB("[SWA] Layer " << layer_idx << " " << kv_type << ": bound " << num_slots
+            LOG_VERB("[SWA] Layer " << layer_idx << " " << kv_type << ": bound " << mgr->num_slots()
                                     << " numbered port(s) as static views into the window buffer");
         };
 
-        bind_one(layer_managers.swa_key_window, layer_managers.swa_key_dim, "key");
-        bind_one(layer_managers.swa_value_window, layer_managers.swa_value_dim, "value");
+        bind_one(layer_managers.key_sliding_manager.get(), "key");
+        bind_one(layer_managers.value_sliding_manager.get(), "value");
     }
 }
 
 void LLMBlockKVCacheStrategy::update_swa_windows_from_prefill(uint32_t current_prompts_len) {
-    namespace uu = ov::npuw::util;
     if (m_kv_cache_block_managers.empty()) {
         return;
     }
@@ -654,14 +644,10 @@ void LLMBlockKVCacheStrategy::update_swa_windows_from_prefill(uint32_t current_p
     const uint32_t tokens_before = kvcache_desc.num_stored_tokens - current_prompts_len;
 
     for (const auto& [layer_idx, layer_managers] : m_kv_cache_block_managers) {
-        if (!layer_managers.is_sliding) {
-            continue;
-        }
         const std::string layer_str = std::to_string(layer_idx);
         for (const bool is_key : {true, false}) {
-            const auto& window = is_key ? layer_managers.swa_key_window : layer_managers.swa_value_window;
-            const uint32_t dst_kv_dim = is_key ? layer_managers.swa_key_dim : layer_managers.swa_value_dim;
-            if (!window) {
+            auto* mgr = (is_key ? layer_managers.key_sliding_manager : layer_managers.value_sliding_manager).get();
+            if (!mgr) {
                 continue;
             }
             const std::string output_name = "present." + layer_str + "." + (is_key ? "key" : "value");
@@ -671,19 +657,12 @@ void LLMBlockKVCacheStrategy::update_swa_windows_from_prefill(uint32_t current_p
             }
             const uint32_t src_kv_dim = (!is_key && kvcache_desc.v_tensors_transposed_pre) ? 3u : kvcache_desc.dim;
             auto src_tensor = m_req.m_prefill_request->get_tensor(port_it->second);
-            uu::write_kv_slice_sliding(window,
-                                      src_tensor,
-                                      dst_kv_dim,
-                                      src_kv_dim,
-                                      tokens_before,
-                                      current_prompts_len,
-                                      uu::SlidingBufferLayout::Circular);
+            mgr->update(src_tensor, src_kv_dim, tokens_before, current_prompts_len);
         }
     }
 }
 
 void LLMBlockKVCacheStrategy::update_swa_windows_generate(uint32_t input_tokens_len) {
-    namespace uu = ov::npuw::util;
     if (m_kv_cache_block_managers.empty()) {
         return;
     }
@@ -691,14 +670,10 @@ void LLMBlockKVCacheStrategy::update_swa_windows_generate(uint32_t input_tokens_
     const uint32_t tokens_before = kvcache_desc.num_stored_tokens - input_tokens_len;
 
     for (const auto& [layer_idx, layer_managers] : m_kv_cache_block_managers) {
-        if (!layer_managers.is_sliding) {
-            continue;
-        }
         const std::string layer_str = std::to_string(layer_idx);
         for (const bool is_key : {true, false}) {
-            const auto& window = is_key ? layer_managers.swa_key_window : layer_managers.swa_value_window;
-            const uint32_t dst_kv_dim = is_key ? layer_managers.swa_key_dim : layer_managers.swa_value_dim;
-            if (!window) {
+            auto* mgr = (is_key ? layer_managers.key_sliding_manager : layer_managers.value_sliding_manager).get();
+            if (!mgr) {
                 continue;
             }
             const std::string output_name = "present." + layer_str + "." + (is_key ? "key" : "value");
@@ -708,13 +683,7 @@ void LLMBlockKVCacheStrategy::update_swa_windows_generate(uint32_t input_tokens_
             }
             const uint32_t src_kv_dim = (!is_key && kvcache_desc.v_tensors_transposed_gen) ? 3u : kvcache_desc.dim;
             auto src_tensor = m_req.m_kvcache_request->get_tensor(port_it->second);
-            uu::write_kv_slice_sliding(window,
-                                      src_tensor,
-                                      dst_kv_dim,
-                                      src_kv_dim,
-                                      tokens_before,
-                                      input_tokens_len,
-                                      uu::SlidingBufferLayout::Circular);
+            mgr->update(src_tensor, src_kv_dim, tokens_before, input_tokens_len);
         }
     }
 }
@@ -1081,24 +1050,12 @@ void LLMBlockKVCacheStrategy::create_block_managers_and_helpers() {
     m_block_size = block_size;
     const uint32_t max_blocks = (compiled_model->m_kvcache_desc.total_size + block_size - 1) / block_size;
 
-    // Sliding-window (SWA) layers get a much smaller, capped block pool sized to the
-    // attention window instead of the full kvcache_desc.total_size: once the pool fills
-    // up, KVCacheBlockManager::ensure_blocks_up_to() evicts the single oldest resident
-    // block to make room for the newest one, so exactly window_size/block_size blocks
-    // (the most recent ones) stay resident at all times.
-    //
-    // FIXME: window_size not being a multiple of block_size is not yet supported - the
-    // last partial window block would need its own tail-style handling, similar to the
-    // tail port used for a non-block-aligned total_size.
+    // Sliding-window (SWA) layers use a much smaller, fixed-size window buffer sized to
+    // the attention window instead of the full kvcache_desc.total_size (see
+    // KVCacheSlidingWindowManager, constructed below) - this is only computed here for
+    // the diagnostic log line; the manager itself validates window_size % block_size == 0.
     uint32_t swa_max_blocks = 0;
     if (compiled_model->m_swa_window_size > 0) {
-        OPENVINO_ASSERT(compiled_model->m_swa_window_size % block_size == 0,
-                        "NPUW block KV cache: SWA window_size (",
-                        compiled_model->m_swa_window_size,
-                        ") must be a multiple of block_size (",
-                        block_size,
-                        "). Non-multiple window sizes are not yet supported by the block-based KV cache "
-                        "strategy.");
         swa_max_blocks = compiled_model->m_swa_window_size / block_size;
     }
 
@@ -1168,23 +1125,7 @@ void LLMBlockKVCacheStrategy::create_block_managers_and_helpers() {
                         "SplitKVCacheIntoBlocks transformation may be broken.");
 
         LayerBlockManagers layer_managers;
-        layer_managers.is_sliding = compiled_model->is_swa_layer(layer_idx);
-
-        // Detects which dim (2 or 3) of `shape` holds the sequence axis (whichever equals
-        // block_size), mirroring KVCacheBlockManager's own detection logic, and returns a
-        // same-rank shape with that dim replaced by `new_len`.
-        auto make_window_shape = [&](const ov::Shape& shape, uint32_t new_len, uint32_t& detected_dim) {
-            OPENVINO_ASSERT(shape.size() == 4 && (shape[2] == block_size || shape[3] == block_size),
-                            "NPUW block KV cache: SWA base_shape ",
-                            shape,
-                            " does not have block_size=",
-                            block_size,
-                            " in sequence dimension (expected at dim 2 or 3)");
-            detected_dim = (shape[2] == block_size) ? 2u : 3u;
-            ov::Shape window_shape = shape;
-            window_shape[detected_dim] = new_len;
-            return window_shape;
-        };
+        const bool is_sliding = compiled_model->is_swa_layer(layer_idx);
 
         if (presence.has_key_numbered_block) {
             // Invariant B: numbered blocks must start at block_0
@@ -1195,16 +1136,18 @@ void LLMBlockKVCacheStrategy::create_block_managers_and_helpers() {
                             " has key blocks but no key_block_0. "
                             "SplitKVCacheIntoBlocks transformation may be broken.");
             auto first_key_port = m_prefill_classified_in_ports.at(key_block0_name).port;
-            if (layer_managers.is_sliding) {
+            if (is_sliding) {
                 // Single persistent window buffer, statically bound to all numbered ports
                 // as adjacent views (see bind_swa_window_views()) - no KVCacheBlockManager,
-                // no eviction/rotation. Updated in-place each step via write_kv_slice_sliding().
-                const auto window_shape =
-                    make_window_shape(first_key_port.get_shape(), swa_max_blocks * block_size, layer_managers.swa_key_dim);
-                layer_managers.swa_key_window = ov::npuw::util::allocMem(first_key_port.get_element_type(),
-                                                                         window_shape,
-                                                                         m_req.m_pre_alloc_device,
-                                                                         compiled_model->get_plugin());
+                // no eviction/rotation. Updated in-place each step via
+                // KVCacheSlidingWindowManager::update().
+                layer_managers.key_sliding_manager =
+                    std::make_unique<KVCacheSlidingWindowManager>(block_size,
+                                                                  compiled_model->m_swa_window_size,
+                                                                  first_key_port.get_shape(),
+                                                                  first_key_port.get_element_type(),
+                                                                  m_req.m_pre_alloc_device,
+                                                                  compiled_model->get_plugin());
             } else {
                 layer_managers.key_manager = std::make_unique<KVCacheBlockManager>(block_size,
                                                                                    max_blocks,
@@ -1222,14 +1165,14 @@ void LLMBlockKVCacheStrategy::create_block_managers_and_helpers() {
                             " has value blocks but no value_block_0. "
                             "SplitKVCacheIntoBlocks transformation may be broken.");
             auto first_value_port = m_prefill_classified_in_ports.at(value_block0_name).port;
-            if (layer_managers.is_sliding) {
-                const auto window_shape = make_window_shape(first_value_port.get_shape(),
-                                                             swa_max_blocks * block_size,
-                                                             layer_managers.swa_value_dim);
-                layer_managers.swa_value_window = ov::npuw::util::allocMem(first_value_port.get_element_type(),
-                                                                           window_shape,
-                                                                           m_req.m_pre_alloc_device,
-                                                                           compiled_model->get_plugin());
+            if (is_sliding) {
+                layer_managers.value_sliding_manager =
+                    std::make_unique<KVCacheSlidingWindowManager>(block_size,
+                                                                  compiled_model->m_swa_window_size,
+                                                                  first_value_port.get_shape(),
+                                                                  first_value_port.get_element_type(),
+                                                                  m_req.m_pre_alloc_device,
+                                                                  compiled_model->get_plugin());
             } else {
                 layer_managers.value_manager = std::make_unique<KVCacheBlockManager>(block_size,
                                                                                      max_blocks,
@@ -1240,7 +1183,7 @@ void LLMBlockKVCacheStrategy::create_block_managers_and_helpers() {
             }
         }
 
-        if (layer_managers.is_sliding) {
+        if (is_sliding) {
             LOG_INFO("[SWA] Layer " << layer_idx << ": sliding, window buffer capacity=" << swa_max_blocks * block_size
                                      << " tokens (window_size=" << compiled_model->m_swa_window_size
                                      << ", block_size=" << block_size << ")");
@@ -1263,7 +1206,7 @@ void LLMBlockKVCacheStrategy::create_block_managers_and_helpers() {
     if (!m_variant_block_binding_helpers.empty()) {
         const auto& first_variant_helpers = m_variant_block_binding_helpers.begin()->second;
         for (const auto& [layer_idx, layer_managers] : m_kv_cache_block_managers) {
-            if (!layer_managers.is_sliding) {
+            if (!layer_managers.key_sliding_manager && !layer_managers.value_sliding_manager) {
                 continue;
             }
             auto it = first_variant_helpers.find(layer_idx);

@@ -7,6 +7,7 @@
 #include <regex>
 
 #include "infer_request_utils.hpp"
+#include "kv_cache_sliding_window_manager.hpp"
 
 // NOTE: This is a basic method for updating KVCache after handling its part.
 //       It is not intended to work with model supporting Linear Cache.

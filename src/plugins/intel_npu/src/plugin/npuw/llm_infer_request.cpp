@@ -9,6 +9,7 @@
 #include <regex>
 
 #include "infer_request_utils.hpp"
+#include "kv_cache_sliding_window_manager.hpp"
 #include "llm_block_kvcache_strategy.hpp"
 #include "llm_compiled_model.hpp"
 #include "llm_continuous_kvcache_strategy.hpp"
