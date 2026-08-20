@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <string>
 
 #include "logging.hpp"
 #include "openvino/runtime/make_tensor.hpp"  // get_tensor_impl
@@ -324,19 +325,35 @@ void ov::npuw::util::fill_causal_sliding_mask(ov::SoPtr<ov::ITensor> mask_tensor
     for (uint32_t row = 0; row < row_dim; ++row) {
         float* row_ptr = data + static_cast<size_t>(row) * col_dim;
 
-        // Past columns: c in [0, past_width). Past K/V is physically shrunk to `window_size`
-        // columns, always holding the most recent min(P, past_width) tokens left-aligned-
-        // by-recency (write_kv_slice_sliding()'s invariant). row_local is this row's local
-        // index within the real/right-aligned current-chunk segment (may be "negative" for
-        // pad rows - harmless, see fn doc comment).
-        const uint32_t w_valid = std::min(P, past_width);
+        // Past columns: c in [0, past_width). The past K/V buffer is maintained by
+        // write_kv_slice_sliding(..., SlidingBufferLayout::Circular): physical slot c always
+        // holds whichever absolute token position last landed there via `p % past_width` - no
+        // data is ever shifted (see kv_cache_sliding_window_manager.hpp). While the window has
+        // not yet saturated (P < past_width), writes fill physical slots strictly in arrival
+        // order 0, 1, 2, ... - so the valid prefix is LEFT-aligned at [0, P) (column c holds
+        // absolute position c), and columns >= P are still-uninitialized garbage. Once
+        // P >= past_width (saturated at least once), every physical slot has been written at
+        // least once (all valid), but which absolute position slot c currently holds depends on
+        // how far the wrap-around write cursor `r = P % past_width` has progressed: slots >= r
+        // hold the most recently *completed* lap (abs = P - r + c - past_width), slots < r hold
+        // the lap currently in progress (abs = P - r + c).
         const int64_t row_local = static_cast<int64_t>(row) - static_cast<int64_t>(row_pad);
+        const int64_t q = static_cast<int64_t>(P) + row_local;  // this row's own absolute position
+        const uint32_t r = P % past_width;
         for (uint32_t c = 0; c < past_width; ++c) {
-            const bool valid = c >= (past_width - w_valid);
-            // Window distance check: derived to `c > row_local` - the row_pad
-            // right-alignment offset cancels algebraically because past_width == window_size
-            // by construction for this (narrowed) buffer. See session plan for the derivation.
-            const bool attend = valid && (static_cast<int64_t>(c) > row_local);
+            bool valid;
+            int64_t abs_pos;
+            if (P >= past_width) {
+                valid = true;
+                abs_pos = (c < r) ? (static_cast<int64_t>(P) - r + c)
+                                  : (static_cast<int64_t>(P) - r + c - past_width);
+            } else {
+                valid = c < P;
+                abs_pos = c;
+            }
+            const bool causal = abs_pos <= q;
+            const bool window_ok = (q - abs_pos) < static_cast<int64_t>(window_size);
+            const bool attend = valid && causal && window_ok;
             row_ptr[c] = attend ? kAttend : kMasked;
         }
 
