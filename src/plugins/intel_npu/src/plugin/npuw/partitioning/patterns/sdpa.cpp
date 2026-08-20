@@ -233,6 +233,15 @@ SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>
 
         auto& node_to_output = m.get_pattern_value_map();
 
+        auto concat1_node = node_to_output.find(concat1);
+        auto concat1_shape = concat1_node->second.get_node_shared_ptr()->get_output_shape(0);
+        auto context_length = concat1_shape[2];
+        if (context_length <= 4096) {
+            std::cout << "Skipping Decomposed SDPA pattern match: context length " << context_length
+                      << " is not greater than 4096" << std::endl;
+            return false;
+        }
+
         // Helper lambda to extract and isolate matched nodes
         auto isolate_matched = [&](const auto& pattern) {
             auto optional_node = node_to_output.find(pattern);
