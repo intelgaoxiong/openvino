@@ -5,23 +5,12 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <map>
 
 #include "openvino/pass/pass.hpp"
 
 namespace ov::npuw {
-
-// Detected attention mask type and (for sliding window) its window size.
-struct MaskInfo {
-    // No recognized mask pattern (e.g. full attention), plain causal, or
-    // causal + sliding-window (local attention).
-    enum class MaskType : int { Unknown = 0, Causal, SlidingWindow };
-
-    // Value-initialized to MaskType::Unknown (== 0).
-    MaskType mask_type{};
-    // Valid only when mask_type == SlidingWindow.
-    int64_t window_size = 0;
-};
 
 // Analysis pass: detects the attention mask type of each SDPA node in the model by
 // inspecting its mask-construction subgraph (Range/LessEqual/Greater/BitwiseAnd, or
@@ -32,46 +21,40 @@ struct MaskInfo {
 // indicates genuinely contradictory evidence (e.g. an is_causal=true SDPA fed an
 // explicit sliding-window mask), not just two matchers agreeing.
 //
-// run_on_model() never modifies the model (always returns false); after running,
-// it also derives two convenience views from the per-SDPA rt_info it just wrote,
-// retained for pre-existing consumers - get_mask_info() (whole-model aggregate)
-// and get_layer_mask_info() (per-layer map, see below).
+// Must run before SDPA decomposition (OptimizeValueTensors) so the SDPA nodes it
+// annotates still exist. run_on_model() never modifies the model (always returns
+// false) - the rt_info annotation is the only output; see get_layer_mask_annotations()
+// and log_detected_masks() below for ways to consume it.
 class DetectAttentionMask : public ov::pass::ModelPass {
 public:
     OPENVINO_MODEL_PASS_RTTI("ov::npuw::DetectAttentionMask");
     DetectAttentionMask() = default;
 
     bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
-
-    // Whole-model aggregate result. Preserves the pre-existing behavior (last
-    // matching matcher wins, never downgrading an already-found SlidingWindow to
-    // Causal) so existing consumers (e.g. HFA mask-skipping) are unaffected.
-    const MaskInfo& get_mask_info() const {
-        return m_mask_info;
-    }
-
-    // Per-layer detection result, keyed by decoder layer index. The layer index
-    // is parsed from the friendly_name of the ScaledDotProductAttention node(s)
-    // that (transitively) consume each matched mask subgraph - not from the
-    // matched subgraph's own name, since a mask subgraph can be CSE-shared across
-    // multiple structurally-identical layers and therefore feed more than one
-    // SDPA. Layers whose mask subgraph wasn't recognized by any matcher, or whose
-    // consuming SDPA's name doesn't carry a parseable layer index, are absent
-    // from the map (equivalent to MaskType::Unknown).
-    const std::map<size_t, MaskInfo>& get_layer_mask_info() const {
-        return m_layer_mask_info;
-    }
-
-private:
-    MaskInfo m_mask_info;
-    std::map<size_t, MaskInfo> m_layer_mask_info;
 };
 
 void log_detected_masks(const std::shared_ptr<ov::Model>& model);
 
+// Walks every ScaledDotProductAttention node in `model` (which must already have been
+// processed by DetectAttentionMask) and returns the per-decoder-layer detection result
+// (see NPUW_SDPA_MASK_RT_KEY's encoding below), keyed by decoder layer index. The layer
+// index is parsed from each SDPA's friendly_name (see
+// util::try_parse_self_attn_layer_idx) - SDPAs whose name doesn't carry a parseable
+// layer index are omitted. A mask subgraph can be CSE-shared across multiple
+// structurally-identical layers and therefore feed more than one SDPA; since
+// DetectAttentionMask's matchers annotate every consuming SDPA node individually (see
+// annotate_sdpa_consumers() in detect_causal_mask.cpp), this is a plain read-back of
+// each node's own rt_info - no separate aggregation/precedence bookkeeping is needed
+// here. Layers absent from the returned map are equivalent to "Unknown".
+std::map<size_t, int64_t> get_layer_mask_annotations(const std::shared_ptr<ov::Model>& model);
+
 // rt_info key written by DetectAttentionMask onto each ScaledDotProductAttention
-// node. Value type: int64_t, encoding both the mask kind and (for sliding window)
-// its window size in a single slot:
+// node, propagated onto the decomposed Add(QK, mask) node by
+// ScaledDotProductAttentionDecomposition::decompose() (via copy_runtime_info), and
+// read directly by HostFlashAttention::from().
+//
+// Value type: int64_t, encoding both the mask kind and (for sliding window) its
+// window size in a single slot:
 //   * key absent   -> Unknown (no recognized mask pattern, e.g. full/bidirectional
 //                     attention)
 //   * value <  0   -> Causal (equivalent to a sliding window whose size covers the

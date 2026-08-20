@@ -28,7 +28,6 @@ class WhisperInferRequest;
 class LLMBlockKVCacheStrategy;
 class LLMContinuousKVCacheStrategy;
 struct PrefixCacheRestorationContext;
-struct MaskInfo;
 class LLMCompiledModel : public ov::npuw::ICompiledModel {
     using GetPropertiesMap =
         std::map<std::string, std::tuple<ov::PropertyMutability, std::function<ov::Any(const ::intel_npu::Config&)>>>;
@@ -169,10 +168,11 @@ private:
     uint32_t m_swa_window_size = 0;            // 0 == Sliding Window Attention disabled
     std::vector<bool> m_swa_layer_is_sliding;  // per-layer flag, indexed by decoder layer id
 
-    // Derives m_swa_window_size / m_swa_layer_is_sliding from DetectAttentionMask's per-layer
-    // result. Enables SWA only for a genuine hybrid model (at least one sliding-window layer AND
-    // at least one non-sliding layer).
-    void detect_swa_layout(const std::map<size_t, MaskInfo>& layer_mask_info);
+    // Thin wrapper storing ov::npuw::util::derive_swa_layout()'s result (see
+    // llm_compiled_model_utils.hpp) on the instance. The actual derivation from
+    // get_layer_mask_annotations()'s per-layer result is a pure function kept there so it can be
+    // unit-tested independently of LLMCompiledModel construction.
+    void detect_swa_layout(const std::map<size_t, int64_t>& layer_mask_annotations);
 
     // True if SWA is enabled and layer_idx is configured as a sliding-window layer.
     bool is_swa_layer(size_t layer_idx) const;

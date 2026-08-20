@@ -577,70 +577,14 @@ std::shared_ptr<ov::Model> check_and_cut_lm_head(const std::shared_ptr<ov::Model
 
 }  // namespace
 
-void ov::npuw::LLMCompiledModel::detect_swa_layout(const std::map<size_t, MaskInfo>& layer_mask_info) {
-    m_swa_window_size = 0;
-    m_swa_layer_is_sliding.clear();
-
-    if (layer_mask_info.empty()) {
-        LOG_DEBUG("[SWA] DetectAttentionMask found no per-layer mask info; Sliding Window Attention is disabled.");
-        return;
-    }
-
-    // Layers absent from the map (mask pattern not recognized by any matcher) are treated as
-    // full-attention, matching MaskType::Unknown's semantics elsewhere.
-    size_t num_layers = 0;
-    for (const auto& [layer_idx, info] : layer_mask_info) {
-        num_layers = std::max(num_layers, layer_idx + 1);
-    }
-
-    std::vector<bool> layer_is_sliding(num_layers, false);
-    int64_t detected_window = 0;
-    bool has_sliding = false;
-    bool has_full = false;
-    for (size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-        const auto it = layer_mask_info.find(layer_idx);
-        if (it != layer_mask_info.end() && it->second.mask_type == MaskInfo::MaskType::SlidingWindow) {
-            layer_is_sliding[layer_idx] = true;
-            has_sliding = true;
-            if (detected_window == 0) {
-                detected_window = it->second.window_size;
-            } else {
-                OPENVINO_ASSERT(detected_window == it->second.window_size,
-                                "NPUW SWA: inconsistent sliding-window sizes detected across layers (",
-                                detected_window,
-                                " vs ",
-                                it->second.window_size,
-                                "). Only a single, uniform window size is currently supported.");
-            }
-        } else {
-            has_full = true;
-        }
-    }
-
-    // Only enable the hybrid SWA pipeline for a genuine hybrid model: at least one sliding-window
-    // layer AND at least one full/causal-attention layer. A model where every layer is uniformly
-    // sliding (or uniformly full attention) doesn't need per-layer KV-cache window capping.
-    if (!has_sliding || !has_full) {
-        LOG_DEBUG("[SWA] Not a genuine hybrid model (has_sliding="
-                  << has_sliding << ", has_full=" << has_full << "); Sliding Window Attention support disabled.");
-        return;
-    }
-
-    m_swa_window_size = static_cast<uint32_t>(detected_window);
-    m_swa_layer_is_sliding = std::move(layer_is_sliding);
-
-    std::string pattern;
-    pattern.reserve(m_swa_layer_is_sliding.size());
-    size_t num_sliding = 0;
-    for (const bool is_sliding : m_swa_layer_is_sliding) {
-        pattern.push_back(is_sliding ? 'S' : 'F');
-        num_sliding += is_sliding ? 1 : 0;
-    }
-    LOG_INFO("[SWA] Sliding Window Attention is ENABLED: window_size=" << m_swa_window_size << ", "
-                                                                       << m_swa_layer_is_sliding.size()
-                                                                       << " layers total, " << num_sliding
-                                                                       << " sliding-window layer(s).");
-    LOG_DEBUG("[SWA] Layer pattern (S=sliding, F=full attention): " << pattern);
+void ov::npuw::LLMCompiledModel::detect_swa_layout(const std::map<size_t, int64_t>& layer_mask_annotations) {
+    // The actual derivation (per-layer classification, uniform-window-size validation, genuine-
+    // hybrid gating) is a pure function of layer_mask_annotations - kept as a free function in
+    // llm_compiled_model_utils.{hpp,cpp} so it can be unit-tested without constructing a full
+    // LLMCompiledModel. This method just stores the result on the instance.
+    auto layout = ov::npuw::util::derive_swa_layout(layer_mask_annotations);
+    m_swa_window_size = layout.window_size;
+    m_swa_layer_is_sliding = std::move(layout.layer_is_sliding);
 }
 
 bool ov::npuw::LLMCompiledModel::is_swa_layer(size_t layer_idx) const {
@@ -999,19 +943,12 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     auto lm_head_model = check_and_cut_lm_head(kvcache_model, m_cfg);
 
-    // Detect attention mask type before the SDPA subgraph is isolated by partitioning.
-    // Mask-skipping optimization on HFA regular tiles will be enabled depending on the mask type.
-    ov::npuw::DetectAttentionMask detect_mask;
-    detect_mask.run_on_model(kvcache_model);
-    const auto mask_info = detect_mask.get_mask_info();
-    {
-        const char* mask_type_str = mask_info.mask_type == ov::npuw::MaskInfo::MaskType::Causal        ? "Causal"
-                                    : mask_info.mask_type == ov::npuw::MaskInfo::MaskType::SlidingWindow ? "SlidingWindow"
-                                                                                                          : "Unknown";
-        LOG_INFO("[HFA] DetectAttentionMask result: mask_type=" << mask_type_str
-                                                                 << ", window_size=" << mask_info.window_size);
-    }
-    detect_swa_layout(detect_mask.get_layer_mask_info());
+    // Detect attention mask kind before the SDPA subgraph is isolated by partitioning,
+    // annotating each SDPA node's rt_info. HostFlashAttention reads this per-node to
+    // decide whether the regular-tile mask-skipping optimization is safe for that layer.
+    ov::npuw::DetectAttentionMask().run_on_model(kvcache_model);
+    ov::npuw::log_detected_masks(kvcache_model);
+    detect_swa_layout(ov::npuw::get_layer_mask_annotations(kvcache_model));
 
     // NB: for a genuine hybrid SWA model (some layers sliding, some full-attention), sliding SDPA
     // mask inputs are externalized to a "sliding_window_attention_mask" model input by
@@ -1215,45 +1152,14 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         prefill_config_opt.value_or(get_default_prefill_config(prefill_model, npudesc)).as<ov::AnyMap>();
 
     if (prefill_attn_hfa) {
-        auto skip_safe = [max_prompt_len](const ov::npuw::MaskInfo& info) {
-            return info.mask_type == ov::npuw::MaskInfo::MaskType::Causal ||
-                   (info.mask_type == ov::npuw::MaskInfo::MaskType::SlidingWindow &&
-                    info.window_size >= max_prompt_len);
-        };
-        // For a genuine SWA hybrid model (m_swa_window_size > 0), the single whole-model
-        // mask_info aggregate can hide per-layer differences (e.g. one sliding layer's window is
-        // wide enough while another's isn't). Conservatively AND the skip-safe condition across
-        // every layer instead - a layer absent from the per-layer map (pattern not recognized) is
-        // treated as unsafe. For every other (non-hybrid, uniform-mask) model, keep using the
-        // whole-model aggregate exactly as before.
-        bool mask_skipping_enabled = false;
-        if (m_swa_window_size > 0) {
-            const auto& layer_mask_info = detect_mask.get_layer_mask_info();
-            mask_skipping_enabled = true;
-            for (size_t layer_idx = 0; layer_idx < m_swa_layer_is_sliding.size(); ++layer_idx) {
-                const auto it = layer_mask_info.find(layer_idx);
-                if (it == layer_mask_info.end() || !skip_safe(it->second)) {
-                    mask_skipping_enabled = false;
-                    break;
-                }
-            }
-        } else {
-            mask_skipping_enabled = skip_safe(mask_info);
-        }
-        prefill_config[ov::intel_npu::npuw::partitioning::attn_hfa_mask_skipping.name()] =
-            mask_skipping_enabled ? "YES" : "NO";
-        LOG_INFO("[HFA] NPUW_ATTN_HFA_MASK_SKIPPING=" << (mask_skipping_enabled ? "YES" : "NO")
-                                                       << " (mask_type="
-                                                       << (mask_info.mask_type == ov::npuw::MaskInfo::MaskType::Causal
-                                                               ? "Causal"
-                                                           : mask_info.mask_type ==
-                                                                   ov::npuw::MaskInfo::MaskType::SlidingWindow
-                                                               ? "SlidingWindow"
-                                                               : "Unknown")
-                                                       << ", window_size=" << mask_info.window_size
-                                                       << ", max_prompt_len=" << max_prompt_len
-                                                       << "). When YES, HFA regular (non-final) prefill tiles "
-                                                          "skip the explicit mask.");
+        // Enable the mask-skipping optimization by default; the actual per-layer
+        // decision (safe only for Causal, or SlidingWindow whose window already
+        // covers the full context) is made independently for each SDPA subgraph in
+        // HostFlashAttention::from(), based on the rt_info DetectAttentionMask wrote
+        // above. Setting this to "NO" here (or via user-supplied config, which
+        // overrides this below) acts as a master kill switch disabling the
+        // optimization outright.
+        prefill_config[ov::intel_npu::npuw::partitioning::attn_hfa_mask_skipping.name()] = "YES";
     }
 
     // NB: GENERATE_HINT is only applicable for default generate config!

@@ -8,6 +8,7 @@
 #include <regex>
 
 #include "../logging.hpp"
+#include "../util.hpp"
 #include "detect_causal_mask.hpp"
 #include "openvino/core/graph_util.hpp"
 #include "openvino/core/validation_util.hpp"
@@ -32,13 +33,6 @@ void set_mask_param_name(const std::shared_ptr<ov::op::v0::Parameter>& param, co
 // Matches e.g. "past_key_values.3.key" / "past_key_values.12.value" -> layer index 3 / 12.
 const std::regex& kv_param_regex() {
     static const std::regex re(R"(past_key_values\.(\d+)\.(?:key|value))");
-    return re;
-}
-
-// Matches e.g. "...layers.5.self_attn..." -> layer index 5. Reused from the same
-// convention as embedding/prepare_embedding_model.cpp's AddKVCacheNodes matcher.
-const std::regex& layer_id_regex() {
-    static const std::regex re(R"(layers\.(\d+)\.self_attn)");
     return re;
 }
 
@@ -225,7 +219,7 @@ bool PatchSlidingWindowKVCache::run_on_model(const std::shared_ptr<ov::Model>& m
     static constexpr size_t kTargetShapeInputIdx = 1;  // Reshape/Broadcast target-shape input.
     auto snapshot_kvcache_dim_input = [&](const std::shared_ptr<ov::Node>& node, size_t input_idx) {
         size_t layer_idx = 0;
-        if (!try_parse_layer_idx(node->get_friendly_name(), layer_id_regex(), layer_idx)) {
+        if (!ov::npuw::util::try_parse_self_attn_layer_idx(node->get_friendly_name(), layer_idx)) {
             return;
         }
         if (layer_idx >= m_layer_is_sliding.size() || input_idx >= node->get_input_size()) {
