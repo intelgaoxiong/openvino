@@ -577,7 +577,7 @@ std::shared_ptr<ov::Model> check_and_cut_lm_head(const std::shared_ptr<ov::Model
 
 }  // namespace
 
-void ov::npuw::LLMCompiledModel::parse_swa_config(const std::map<size_t, MaskInfo>& layer_mask_info) {
+void ov::npuw::LLMCompiledModel::detect_swa_layout(const std::map<size_t, MaskInfo>& layer_mask_info) {
     m_swa_window_size = 0;
     m_swa_layer_is_sliding.clear();
 
@@ -624,16 +624,6 @@ void ov::npuw::LLMCompiledModel::parse_swa_config(const std::map<size_t, MaskInf
         LOG_DEBUG("[SWA] Not a genuine hybrid model (has_sliding="
                   << has_sliding << ", has_full=" << has_full << "); Sliding Window Attention support disabled.");
         return;
-    }
-
-    const uint64_t configured_window = m_cfg.get<::intel_npu::NPUW_LLM_SLIDING_WINDOW>();
-    if (configured_window > 0) {
-        OPENVINO_ASSERT(static_cast<int64_t>(configured_window) == detected_window,
-                        "NPUW_LLM_SLIDING_WINDOW (",
-                        configured_window,
-                        ") does not match the sliding-window size detected from the model graph (",
-                        detected_window,
-                        "). Omit NPUW_LLM_SLIDING_WINDOW to rely on auto-detection, or correct its value.");
     }
 
     m_swa_window_size = static_cast<uint32_t>(detected_window);
@@ -1021,7 +1011,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         LOG_INFO("[HFA] DetectAttentionMask result: mask_type=" << mask_type_str
                                                                  << ", window_size=" << mask_info.window_size);
     }
-    parse_swa_config(detect_mask.get_layer_mask_info());
+    detect_swa_layout(detect_mask.get_layer_mask_info());
 
     // NB: for a genuine hybrid SWA model (some layers sliding, some full-attention), SDPA mask
     // inputs are externalized to "global_attention_mask"/"sliding_window_attention_mask" model

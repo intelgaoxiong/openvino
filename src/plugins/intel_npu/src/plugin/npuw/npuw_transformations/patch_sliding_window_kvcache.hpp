@@ -26,7 +26,7 @@ namespace ov::npuw {
 // `DetectAttentionMask`'s rt_info, see NPUW_SDPA_MASK_RT_KEY), and reconnects it to one of two new,
 // shared model inputs added here: "sliding_window_attention_mask" (every SlidingWindow-classified
 // SDPA) and "global_attention_mask" (every other SDPA - Causal, or no recognized pattern, matching
-// `parse_swa_config()`'s has_full semantics). Each new Parameter's shape is read DIRECTLY off the
+// `detect_swa_layout()`'s has_full semantics). Each new Parameter's shape is read DIRECTLY off the
 // real (guaranteed fully-static, since ReshapeToStatic already ran) mask value it replaces on the
 // first SDPA of its kind encountered - no hardcoded shape formula, single source of truth. Once
 // disconnected, the original in-graph mask-computation subgraph(s) become unreachable and are

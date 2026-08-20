@@ -162,18 +162,17 @@ private:
     bool m_is_encoder_embedding = false;
 
     // Sliding Window Attention (SWA) support: per-layer KV-cache window capping for
-    // hybrid sliding/full-attention models (e.g. Gemma4). Both fields are derived from the
-    // model graph itself (DetectAttentionMask's per-layer result), cross-checked against the
-    // cached NPUW_LLM_SLIDING_WINDOW config option if the latter is explicitly set. They ARE
-    // separately serialized (the original graph isn't available after deserialize()).
+    // hybrid sliding/full-attention models (e.g. Gemma4). Both fields are derived entirely
+    // from the model graph itself (DetectAttentionMask's per-layer result) - there is no
+    // config option to override or cross-check against. They ARE separately serialized (the
+    // original graph isn't available after deserialize()).
     uint32_t m_swa_window_size = 0;            // 0 == Sliding Window Attention disabled
     std::vector<bool> m_swa_layer_is_sliding;  // per-layer flag, indexed by decoder layer id
 
     // Derives m_swa_window_size / m_swa_layer_is_sliding from DetectAttentionMask's per-layer
     // result. Enables SWA only for a genuine hybrid model (at least one sliding-window layer AND
-    // at least one non-sliding layer); cross-checks the detected window size against
-    // NPUW_LLM_SLIDING_WINDOW when the latter is explicitly configured.
-    void parse_swa_config(const std::map<size_t, MaskInfo>& layer_mask_info);
+    // at least one non-sliding layer).
+    void detect_swa_layout(const std::map<size_t, MaskInfo>& layer_mask_info);
 
     // True if SWA is enabled and layer_idx is configured as a sliding-window layer.
     bool is_swa_layer(size_t layer_idx) const;
