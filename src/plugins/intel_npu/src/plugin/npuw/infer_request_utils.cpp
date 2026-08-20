@@ -318,7 +318,8 @@ void ov::npuw::util::fill_causal_sliding_mask(ov::SoPtr<ov::ITensor> mask_tensor
     const uint32_t P = num_stored_tokens_before;
 
     constexpr float kAttend = 0.0f;
-    const float kMasked = std::numeric_limits<float>::lowest();
+    // For NPU execution - use fp16 lowest value to represent masked positions
+    float kMasked = static_cast<float>(std::numeric_limits<ov::float16>::lowest());
 
     float* data = mask_tensor->data<float>();
 
