@@ -28,8 +28,7 @@ public:
         static constexpr const char* visual_pos_masks = ov::npuw::util::kVisualPosMasksParamName;
         static constexpr const char* deepstack_visual_embeds = ov::npuw::util::kDeepstackVisualEmbedsParamName;
         // Only present for genuine hybrid Sliding-Window-Attention models (see
-        // npuw_transformations/cut_attention_masks.hpp) - absent for every other model.
-        static constexpr const char* global_attention_mask = "global_attention_mask";
+        // npuw_transformations/patch_sliding_window_kvcache.hpp) - absent for every other model.
         static constexpr const char* sliding_window_attention_mask = "sliding_window_attention_mask";
     };
 

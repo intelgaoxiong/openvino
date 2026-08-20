@@ -1013,12 +1013,12 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
     detect_swa_layout(detect_mask.get_layer_mask_info());
 
-    // NB: for a genuine hybrid SWA model (some layers sliding, some full-attention), SDPA mask
-    // inputs are externalized to "global_attention_mask"/"sliding_window_attention_mask" model
-    // inputs by `PatchSlidingWindowKVCache` itself (see that pass), once per model variant, right
-    // after each variant's own `ReshapeToStatic` call below - not here. `PatchSlidingWindowMask`'s
-    // in-graph mask-formula rebuild is therefore pointless for such models (its output would only
-    // feed a mask subgraph that's about to be cut away and replaced wholesale), so skip it here.
+    // NB: for a genuine hybrid SWA model (some layers sliding, some full-attention), sliding SDPA
+    // mask inputs are externalized to a "sliding_window_attention_mask" model input by
+    // `PatchSlidingWindowKVCache` itself (see that pass), once per model variant, right after each
+    // variant's own `ReshapeToStatic` call below - not here. `PatchSlidingWindowMask`'s in-graph
+    // mask-formula rebuild is therefore pointless for such models (its output would only feed a
+    // sliding mask subgraph that's about to be cut away and replaced wholesale), so skip it here.
     if (!m_is_whisper && m_swa_window_size <= 0) {
         LOG_DEBUG("Try patch sliding window attention mask (Phi-3, Gemma-2, Gemma-3, Gemma-4), if it exists.");
         ov::npuw::PatchSlidingWindowMask().run_on_model(kvcache_model);

@@ -292,7 +292,7 @@ void ov::npuw::util::copy_per_layer_inputs_chunk_to_right(const ov::SoPtr<ov::IT
 void ov::npuw::util::fill_causal_sliding_mask(ov::SoPtr<ov::ITensor> mask_tensor,
                                               uint32_t num_stored_tokens_before,
                                               uint32_t num_real_new_tokens,
-                                              std::optional<uint32_t> window_size) {
+                                              uint32_t window_size) {
     OPENVINO_ASSERT(mask_tensor->get_element_type() == ov::element::f32,
                     "Attention mask tensor is expected to be f32, got: ",
                     mask_tensor->get_element_type());
@@ -324,30 +324,20 @@ void ov::npuw::util::fill_causal_sliding_mask(ov::SoPtr<ov::ITensor> mask_tensor
     for (uint32_t row = 0; row < row_dim; ++row) {
         float* row_ptr = data + static_cast<size_t>(row) * col_dim;
 
-        // Past columns: c in [0, past_width).
-        if (!window_size.has_value()) {
-            // global_attention_mask: past K/V is never physically shrunk, so column index c
-            // IS the absolute key position. Causality is automatic (any already-stored past
-            // token always precedes any current-call query), so validity is the only check.
-            for (uint32_t c = 0; c < past_width; ++c) {
-                row_ptr[c] = (c < P) ? kAttend : kMasked;
-            }
-        } else {
-            // sliding_window_attention_mask: past K/V is physically shrunk to `window_size`
-            // columns, always holding the most recent min(P, past_width) tokens left-aligned-
-            // by-recency (write_kv_slice_sliding()'s invariant). row_local is this row's local
-            // index within the real/right-aligned current-chunk segment (may be "negative" for
-            // pad rows - harmless, see fn doc comment).
-            const uint32_t w_valid = std::min(P, past_width);
-            const int64_t row_local = static_cast<int64_t>(row) - static_cast<int64_t>(row_pad);
-            for (uint32_t c = 0; c < past_width; ++c) {
-                const bool valid = c >= (past_width - w_valid);
-                // Window distance check: derived to `c > row_local` - the row_pad
-                // right-alignment offset cancels algebraically because past_width == window_size
-                // by construction for this (narrowed) buffer. See session plan for the derivation.
-                const bool attend = valid && (static_cast<int64_t>(c) > row_local);
-                row_ptr[c] = attend ? kAttend : kMasked;
-            }
+        // Past columns: c in [0, past_width). Past K/V is physically shrunk to `window_size`
+        // columns, always holding the most recent min(P, past_width) tokens left-aligned-
+        // by-recency (write_kv_slice_sliding()'s invariant). row_local is this row's local
+        // index within the real/right-aligned current-chunk segment (may be "negative" for
+        // pad rows - harmless, see fn doc comment).
+        const uint32_t w_valid = std::min(P, past_width);
+        const int64_t row_local = static_cast<int64_t>(row) - static_cast<int64_t>(row_pad);
+        for (uint32_t c = 0; c < past_width; ++c) {
+            const bool valid = c >= (past_width - w_valid);
+            // Window distance check: derived to `c > row_local` - the row_pad
+            // right-alignment offset cancels algebraically because past_width == window_size
+            // by construction for this (narrowed) buffer. See session plan for the derivation.
+            const bool attend = valid && (static_cast<int64_t>(c) > row_local);
+            row_ptr[c] = attend ? kAttend : kMasked;
         }
 
         // Current-chunk diagonal columns: local_c in [0, row_dim), mapped to c = past_width +
@@ -356,7 +346,7 @@ void ov::npuw::util::fill_causal_sliding_mask(ov::SoPtr<ov::ITensor> mask_tensor
         for (uint32_t local_c = 0; local_c < row_dim; ++local_c) {
             const bool valid_key = local_c >= row_pad;
             const bool causal = local_c <= row;
-            const bool window_ok = !window_size.has_value() || (causal && (row - local_c) < *window_size);
+            const bool window_ok = causal && (row - local_c) < window_size;
             const bool attend = valid_key && causal && window_ok;
             row_ptr[past_width + local_c] = attend ? kAttend : kMasked;
         }

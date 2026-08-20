@@ -989,28 +989,18 @@ void ov::npuw::LLMInferRequest::fill_attention_masks(const std::shared_ptr<ov::I
                                                      const int64_t* token_type_ids_real) {
     // See the declaration's doc comment (llm_infer_request.hpp) and
     // ov::npuw::util::fill_causal_sliding_mask()'s doc comment (infer_request_utils.hpp) for the
-    // full design. Every non-hybrid model has neither port, so this is a no-op there.
-    struct MaskPortSpec {
-        const char* name;
-        bool is_sliding;
-    };
-    const MaskPortSpec specs[] = {{layer_names::global_attention_mask, false},
-                                  {layer_names::sliding_window_attention_mask, true}};
-    for (const auto& spec : specs) {
-        const auto it = in_ports.find(spec.name);
-        if (it == in_ports.end()) {
-            continue;
-        }
-        const std::optional<uint32_t> window_size =
-            spec.is_sliding ? std::optional<uint32_t>(m_npuw_llm_compiled_model->m_swa_window_size) : std::nullopt;
-        auto mask_tensor = request->get_tensor(it->second);
-        ov::npuw::util::fill_causal_sliding_mask(mask_tensor,
-                                                 num_stored_tokens_before,
-                                                 num_real_new_tokens,
-                                                 window_size);
-        if (token_type_ids_real != nullptr) {
-            ov::npuw::util::overlay_vision_bidirectional_mask(mask_tensor, token_type_ids_real, num_real_new_tokens);
-        }
+    // full design. Every non-hybrid model has no such port, so this is a no-op there.
+    const auto it = in_ports.find(layer_names::sliding_window_attention_mask);
+    if (it == in_ports.end()) {
+        return;
+    }
+    auto mask_tensor = request->get_tensor(it->second);
+    ov::npuw::util::fill_causal_sliding_mask(mask_tensor,
+                                             num_stored_tokens_before,
+                                             num_real_new_tokens,
+                                             m_npuw_llm_compiled_model->m_swa_window_size);
+    if (token_type_ids_real != nullptr) {
+        ov::npuw::util::overlay_vision_bidirectional_mask(mask_tensor, token_type_ids_real, num_real_new_tokens);
     }
 }
 

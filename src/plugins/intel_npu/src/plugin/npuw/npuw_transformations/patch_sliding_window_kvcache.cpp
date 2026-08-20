@@ -16,6 +16,7 @@
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
+#include "openvino/op/slice.hpp"
 
 namespace {
 
@@ -81,28 +82,40 @@ bool PatchSlidingWindowKVCache::run_on_model(const std::shared_ptr<ov::Model>& m
     // (subtracting input_size here was a correctness bug: with input_size == window_size,
     // e.g. chunked prefill, it collapsed past to 0, silently dropping all history the
     // first row of the chunk should have attended to).
+    // Special case: a FULL one-shot call (`input_size >= kvcache_size`, i.e. regular,
+    // non-chunked prefill processing the entire prompt in a single call) has no separate
+    // past buffer at all - the original graph never concatenates a real past KV here (it's
+    // reshaped to 0-length upstream and typically folded away), and windowing is fully
+    // expressed by the mask CONTENT within the input itself. Forcing a nonzero past here
+    // would shrink/grow the past_key_values Parameter's declared shape without a matching
+    // change to the (already-disconnected) K/V producer, desyncing it from the
+    // `sliding_window_attention_mask` width set below and failing shape validation.
     // Degenerate case: if window_size >= kvcache_size, sliding effectively never kicks
     // in within the model's overall budget, so behave like a regular (non-SWA) layer:
     // past = kvcache_size - input_size.
-    const uint32_t new_past_u32 = (m_window_size < m_kvcache_size)
-                                      ? m_window_size
-                                      : (m_input_size < m_kvcache_size ? (m_kvcache_size - m_input_size) : 0u);
+    const uint32_t new_past_u32 = (m_input_size >= m_kvcache_size)
+                                      ? 0u
+                                      : (m_window_size < m_kvcache_size
+                                             ? m_window_size
+                                             : (m_input_size < m_kvcache_size ? (m_kvcache_size - m_input_size)
+                                                                              : 0u));
     const int64_t new_past = static_cast<int64_t>(new_past_u32);
     const int64_t new_kv_total = new_past + static_cast<int64_t>(m_input_size);
     bool changed = false;
 
-    // Step 0: externalize every self_attn SDPA's mask input to one of two shared Parameters
-    // ("global_attention_mask" / "sliding_window_attention_mask"). Formerly a separate
-    // `CutAttentionMasks` pass that ran BEFORE `ReshapeToStatic`/`kvcache_model->clone()` and
-    // created these Parameters with a *dynamic* shape, relying on a hardcoded shape formula
-    // duplicated in `reshape_to_static.cpp` to size them later. Doing it HERE instead - after
-    // `ReshapeToStatic` already ran on this per-variant clone - lets us read each SDPA's CURRENT
-    // (guaranteed fully static) mask-input shape directly off the about-to-be-discarded in-graph
-    // mask subgraph and reuse it verbatim: a single source of truth, no formula to keep in sync in
-    // a different file. Must run BEFORE the past_key_values shrink below (that logic assumes the
-    // graph is still uniformly `m_kvcache_size`-wide at this point).
+    // Step 0: externalize every SLIDING-WINDOW self_attn SDPA's mask input to a single shared
+    // `sliding_window_attention_mask` Parameter. Only sliding layers need this: Step 1 below
+    // physically SHRINKS sliding layers' past_key_values buffer to `window_size`, which breaks
+    // the shape of whatever native mask subgraph the exporter produced for them, so their mask
+    // must be host-filled against the new, smaller shape instead. Full-attention/causal SDPAs are
+    // intentionally left completely untouched here - their past_key_values is never resized by
+    // this pass, so their native in-graph mask representation (whether an `is_causal=true`
+    // attribute or an explicit mask subgraph) stays perfectly shape-valid on its own and does not
+    // need externalizing. This also avoids the cost of host-constructing and copying a
+    // full-`m_kvcache_size`-wide global mask tensor on every inference call.
+    // Must run BEFORE the past_key_values shrink below (that logic assumes the graph is still
+    // uniformly `m_kvcache_size`-wide at this point).
     {
-        std::shared_ptr<ov::op::v0::Parameter> global_mask_param;
         std::shared_ptr<ov::op::v0::Parameter> sliding_mask_param;
         size_t num_cut = 0;
         for (const auto& node : model->get_ordered_ops()) {
@@ -116,50 +129,32 @@ bool PatchSlidingWindowKVCache::run_on_model(const std::shared_ptr<ov::Model>& m
             if (it != rt_info.end()) {
                 is_sliding = it->second.as<int64_t>() >= 0;
             }
-            const bool has_explicit_mask = sdpa->get_input_size() > kMaskInputIdx;
-            const ov::PartialShape mask_shape =
-                has_explicit_mask ? sdpa->input(kMaskInputIdx).get_partial_shape() : ov::PartialShape::dynamic();
-            auto& mask_param = is_sliding ? sliding_mask_param : global_mask_param;
-            const char* param_name = is_sliding ? "sliding_window_attention_mask" : "global_attention_mask";
-            if (!mask_param) {
-                NPUW_ASSERT(!has_explicit_mask || mask_shape.is_static());
-                const ov::PartialShape param_shape =
-                    mask_shape.is_static() ? mask_shape : ov::PartialShape({m_input_size, m_kvcache_size});
-                mask_param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, param_shape);
-                set_mask_param_name(mask_param, param_name);
-            } else if (has_explicit_mask) {
-                NPUW_ASSERT(mask_shape == mask_param->get_partial_shape());
+            if (!is_sliding) {
+                // Full-attention/causal SDPA - leave its mask input (or is_causal attribute)
+                // exactly as the exporter produced it.
+                continue;
             }
-            if (has_explicit_mask) {
-                sdpa->input(kMaskInputIdx).replace_source_output(mask_param->output(0));
+            // Every SlidingWindow-classified SDPA is guaranteed (by detect_causal_mask.cpp's
+            // matchers) to already carry an explicit, statically-shaped mask input - none of them
+            // are `is_causal`-only.
+            NPUW_ASSERT(sdpa->get_input_size() > kMaskInputIdx);
+            const ov::PartialShape mask_shape = sdpa->input(kMaskInputIdx).get_partial_shape();
+            if (!sliding_mask_param) {
+                NPUW_ASSERT(mask_shape.is_static());
+                sliding_mask_param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, mask_shape);
+                set_mask_param_name(sliding_mask_param, "sliding_window_attention_mask");
             } else {
-                // is_causal-only SDPA (no explicit mask input at all) - SDPA's input ports are
-                // fixed at construction, so gaining one requires replacing the node wholesale with
-                // an equivalent one that has an explicit (non-causal) mask input instead.
-                auto new_sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(sdpa->input_value(0),
-                                                                                         sdpa->input_value(1),
-                                                                                         sdpa->input_value(2),
-                                                                                         mask_param->output(0),
-                                                                                         /*causal=*/false);
-                new_sdpa->set_friendly_name(sdpa->get_friendly_name());
-                ov::replace_node(sdpa, new_sdpa);
+                NPUW_ASSERT(mask_shape == sliding_mask_param->get_partial_shape());
             }
+            sdpa->input(kMaskInputIdx).replace_source_output(sliding_mask_param->output(0));
             ++num_cut;
         }
-        ov::ParameterVector new_params;
-        if (global_mask_param) {
-            new_params.push_back(global_mask_param);
-        }
         if (sliding_mask_param) {
-            new_params.push_back(sliding_mask_param);
-        }
-        if (!new_params.empty()) {
-            model->add_parameters(new_params);
+            model->add_parameters({sliding_mask_param});
             changed = true;
-            LOG_INFO("[SWA] Externalized " << num_cut << " SDPA mask input(s) in '" << model->get_friendly_name()
-                                           << "' (global_attention_mask=" << (global_mask_param != nullptr)
-                                           << ", sliding_window_attention_mask=" << (sliding_mask_param != nullptr)
-                                           << ").");
+            LOG_INFO("[SWA] Externalized " << num_cut
+                                           << " sliding SDPA mask input(s) as 'sliding_window_attention_mask' in '"
+                                           << model->get_friendly_name() << "'.");
         }
     }
 
@@ -200,52 +195,75 @@ bool PatchSlidingWindowKVCache::run_on_model(const std::shared_ptr<ov::Model>& m
     // upstream node, so it works uniformly regardless of how the shape is represented or how many
     // layers currently reuse the same shape-computation subgraph.
     //
-    // NOTE: the attention-mask itself is no longer computed in-graph for a genuine SWA hybrid
-    // model - Step 0 above externalizes it as the `global_attention_mask`/
-    // `sliding_window_attention_mask` model inputs instead, sized directly below in Step 1b. So,
-    // unlike an earlier version of this pass, there is no in-graph causal-mask Slice left to
-    // privatize/correct here.
+    // NOTE: the SLIDING SDPA's OWN mask input is no longer read from any in-graph subgraph for a
+    // genuine SWA hybrid model - Step 0 above already redirected it to the
+    // `sliding_window_attention_mask` model input instead, sized directly below in Step 1b. But
+    // that does NOT mean the ORIGINAL mask-construction subgraph (e.g. a per-layer causal-mask
+    // `Slice(mask, begin, end, ...)` trimming it to the current KV length) is irrelevant here: a
+    // FULL-ATTENTION layer's own native mask Slice can be CSE-shared with a sliding layer's shape
+    // computation exactly like the Broadcast/Reshape case above (same root cause: exporters
+    // frequently reuse one ShapeOf/Gather chain derived from ONE particular layer's `past_key_values`
+    // across MULTIPLE structurally-identical `layers.N.self_attn` blocks, sliding and full alike).
+    // Once Step 1 shrinks a sliding layer's `past_key_values` Parameter, any full-attention layer's
+    // Slice still wired to that SAME shared node silently inherits the sliding layer's new
+    // (wrong-for-it) `new_kv_total`, instead of keeping the model's real `m_kvcache_size` - this is
+    // the exact failure observed in practice: a global/full-attention SDPA's mask input ends up
+    // `[.., window_size + input_size]` instead of `[.., kvcache_size]`. So this Slice's begin/end
+    // bounds must be snapshotted and privatized the same way as Broadcast/Reshape below, for every
+    // self_attn layer (sliding layers' own Slice is normally already dead/unreachable here since
+    // Step 0 disconnected its SDPA consumer, so in practice only full-attention layers' Slice
+    // nodes are found and rebuilt - but the logic stays symmetric/correct either way).
     struct ShapeInputSnapshot {
         std::shared_ptr<ov::Node> consumer;
         size_t input_index;
         size_t layer_idx;
         bool layer_is_sliding;
+        ov::element::Type elem_type;
         std::vector<int64_t> original_values;
     };
     std::vector<ShapeInputSnapshot> shape_snapshots;
     static constexpr size_t kTargetShapeInputIdx = 1;  // Reshape/Broadcast target-shape input.
-    for (const auto& node : model->get_ordered_ops()) {
-        if (!ov::is_type<ov::op::v1::Reshape>(node) && !ov::is_type<ov::op::v3::Broadcast>(node)) {
-            continue;
-        }
+    auto snapshot_kvcache_dim_input = [&](const std::shared_ptr<ov::Node>& node, size_t input_idx) {
         size_t layer_idx = 0;
         if (!try_parse_layer_idx(node->get_friendly_name(), layer_id_regex(), layer_idx)) {
-            continue;
+            return;
         }
-        if (layer_idx >= m_layer_is_sliding.size() || kTargetShapeInputIdx >= node->get_input_size()) {
-            continue;
+        if (layer_idx >= m_layer_is_sliding.size() || input_idx >= node->get_input_size()) {
+            return;
         }
-        auto folded = ov::util::get_constant_from_source(node->input_value(kTargetShapeInputIdx));
+        auto folded = ov::util::get_constant_from_source(node->input_value(input_idx));
         if (!folded) {
             LOG_WARN("[SWA] Layer " << layer_idx << ": " << node->get_type_name() << " '"
-                                    << node->get_friendly_name() << "' input(" << kTargetShapeInputIdx
+                                    << node->get_friendly_name() << "' input(" << input_idx
                                     << ") is not constant-foldable, cannot verify/patch it.");
-            continue;
+            return;
         }
         auto values = folded->cast_vector<int64_t>();
         const auto kv = static_cast<int64_t>(m_kvcache_size);
         const bool has_kvcache_dim =
             std::any_of(values.begin(), values.end(), [kv](int64_t v) { return v == kv || v == -kv; });
         if (!has_kvcache_dim) {
-            // Not a KV-size-dependent shape (e.g. unrelated input in the same self_attn block) -
-            // nothing to guard here.
-            continue;
+            // Not a KV-size-dependent shape/bound (e.g. unrelated input in the same self_attn
+            // block) - nothing to guard here.
+            return;
         }
         shape_snapshots.push_back(ShapeInputSnapshot{node,
-                                                     kTargetShapeInputIdx,
+                                                     input_idx,
                                                      layer_idx,
                                                      m_layer_is_sliding[layer_idx],
+                                                     folded->get_element_type(),
                                                      std::move(values)});
+    };
+    for (const auto& node : model->get_ordered_ops()) {
+        if (ov::is_type<ov::op::v1::Reshape>(node) || ov::is_type<ov::op::v3::Broadcast>(node)) {
+            snapshot_kvcache_dim_input(node, kTargetShapeInputIdx);
+        } else if (ov::is_type<ov::op::v8::Slice>(node)) {
+            // Slice(data, begin, end, step, [axes]): both `begin` (input 1) and `end` (input 2)
+            // can independently carry a current-KV-length bound (e.g. a causal-mask trim's `end`,
+            // or a sliding-window trim's `begin`) - check both.
+            snapshot_kvcache_dim_input(node, 1);
+            snapshot_kvcache_dim_input(node, 2);
+        }
     }
 
     // Step 1: shrink past_key_values Parameter shapes for sliding-window layers.
@@ -373,7 +391,8 @@ bool PatchSlidingWindowKVCache::run_on_model(const std::shared_ptr<ov::Model>& m
                     value_changed = true;
                 }
             }
-            auto new_const = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{values.size()}, values);
+            auto new_const =
+                std::make_shared<ov::op::v0::Constant>(snapshot.elem_type, ov::Shape{values.size()}, values);
             new_const->set_friendly_name(snapshot.consumer->get_friendly_name() + "/swa_shape_patched_" +
                                           std::to_string(snapshot.input_index));
             snapshot.consumer->input(snapshot.input_index).replace_source_output(new_const);

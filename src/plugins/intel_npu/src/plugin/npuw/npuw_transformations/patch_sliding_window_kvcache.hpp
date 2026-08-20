@@ -14,27 +14,29 @@ namespace ov::npuw {
 
 // For a genuine hybrid Sliding-Window-Attention model (e.g. Gemma-4: some decoder layers use a
 // bounded sliding window, others full/causal attention), owns the ENTIRE lifecycle of the
-// externalized attention-mask model inputs, plus reduces the past_key_values buffer size for
-// layers configured as Sliding Window Attention (SWA), e.g. Gemma4's "sliding_attention" layers.
-// Must run AFTER ReshapeToStatic (it reads already-static shapes off the about-to-be-cut mask
-// subgraph, and re-shrinks already-static past_key_values Parameters) and BEFORE DecomposeGQA /
-// value-tensor optimization passes. Runs once per model variant (prefill, each generate kv_size
-// bucket) - each variant needs its own concretely-and-independently-shaped mask Parameters.
+// externalized sliding-window attention-mask model input, plus reduces the past_key_values buffer
+// size for layers configured as Sliding Window Attention (SWA), e.g. Gemma4's "sliding_attention"
+// layers. Must run AFTER ReshapeToStatic (it reads already-static shapes off the about-to-be-cut
+// mask subgraph, and re-shrinks already-static past_key_values Parameters) and BEFORE DecomposeGQA
+// / value-tensor optimization passes. Runs once per model variant (prefill, each generate kv_size
+// bucket) - each variant needs its own concretely-and-independently-shaped mask Parameter.
 //
-// Step 0 (always performed, first): disconnects EVERY ScaledDotProductAttention node's mask input
-// from its in-graph computed mask-construction subgraph (classified Sliding vs. Global via
-// `DetectAttentionMask`'s rt_info, see NPUW_SDPA_MASK_RT_KEY), and reconnects it to one of two new,
-// shared model inputs added here: "sliding_window_attention_mask" (every SlidingWindow-classified
-// SDPA) and "global_attention_mask" (every other SDPA - Causal, or no recognized pattern, matching
-// `detect_swa_layout()`'s has_full semantics). Each new Parameter's shape is read DIRECTLY off the
-// real (guaranteed fully-static, since ReshapeToStatic already ran) mask value it replaces on the
-// first SDPA of its kind encountered - no hardcoded shape formula, single source of truth. Once
-// disconnected, the original in-graph mask-computation subgraph(s) become unreachable and are
-// removed by standard dead-code elimination in the pass manager - no separate cleanup needed. This
-// step used to be a separate `CutAttentionMasks` pass that ran BEFORE `ReshapeToStatic`/
-// `kvcache_model->clone()`, creating dynamic-shape Parameters sized later by a formula duplicated
-// in `reshape_to_static.cpp` - merged here so the mask Parameters' entire lifecycle (create, size,
-// shrink) lives in one place, sized directly from the graph.
+// Step 0 (always performed, first): disconnects every SlidingWindow-classified
+// ScaledDotProductAttention node's mask input (classified via `DetectAttentionMask`'s rt_info, see
+// NPUW_SDPA_MASK_RT_KEY) from its in-graph computed mask-construction subgraph, and reconnects it
+// to a single new shared model input added here: "sliding_window_attention_mask". Its shape is
+// read DIRECTLY off the real (guaranteed fully-static, since ReshapeToStatic already ran) mask
+// value it replaces on the first sliding SDPA encountered - no hardcoded shape formula, single
+// source of truth. Once disconnected, the original in-graph mask-computation subgraph(s) become
+// unreachable and are removed by standard dead-code elimination in the pass manager - no separate
+// cleanup needed.
+//
+// Full-attention/causal SDPAs are intentionally left completely UNTOUCHED by this step: their
+// past_key_values is never resized by Step 1 below, so whatever native mask representation the
+// exporter produced for them (an `is_causal=true` attribute, or an explicit mask subgraph) stays
+// perfectly shape-valid on its own. Externalizing it too would require host-constructing and
+// copying a full-`m_kvcache_size`-wide mask tensor on every inference call for no shape-validity
+// benefit, so it is deliberately avoided.
 //
 // Step 1 (always performed): for every past_key_values.<layer>.key/value Parameter that
 // belongs to a sliding-window layer, shrink its seq_len axis to hold exactly

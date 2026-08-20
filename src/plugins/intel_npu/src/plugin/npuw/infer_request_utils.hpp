@@ -50,21 +50,19 @@ void copy_per_layer_inputs_chunk_to_right(const ov::SoPtr<ov::ITensor>& src,
                                           uint32_t src_offset_tokens,
                                           uint32_t chunk_tokens);
 
-// Fills a per-SDPA additive attention-mask tensor (`global_attention_mask` /
-// `sliding_window_attention_mask`, f32, shape [..., row_dim, col_dim] with all leading dims == 1)
-// with real causal (and, when `window_size` is set, sliding-window) values: 0.0f where the query
-// row may attend to a column, std::numeric_limits<float>::lowest() where it may not.
+// Fills the per-SDPA additive `sliding_window_attention_mask` tensor (f32, shape
+// [..., row_dim, col_dim] with all leading dims == 1) with real sliding-window causal values:
+// 0.0f where the query row may attend to a column, std::numeric_limits<float>::lowest() where it
+// may not.
 //
 // The tensor's last two dims are read directly off its own runtime shape:
 //   - row_dim: this call's query length (`input_size` for the compiled variant).
 //   - col_dim: full key context width - `col_dim - row_dim` ("past_width") is the number of
 //     "past" columns preceding this call's own current-chunk columns.
-// For `global_attention_mask` (window_size == nullopt), past_width spans the whole prior context
-// (past_width == col_dim - row_dim, growing across calls, never physically shrunk). For
-// `sliding_window_attention_mask` (window_size == Some(w)), the past K/V buffer has already been
-// physically shrunk (PatchSlidingWindowKVCache) to `w` columns, always holding the most recent
-// `min(P, w)` tokens left-aligned-by-recency (see write_kv_slice_sliding()'s invariant) -
-// structurally `past_width == w` for this mask.
+// The past K/V buffer has already been physically shrunk (PatchSlidingWindowKVCache) to
+// `window_size` columns, always holding the most recent `min(P, window_size)` tokens
+// left-aligned-by-recency (see write_kv_slice_sliding()'s invariant) - structurally
+// `past_width == window_size`.
 //
 // `P` (num_stored_tokens before this call) and `L` (number of REAL, non-pad new tokens this call,
 // right-aligned within the last `row_dim`/`col_dim` current-chunk positions - `L <= row_dim`) are
@@ -73,7 +71,7 @@ void copy_per_layer_inputs_chunk_to_right(const ov::SoPtr<ov::ITensor>& src,
 void fill_causal_sliding_mask(ov::SoPtr<ov::ITensor> mask_tensor,
                               uint32_t num_stored_tokens_before,
                               uint32_t num_real_new_tokens,
-                              std::optional<uint32_t> window_size);
+                              uint32_t window_size);
 
 // Overlays extra bidirectional visibility for same-image vision tokens on top of an
 // already-filled (via fill_causal_sliding_mask()) mask tensor, mirroring the original HF-exported
