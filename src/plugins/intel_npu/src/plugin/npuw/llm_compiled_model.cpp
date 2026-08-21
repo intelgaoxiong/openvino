@@ -29,6 +29,7 @@
 #include "npuw_transformations/reshape_sliced_head_to_static.hpp"
 #include "npuw_transformations/reshape_to_static.hpp"
 #include "npuw_transformations/right_align_mask_slice_for_conv.hpp"
+#include "npuw_transformations/slice_last_token_prefill.hpp"
 #include "npuw_transformations/slice_out_embeds.hpp"
 #include "npuw_transformations/split_kvcache_into_blocks.hpp"
 #include "openvino/op/convert.hpp"
@@ -672,7 +673,7 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
 
         if (m_swa_window_size > 0) {
             LOG_DEBUG("[SWA] Applying sliding-window KV-cache reduction to generate variant (kv_size=" << kv_size
-                                                                                                        << ").");
+                                                                                                       << ").");
             ov::npuw::PatchSlidingWindowKVCache(m_swa_window_size,
                                                 m_swa_layer_is_sliding,
                                                 kv_size,
@@ -1027,8 +1028,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         // chunked prefill) the past buffer is NOT always empty. The `sliding_window_attention_mask`
         // input is resized to match in the same pass; only the mask's CONTENT (per-query-position
         // staggered banded values, filled by the host-side runtime) differs from the generate case.
-        const uint32_t prefill_input_size = m_use_chunk_prefill ? static_cast<uint32_t>(m_prefill_chunk_size)
-                                                                : m_kvcache_desc.max_prompt_size;
+        const uint32_t prefill_input_size =
+            m_use_chunk_prefill ? static_cast<uint32_t>(m_prefill_chunk_size) : m_kvcache_desc.max_prompt_size;
         LOG_DEBUG("[SWA] Applying sliding-window KV-cache reduction to prefill model.");
         ov::npuw::PatchSlidingWindowKVCache(m_swa_window_size,
                                             m_swa_layer_is_sliding,
@@ -1060,11 +1061,14 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         LOG_DEBUG("Shared LM head: slice the prefill output");
         // KVCache model is already reshaped to [1, max_generation_token_len, embed size],
         // so only apply slice to the Prefill model:
-        ov::npuw::SliceOutEmbeds(axes.batch, m_kvcache_desc.max_generation_token_len).run_on_model(prefill_model);
+        // ov::npuw::SliceOutEmbeds(axes.batch, m_kvcache_desc.max_generation_token_len).run_on_model(prefill_model);
         LOG_DEBUG("Make LM head model with static shapes");
         ov::npuw::ReshapeSlicedHeadToStatic(axes.batch, m_kvcache_desc.max_generation_token_len)
             .run_on_model(lm_head_model);
     }
+
+    LOG_DEBUG("5.0, slice last token at last SDPA for prefill model");
+    ov::npuw::SliceLastTokenPrefill(axes.batch).run_on_model(prefill_model);
 
     LOG_DEBUG("5.1, decompose GroupQueryAttention OP");
     ov::npuw::DecomposeGQA(true).run_on_model(prefill_model);
@@ -1500,8 +1504,7 @@ void ov::npuw::LLMCompiledModel::serialize(std::ostream& raw_stream, const ov::n
             m_kvcache_desc.v_tensors_transposed_gen & m_prefill_chunk_size & m_use_chunk_prefill & m_max_lora_rank &
             m_enable_prefix_caching & m_prefix_caching_block_size & m_prefix_caching_max_num_blocks &
             m_longrope_context_limit & m_is_whisper & m_eos_token_id & m_decomposed_sdpa_size & m_is_eagle &
-            m_is_embedding & m_is_block_kv_cache & m_is_encoder_embedding & m_swa_window_size &
-            m_swa_layer_is_sliding;
+            m_is_embedding & m_is_block_kv_cache & m_is_encoder_embedding & m_swa_window_size & m_swa_layer_is_sliding;
 
         // Write config
         stream & m_cfg;
