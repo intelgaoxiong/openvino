@@ -10,6 +10,7 @@
 
 #include "../logging.hpp"
 #include "../npuw_transformations/detect_causal_mask.hpp"
+#include "../npuw_transformations/propagate_slice.hpp"
 #include "../util.hpp"
 #include "intel_npu/config/npuw.hpp"
 #include "online/compiler.hpp"
@@ -2075,57 +2076,24 @@ void Partitioner::attention(const std::string& func_name) {
                      << model->get_friendly_name() << "...");
     LOG_BLOCK();
 
-    // Try DYNAMIC attention
-    if (attn_mode == "DYNAMIC") {
-        f._attention = ov::npuw::function::Attention::from(f._model);
-        if (f._attention) {
-            LOG_VERB("Done - DYNAMIC attention");
-            return;
-        }
-        LOG_WARN("No dynamic ranges found in the ATTN block");
-    }
-
-    // Try PYRAMID attention
-    if (attn_mode == "PYRAMID") {
-        LOG_DEBUG("Attempting PyramidAttention based on config");
-        f._pyramid_attention = ov::npuw::function::PyramidAttention::from(f._model);
-        if (f._pyramid_attention) {
-            LOG_VERB("Done - PYRAMID attention");
-            return;
-        }
-        LOG_WARN("No pyramid attention found in the ATTN block");
-    }
-
-    // Try HFA (Host Flash Attention)
-    if (attn_mode == "HFA") {
-        LOG_DEBUG("Attempting HostFlashAttention based on config");
-
-        // Consistency check: HostFlashAttention::from() inspects a single representative
-        // instance (f._model) of this repeated "attn" function to decide whether the
-        // compiled tile model can structurally drop the mask input. That decision is only
-        // valid if all funcall instances sharing this function have the same mask kind --
-        // otherwise it's a correctness bug (e.g. a Causal representative stripping a mask
-        // a SlidingWindow instance still needs), not just a missed optimization. This is a
-        // defensive backstop, not the primary separation mechanism: distinct mask kinds
-        // normally yield structurally distinct subgraphs, so partitioning already tends to
-        // keep them in separate functions. If a mix is still found here, disable
-        // mask-skipping for the whole function (safe: only forgoes an optimization).
-        //
-        // NPUW_SDPA_MASK_RT_KEY encodes mask kind + (for sliding window) window size in
-        // one int64_t, so raw-value comparison also catches differing window sizes.
+    // Helper: check that all funcall instances sharing this function have the same mask kind.
+    // HostFlashAttention::from() makes a compile-time decision (based on one representative
+    // instance) about whether to structurally drop the mask input. That decision is only
+    // correct if every instance has the same mask kind -- otherwise it is a correctness bug,
+    // not just a missed optimization. Distinct mask kinds normally produce structurally
+    // distinct subgraphs so partitioning already separates them; this is a defensive backstop.
+    // NPUW_SDPA_MASK_RT_KEY encodes mask kind + sliding-window size in one int64_t.
+    // Returns true when all instances agree (mask-skipping is safe).
+    auto check_mask_consistency = [&]() -> bool {
         std::optional<int64_t> common_mask_value;
-        bool mask_kind_consistent = true;
         for (const auto& mdl : all_functions.at(func_name).mdls) {
-            const auto pattern_nodes = ov::npuw::util::find_sdpa_pattern_nodes(mdl);
-            if (!pattern_nodes.add_node) {
+            const auto pn = ov::npuw::util::find_sdpa_pattern_nodes(mdl);
+            if (!pn.add_node)
                 continue;
-            }
-
             int64_t mask_value = std::numeric_limits<int64_t>::min();
-            const auto& rt_info = pattern_nodes.add_node->get_rt_info();
-            if (auto it = rt_info.find(ov::npuw::NPUW_SDPA_MASK_RT_KEY); it != rt_info.end()) {
+            const auto& rt_info = pn.add_node->get_rt_info();
+            if (auto it = rt_info.find(ov::npuw::NPUW_SDPA_MASK_RT_KEY); it != rt_info.end())
                 mask_value = it->second.as<int64_t>();
-            }
             if (!common_mask_value) {
                 common_mask_value = mask_value;
             } else if (*common_mask_value != mask_value) {
@@ -2136,20 +2104,81 @@ void Partitioner::attention(const std::string& func_name) {
                          << "'. The mask-skipping optimization's compile-time decision is based on a single "
                             "representative instance, which would be unsafe here -- disabling mask skipping for "
                             "this function.");
-                mask_kind_consistent = false;
-                break;
+                return false;
             }
         }
+        return true;
+    };
 
+    // Helper: attempt to create a HostFlashAttention descriptor for f._model.
+    // Returns true on success.
+    auto try_hfa = [&]() -> bool {
         f._host_flash_attention = ov::npuw::function::HostFlashAttention::from(
             f._model,
             cfg.get<::intel_npu::NPUW_ATTN_HFA_FUSED>(),
-            mask_kind_consistent && cfg.get<::intel_npu::NPUW_ATTN_HFA_MASK_SKIPPING>());
-        if (f._host_flash_attention) {
+            check_mask_consistency() && cfg.get<::intel_npu::NPUW_ATTN_HFA_MASK_SKIPPING>());
+        return f._host_flash_attention.has_value();
+    };
+
+    // Helper: attempt to create a PyramidAttention descriptor for f._model.
+    // Returns true on success.
+    auto try_pyramid = [&]() -> bool {
+        f._pyramid_attention = ov::npuw::function::PyramidAttention::from(f._model);
+        return f._pyramid_attention.has_value();
+    };
+
+    if (attn_mode == "DYNAMIC") {
+        f._attention = ov::npuw::function::Attention::from(f._model);
+        if (f._attention) {
+            LOG_VERB("Done - DYNAMIC attention");
+            return;
+        }
+        LOG_WARN("No dynamic ranges found in the ATTN block");
+    }
+
+    if (attn_mode == "PYRAMID") {
+        LOG_DEBUG("Attempting PyramidAttention based on config");
+        if (try_pyramid()) {
+            LOG_VERB("Done - PYRAMID attention");
+            return;
+        }
+        LOG_WARN("No pyramid attention found in the ATTN block");
+    }
+
+    if (attn_mode == "HFA") {
+        LOG_DEBUG("Attempting HostFlashAttention based on config");
+        if (try_hfa()) {
             LOG_VERB("Done - HFA (Host Flash Attention)");
             return;
         }
         LOG_WARN("No host flash attention found in the ATTN block");
+    }
+
+    // WORKLOAD_AWARE: routes each attention function at compile time based on whether
+    // PropagateSliceThroughSDPA sliced Q to seq_len==1 (→ PYRAMID) or left the full
+    // sequence intact (→ HFA). Detected via NPUW_ORIGINAL_QUERY_LENGTH_RT_KEY on MatMul2.
+    if (attn_mode == "WORKLOAD_AWARE") {
+        LOG_DEBUG("WORKLOAD_AWARE mode: detecting slice propagation to route PYRAMID vs HFA");
+        const auto pn = ov::npuw::util::find_sdpa_pattern_nodes(f._model);
+        const auto propagated = ov::npuw::find_propagated_original_query_length(pn.matmul2_node);
+
+        if (propagated.has_value()) {
+            // Sliced layer: Q seq_len == 1 at runtime → PYRAMID
+            LOG_DEBUG("WORKLOAD_AWARE: slice detected (original_query_length=" << *propagated << ") → PYRAMID");
+            if (try_pyramid()) {
+                LOG_VERB("Done - WORKLOAD_AWARE: sliced layer → PYRAMID");
+                return;
+            }
+            LOG_WARN("WORKLOAD_AWARE: sliced layer PYRAMID matching failed for " << func_name);
+        } else {
+            // Full-sequence layer → HFA
+            LOG_DEBUG("WORKLOAD_AWARE: no slice detected → HFA");
+            if (try_hfa()) {
+                LOG_VERB("Done - WORKLOAD_AWARE: full-sequence layer → HFA");
+                return;
+            }
+            LOG_WARN("WORKLOAD_AWARE: full-sequence layer HFA matching failed for " << func_name);
+        }
     }
 }
 
