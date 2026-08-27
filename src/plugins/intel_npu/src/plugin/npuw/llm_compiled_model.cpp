@@ -29,6 +29,7 @@
 #include "npuw_transformations/right_align_mask_slice_for_conv.hpp"
 #include "npuw_transformations/slice_out_embeds.hpp"
 #include "npuw_transformations/split_kvcache_into_blocks.hpp"
+#include "openvino/core/parallel.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/greater.hpp"
 #include "openvino/op/ops.hpp"
@@ -706,24 +707,28 @@ void ov::npuw::LLMCompiledModel::compile_generate_model_variants(
     const std::vector<std::shared_ptr<ov::Model>>& generate_model_variants,
     const std::shared_ptr<const ov::IPlugin>& plugin,
     const ov::AnyMap& generate_config) {
-    // Compile multiple generate model variants with different sizes
     LOG_INFO("Compiling " << m_kvcache_sizes.size() << " generate model variants...");
-    m_generate_compiled_variants.reserve(m_kvcache_sizes.size());
+    m_generate_compiled_variants.resize(m_kvcache_sizes.size());
 
-    for (size_t i = 0; i < m_kvcache_sizes.size(); ++i) {
+    auto compile_one = [&](size_t i) {
         const uint32_t kv_size = m_kvcache_sizes[i];
         LOG_DEBUG("Compiling generate variant " << (i + 1) << "/" << m_kvcache_sizes.size()
                                                 << " with size: " << kv_size);
-
-        // Use the already prepared variant model
-        auto& generate_variant = generate_model_variants[i];
-
-        // Compile the variant
-        auto compiled_variant = m_compiled_model_factory(generate_variant, plugin, generate_config);
-        NPUW_ASSERT(compiled_variant && "Can't create ov::npuw::CompiledModel for generate variant!");
-
-        m_generate_compiled_variants.push_back(compiled_variant);
+        auto compiled = m_compiled_model_factory(generate_model_variants[i], plugin, generate_config);
+        NPUW_ASSERT(compiled && "Can't create ov::npuw::CompiledModel for generate variant!");
+        m_generate_compiled_variants[i] = std::move(compiled);
         LOG_DEBUG("Successfully compiled generate variant with size: " << kv_size);
+    };
+
+    bool par_opt = ::intel_npu::NPUW_PARALLEL_COMPILE::defaultValue();
+    const auto par_opt_it = generate_config.find(std::string(::intel_npu::NPUW_PARALLEL_COMPILE::key()));
+    if (par_opt_it != generate_config.end()) {
+        par_opt = par_opt_it->second.as<bool>();
+    }
+    if (par_opt) {
+        ov::parallel_for(m_kvcache_sizes.size(), compile_one);
+    } else {
+        ov::npuw::util::non_parallel_for(m_kvcache_sizes.size(), compile_one);
     }
 
     // Keep the original compiled model for backward compatibility (using the largest size).
@@ -1078,6 +1083,13 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     const bool prefill_attn_hfa = prefill_attn_hint == ::intel_npu::npuw::llm::AttentionHint::HFA;
     const bool generate_attn_hfa = generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::HFA;
 
+    const bool prefill_attn_workload_aware = prefill_attn_hint == ::intel_npu::npuw::llm::AttentionHint::WORKLOAD_AWARE;
+    const bool generate_attn_workload_aware =
+        generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::WORKLOAD_AWARE;
+    OPENVINO_ASSERT(!generate_attn_workload_aware,
+                    "NPUW_LLM_GENERATE_ATTENTION_HINT=WORKLOAD_AWARE is not supported. "
+                    "WORKLOAD_AWARE attention is only applicable to the prefill stage.");
+
     const bool optimize_v_tensors = m_cfg.get<::intel_npu::NPUW_LLM_OPTIMIZE_V_TENSORS>();
     if (optimize_v_tensors) {
         LOG_DEBUG("Check and apply opt layout");
@@ -1146,7 +1158,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     auto prefill_config =
         prefill_config_opt.value_or(get_default_prefill_config(prefill_model, npudesc)).as<ov::AnyMap>();
 
-    if (prefill_attn_hfa) {
+    if (prefill_attn_hfa || prefill_attn_workload_aware) {
         // Enable the mask-skipping optimization by default; the actual per-layer
         // decision (safe only for Causal, or SlidingWindow whose window already
         // covers the full context) is made independently for each SDPA subgraph in
@@ -1203,7 +1215,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         {"NPUW_UNFOLD_IREQS", "NO"},
     };
 
-    if (m_use_chunk_prefill && (prefill_attn_pyramid || prefill_attn_hfa || prefill_attn_dyn)) {
+    if (m_use_chunk_prefill &&
+        (prefill_attn_pyramid || prefill_attn_hfa || prefill_attn_dyn || prefill_attn_workload_aware)) {
         prefill_config["NPUW_ATTN"] = ::intel_npu::NPUW_LLM_PREFILL_ATTENTION_HINT::toString(prefill_attn_hint);
         merge_config_with(prefill_config, dyn_attn_opts);
         // Gemma-4 E2B/E4B: the SWA<->Global boundary subgraphs (FFN tail + Global Q-proj
@@ -1339,7 +1352,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     // Regularize models for the better partitioning assuming it is a transformer
     // Apply these transformations to all variant models
     {
-        ov::npuw::patterns::regularize::RegularizeSDPA(prefill_attn_dyn || prefill_attn_pyramid || prefill_attn_hfa)
+        ov::npuw::patterns::regularize::RegularizeSDPA(prefill_attn_dyn || prefill_attn_pyramid || prefill_attn_hfa ||
+                                                       prefill_attn_workload_aware)
             .run_on_model(prefill_model);
         for (auto& model_variant : generate_model_variants) {
             ov::npuw::patterns::regularize::RegularizeSDPA(generate_attn_dyn || generate_attn_pyramid ||
@@ -1355,7 +1369,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                         "NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE and NPUW_LLM_ENABLE_PREFIX_CACHING "
                         "cannot be enabled simultaneously — this combination is not yet supported. "
                         "Please disable one of the two options.");
-        if (m_use_chunk_prefill && !m_is_embedding && (prefill_attn_hfa || prefill_attn_pyramid)) {
+        if (m_use_chunk_prefill && !m_is_embedding &&
+            (prefill_attn_hfa || prefill_attn_pyramid || prefill_attn_workload_aware)) {
             const uint32_t block_size = static_cast<uint32_t>(m_prefill_chunk_size);
 
             LOG_DEBUG("Applying SplitKVCacheIntoBlocks (block_size=" << block_size << ")");
@@ -1400,7 +1415,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     // SDPA gets its own independent Concat chain.  This enables TagSDPA/SDPADecomposed to
     // isolate and convert each SDPA to HFA independently (e.g. Gemma-4 L15–L34 reuse
     // L13/L14 KV).
-    if ((prefill_attn_hfa || prefill_attn_pyramid) && !m_is_embedding) {
+    if ((prefill_attn_hfa || prefill_attn_pyramid || prefill_attn_workload_aware) && !m_is_embedding) {
         ov::pass::GraphRewrite rewr;
         rewr.add_matcher<ov::npuw::pass::DuplicateSharedKVConcat>();
         if (rewr.run_on_model(prefill_model)) {
