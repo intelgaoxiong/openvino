@@ -2154,30 +2154,37 @@ void Partitioner::attention(const std::string& func_name) {
         LOG_WARN("No host flash attention found in the ATTN block");
     }
 
-    // WORKLOAD_AWARE: routes each attention function at compile time based on whether
-    // PropagateSliceThroughSDPA sliced Q to seq_len==1 (→ PYRAMID) or left the full
-    // sequence intact (→ HFA). Detected via NPUW_ORIGINAL_QUERY_LENGTH_RT_KEY on MatMul2.
+    // WORKLOAD_AWARE: routes each attention function at compile time based on its full
+    // (Softmax output) context length -- short contexts favor PYRAMID's tiered models,
+    // long contexts favor HFA's tiled execution.
     if (attn_mode == "WORKLOAD_AWARE") {
-        LOG_DEBUG("WORKLOAD_AWARE mode: detecting slice propagation to route PYRAMID vs HFA");
+        constexpr std::size_t kWorkloadAwareContextThreshold = 2048u;
         const auto pn = ov::npuw::util::find_sdpa_pattern_nodes(f._model);
-        const auto propagated = ov::npuw::find_propagated_original_query_length(pn.matmul2_node);
+        std::size_t full_context_length = 0;
+        if (pn.is_valid()) {
+            const auto softmax_output_shape = pn.softmax_node->get_output_shape(0);
+            if (!softmax_output_shape.empty()) {
+                full_context_length = softmax_output_shape.back();
+            }
+        }
+        LOG_DEBUG("WORKLOAD_AWARE mode: routing based on full_context_length=" << full_context_length);
 
-        if (propagated.has_value()) {
-            // Sliced layer: Q seq_len == 1 at runtime → PYRAMID
-            LOG_DEBUG("WORKLOAD_AWARE: slice detected (original_query_length=" << *propagated << ") → PYRAMID");
+        if (full_context_length > 0 && full_context_length <= kWorkloadAwareContextThreshold) {
+            LOG_DEBUG("WORKLOAD_AWARE: full_context_length=" << full_context_length << " <= "
+                                                             << kWorkloadAwareContextThreshold << " → PYRAMID");
             if (try_pyramid()) {
-                LOG_VERB("Done - WORKLOAD_AWARE: sliced layer → PYRAMID");
+                LOG_VERB("Done - WORKLOAD_AWARE: short context → PYRAMID");
                 return;
             }
-            LOG_WARN("WORKLOAD_AWARE: sliced layer PYRAMID matching failed for " << func_name);
+            LOG_WARN("WORKLOAD_AWARE: short-context PYRAMID matching failed for " << func_name);
         } else {
-            // Full-sequence layer → HFA
-            LOG_DEBUG("WORKLOAD_AWARE: no slice detected → HFA");
+            LOG_DEBUG("WORKLOAD_AWARE: full_context_length=" << full_context_length << " > "
+                                                             << kWorkloadAwareContextThreshold << " → HFA");
             if (try_hfa()) {
-                LOG_VERB("Done - WORKLOAD_AWARE: full-sequence layer → HFA");
+                LOG_VERB("Done - WORKLOAD_AWARE: long context → HFA");
                 return;
             }
-            LOG_WARN("WORKLOAD_AWARE: full-sequence layer HFA matching failed for " << func_name);
+            LOG_WARN("WORKLOAD_AWARE: long-context HFA matching failed for " << func_name);
         }
     }
 }
