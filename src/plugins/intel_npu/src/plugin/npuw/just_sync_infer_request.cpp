@@ -1104,22 +1104,6 @@ void ov::npuw::JustInferRequest::unsafe_run_this_prep_next(std::size_t idx, bool
     auto real_idx = comp_model_desc.replaced_by.value_or(idx);
     const std::size_t next_idx = next(idx + 1);
 
-    // Dump the generate model's inputs once, for the very first generated token only
-    // (never for the prefill model, identified by its "_prefill" name suffix).
-    // NB: closures (weights) are only Parameters of the submodel/subrequest itself,
-    // not of the outer m_npuw_model - so dump via the subrequest's compiled model.
-    static bool generate_first_tok_dumped = false;
-    if (idx == 0 && !generate_first_tok_dumped &&
-        m_npuw_model->m_name.find("_prefill") == std::string::npos &&
-        m_npuw_model->m_name.find("_kv") != std::string::npos) {
-        const auto& subrequest = m_subrequests[real_idx];
-        const auto& submodel_inputs = subrequest->get_compiled_model()->inputs();
-        for (std::size_t i = 0u; i < submodel_inputs.size(); ++i) {
-            ov::npuw::dump_tensor(subrequest->get_tensor(submodel_inputs[i]), "input-" + std::to_string(i));
-        }
-        generate_first_tok_dumped = true;
-    }
-
     if (comp_model_desc.replaced_by) {
         // This is a function call!
         if (real_idx == real(next_idx)) {
