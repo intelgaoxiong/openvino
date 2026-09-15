@@ -1078,15 +1078,16 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                 }
                             }
 
-                            if (async) {
-                                request->start_async();
-                                if (state.hfa_runtime_ctx && state.hfa_runtime_ctx->has_state_buffers()) {
-                                    state.hfa_runtime_ctx->prepare_next_state_buffers();
-                                }
-                                request->wait();
-                            } else {
-                                request->infer();
+                            // Always submit through the async entry: a tile model compiled
+                            // with RUN_INFERENCES_SEQUENTIALLY rejects infer(), and
+                            // start_async() plus wait() is the same work. The async flag
+                            // now only decides whether the next state buffers are prepared
+                            // while the tile runs.
+                            request->start_async();
+                            if (async && state.hfa_runtime_ctx && state.hfa_runtime_ctx->has_state_buffers()) {
+                                state.hfa_runtime_ctx->prepare_next_state_buffers();
                             }
+                            request->wait();
                         };
 
                         int64_t mask_tile_offset = 0;
