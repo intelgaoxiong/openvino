@@ -74,6 +74,7 @@ void MoEExecutor::prepare(size_t idx, size_t real_idx, size_t num_sublayers, siz
                                                      pool_size);
         } else {
             m_resources.initialize_expert_iterative_mode(m_config, m_allocator, get_device_name(idx, &desc));
+            m_chunk_stats.init(m_config.num_experts, ov::npuw::profiling_enabled());
         }
     } else {
         LOG_DEBUG("Reusing existing shared MoE config and resources");
@@ -222,17 +223,17 @@ void MoEExecutor::run(size_t real_idx, size_t idx) {
     //   overlapping with NPU execution to hide the per-layer parse overhead.
     if (processing_mode == MoEProcessingMode::EXPERT_BATCH) {
         std::vector<size_t> selected_experts;
-        m_profile->batch["Parse Router Output"].record([&]() {
+        m_profile->batch[tags::kParseRouterOutput].record([&]() {
             selected_experts = ov::npuw::moe::parse_selected_experts_from_router(io.router_scores,
                                                                                  num_experts,
                                                                                  m_token_to_experts,
                                                                                  m_expert_to_tokens);
         });
-        m_profile->batch["Total Expert Batch"].record([&]() {
+        m_profile->batch[tags::kTotalExpertBatch].record([&]() {
             run_expert_batch(idx, real_idx, selected_experts);
         });
     } else {
-        m_profile->iterative["Total Expert Iterative"].record([&]() {
+        m_profile->iterative[tags::kTotalExpertIterative].record([&]() {
             run_expert_iterative(idx);
         });
     }
@@ -296,7 +297,7 @@ void MoEExecutor::run_expert_batch(size_t idx, size_t real_idx, const std::vecto
         }
 
         // Step 2: Configure expert weights
-        m_profile->batch["Unpack Closure"].record([&]() {
+        m_profile->batch[tags::kUnpackClosure].record([&]() {
             unpack_multiple_experts_closure(idx, request, *bound_experts);
         });
 
@@ -333,12 +334,12 @@ void MoEExecutor::run_expert_batch(size_t idx, size_t real_idx, const std::vecto
     request->set_tensor(output_port, output_tensor);
 
     // Step 5: Set unrolled router scores (always needed, even on cache hit)
-    m_profile->batch["Set Router Input"].record([&]() {
+    m_profile->batch[tags::kSetRouterInput].record([&]() {
         set_router_scores(idx, real_idx, selected_experts, request);
     });
 
     // Step 6: Execute inference once for all K experts in parallel
-    m_profile->batch["Expert Inference"].record([&]() {
+    m_profile->batch[tags::kExpertInference].record([&]() {
         request->infer();
     });
 }
@@ -360,11 +361,12 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
     if (m_resources.sorted_chunk_sizes.empty())
         OPENVINO_THROW("MoE: Sorted chunk sizes cannot be empty");
 
-    // Clear output accumulator before accumulating expert outputs
-    std::memset(m_resources.expert_output_accumulator->data(),
-                0,
-                m_resources.expert_output_accumulator->get_byte_size());
-
+    // expert_output_accumulator is not cleared up front (profiled as too heavy for a buffer this
+    // size). Routing is expected to be dense — every (token, expert_slot) cell gets memcpy'd
+    // exactly once by scatter_expert_outputs() — but is_nonzero()'s 1e-6 threshold could filter
+    // out a legitimately selected expert with a tiny/underflowed score, leaving a slot unfilled.
+    // token_slot_count (below) tracks exactly which slots that happens to, so instead we do a
+    // targeted clear of only the missing cells after dispatch — see clear_unfilled_accumulator_slots().
     auto expert_input_source = io.expert_input;
 
     // Use the embed_dim already validated against the accumulator buffer during prepare().
@@ -379,11 +381,33 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
                     "layout may have changed, update embed_dim derivation");
     }
 
-    // num_tokens and num_experts come from config, validated once during prepare().
-    // The router tensor's token dimension is guaranteed to match input_token_count because
-    // both are derived from the same compiled model structure at prepare() time.
+    // num_tokens, num_experts and num_active_experts come from config, validated once
+    // during prepare(). The router tensor's token dimension is guaranteed to match
+    // input_token_count because both are derived from the same compiled model structure
+    // at prepare() time.
     const size_t num_tokens = m_config.input_token_count;
     const size_t num_experts = m_config.num_experts;
+    const size_t num_active_experts = m_config.num_active_experts;
+
+    // Profile::operator[] does a std::map lookup by tag on every call, even when profiling is
+    // disabled. These tags are fixed for the whole call (or, for wait/scatter, keyed by the
+    // small fixed set of compiled chunk sizes) — resolve each Metric& once here instead of
+    // once per dispatch/drain. Kept local to this function rather than in MoEResources, since
+    // these are profiling accessors, not reusable inference resources.
+    using ProfileMetric = std::remove_reference_t<decltype(m_profile->iterative[tags::kUnpackClosure])>;
+    auto& unpack_closure_metric = m_profile->iterative[tags::kUnpackClosure];
+    auto& parse_router_row_metric = m_profile->iterative[tags::kParseRouterRow];
+    auto& get_io_tensors_metric = m_profile->iterative[tags::kGetIOTensors];
+    auto& gather_router_scores_metric = m_profile->iterative[tags::kGatherRouterScores];
+    auto& gather_expert_input_metric = m_profile->iterative[tags::kGatherExpertInput];
+    auto& npu_start_metric = m_profile->iterative[tags::kNpuStart];
+    auto& get_output_tensor_metric = m_profile->iterative[tags::kGetOutputTensor];
+    std::map<size_t, ProfileMetric*> wait_metric;
+    std::map<size_t, ProfileMetric*> scatter_metric;
+    for (size_t cs : m_resources.sorted_chunk_sizes) {
+        wait_metric[cs] = &m_profile->iterative[m_resources.wait_tag.at(cs)];
+        scatter_metric[cs] = &m_profile->iterative[m_resources.scatter_tag.at(cs)];
+    }
 
     // Chunk-size selector
     auto select_chunk = [&](size_t remaining) -> size_t {
@@ -413,7 +437,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
         const size_t key = cs * 2 + (slot & 1);
         auto it = req_expert_state.find(key);
         if (it == req_expert_state.end() || it->second != expert_id) {
-            m_profile->iterative["Unpack Closure"].record([&]() {
+            unpack_closure_metric.record([&]() {
                 unpack_single_expert_closure(idx, req, expert_id);
             });
             req_expert_state[key] = expert_id;
@@ -448,13 +472,18 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
     auto do_drain = [&]() {
         NPUW_ASSERT(inflight.has_value() && "do_drain called with no in-flight item");
         auto& req = get_req(inflight->cs, inflight->req_slot);
-        m_profile->iterative["NPU Wait"].record([&]() {
+        wait_metric.at(inflight->cs)->record([&]() {
             req->wait();
         });
         const auto& data = expert_ring[inflight->ring_idx & 1];
         const auto cm = m_config.compiled_models.at(inflight->cs);
-        auto output = req->get_tensor(cm->outputs()[0]);
-        m_profile->iterative["Scatter Output"].record([&]() {
+        // get_tensor() was previously unattributed overhead sitting between the
+        // NPU Wait and Scatter Output buckets — give it its own bucket.
+        ov::SoPtr<ov::ITensor> output;
+        get_output_tensor_metric.record([&]() {
+            output = req->get_tensor(cm->outputs()[0]);
+        });
+        scatter_metric.at(inflight->cs)->record([&]() {
             ov::npuw::moe::scatter_expert_outputs(output,
                                                   m_resources.expert_output_accumulator,
                                                   data.tokens,
@@ -509,7 +538,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
                 cur.tokens.push_back(token_id);
                 cur.slots.push_back(token_slot_count[token_id]++);
             };
-            m_profile->iterative["Parse Router Row"].record([&]() {
+            parse_router_row_metric.record([&]() {
                 if (parse_ahead.expert_id == expert_id) {
                     // Fast path: token IDs already filtered; only slot updates remain.
                     for (size_t token_id : parse_ahead.tokens) {
@@ -532,18 +561,30 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
 
             // -- Dispatch: slice tokens into chunks and pipeline NPU execution --
             size_t processed = 0;
+            size_t chunks_for_expert = 0;
             while (processed < cur.tokens.size()) {
-                const size_t cs = select_chunk(cur.tokens.size() - processed);
-                const size_t actual = std::min(cs, cur.tokens.size() - processed);
+                const size_t remaining = cur.tokens.size() - processed;
+                const size_t cs = select_chunk(remaining);
+                const size_t actual = std::min(cs, remaining);
                 const size_t s = global_slot & 1;
                 auto& req = get_req(cs, s);
+
+                m_chunk_stats.record_chunk(cs, actual);
+                m_chunk_stats.record_remaining(remaining);
+                ++chunks_for_expert;
 
                 do_unpack(cs, s, req, expert_id);
                 {
                     const auto cm = m_config.compiled_models.at(cs);
-                    auto router_dest = req->get_tensor(cm->inputs()[m_config.router_scores.compiled.value()]);
-                    auto input_dest = req->get_tensor(cm->inputs()[m_config.expert_input.compiled.value()]);
-                    m_profile->iterative["Gather Router Scores"].record([&]() {
+                    // get_tensor() lookups were previously unattributed overhead sitting
+                    // between Unpack Closure and the Gather buckets — give them their own bucket.
+                    ov::SoPtr<ov::ITensor> router_dest;
+                    ov::SoPtr<ov::ITensor> input_dest;
+                    get_io_tensors_metric.record([&]() {
+                        router_dest = req->get_tensor(cm->inputs()[m_config.router_scores.compiled.value()]);
+                        input_dest = req->get_tensor(cm->inputs()[m_config.expert_input.compiled.value()]);
+                    });
+                    gather_router_scores_metric.record([&]() {
                         ov::npuw::moe::gather_router_scores(io.router_scores,
                                                             router_dest,
                                                             expert_id,
@@ -551,7 +592,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
                                                             processed,
                                                             actual);
                     });
-                    m_profile->iterative["Gather Expert Input"].record([&]() {
+                    gather_expert_input_metric.record([&]() {
                         ov::npuw::moe::gather_expert_inputs(expert_input_source,
                                                             input_dest,
                                                             cur.tokens,
@@ -561,7 +602,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
                 }
 
                 // Start NPU first, then drain previous — this creates the CPU/NPU overlap.
-                m_profile->iterative["NPU Start"].record([&]() {
+                npu_start_metric.record([&]() {
                     req->start_async();
                 });
                 if (inflight) {
@@ -572,6 +613,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
                 ++global_slot;
                 processed += actual;
             }
+            m_chunk_stats.record_expert(expert_id, cur.tokens.size(), chunks_for_expert);
 
             // -- Prefetch: scan next expert's row while the last NPU chunk runs --
             if ((expert_id + 1) < num_experts) {
@@ -624,6 +666,17 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
         }
         std::rethrow_exception(original_error);
     }
+
+    // Zero any (token, slot) cells that dense routing was expected to fill but didn't (see
+    // comment above token_slot_count's declaration). No-op in the common case where every
+    // token reached num_active_experts.
+    m_profile->iterative[tags::kClearUnfilledSlots].record([&]() {
+        ov::npuw::moe::clear_unfilled_accumulator_slots(m_resources.expert_output_accumulator,
+                                                         token_slot_count,
+                                                         num_active_experts,
+                                                         embed_dim,
+                                                         num_tokens);
+    });
 }
 
 void MoEExecutor::set_router_scores(size_t idx,
