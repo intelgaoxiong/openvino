@@ -13,7 +13,11 @@
 #include "compiled_model.hpp"
 #include "llm_compiled_model.hpp"
 #include "model_builder.hpp"
+#include "openvino/op/add.hpp"
+#include "openvino/op/constant.hpp"
 #include "openvino/op/fake_convert.hpp"
+#include "openvino/op/parameter.hpp"
+#include "openvino/op/result.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/pass/stateful_to_stateless.hpp"
 #include "openvino/runtime/iplugin.hpp"
@@ -69,8 +73,7 @@ inline std::shared_ptr<ov::Model> build_dynamic_attention_llm_model() {
     for (const auto& input : model->inputs()) {
         const auto& name = input.get_any_name();
         const auto& pshape = input.get_partial_shape();
-        if (name.find("input_ids") != std::string::npos ||
-            name.find("token_type_ids") != std::string::npos) {
+        if (name.find("input_ids") != std::string::npos || name.find("token_type_ids") != std::string::npos) {
             new_shapes[name] = ov::PartialShape{1, kSeq};
         } else if (name.find("attention_mask") != std::string::npos) {
             new_shapes[name] = ov::PartialShape{1, kSeq + kPast};
@@ -113,8 +116,7 @@ inline std::shared_ptr<ov::Model> build_llm_test_model_with_kv_fake_convert(cons
         auto inject_fake_convert = [&](size_t input_idx, const std::string& suffix) {
             auto fake_convert_1 =
                 std::make_shared<ov::op::v13::FakeConvert>(sdpa->input_value(input_idx), scale, fake_convert_type);
-            auto fake_convert_2 =
-                std::make_shared<ov::op::v13::FakeConvert>(fake_convert_1, scale, fake_convert_type);
+            auto fake_convert_2 = std::make_shared<ov::op::v13::FakeConvert>(fake_convert_1, scale, fake_convert_type);
             fake_convert_1->set_friendly_name(sdpa->get_friendly_name() + "/" + suffix + "_1");
             fake_convert_2->set_friendly_name(sdpa->get_friendly_name() + "/" + suffix + "_2");
             sdpa->input(input_idx).replace_source_output(fake_convert_2);
@@ -231,6 +233,32 @@ inline std::shared_ptr<ov::Model> build_gemma4_moe_llm_test_model() {
     ple->output(0).set_names({"per_layer_inputs"});
     model->add_parameters({ple});
     return model;
+}
+
+/// Minimal model with a *consumed* per_layer_inputs parameter (non-zero, dynamic proj_dim),
+/// used to probe LLMCompiledModel's is_per_layer_inputs_model auto-enable path (Gemma-4
+/// E2B/E4B cross-group KV sharing). has_per_layer_inputs() only inspects input names/shapes/
+/// consumers, so a small standalone probe graph is enough - no need for a full LLM topology.
+inline std::shared_ptr<ov::Model> build_per_layer_inputs_probe_model() {
+    auto input_ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{1, -1});
+    input_ids->output(0).set_names({"input_ids"});
+
+    auto attention_mask = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{1, -1});
+    attention_mask->output(0).set_names({"attention_mask"});
+
+    auto position_ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{1, -1});
+    position_ids->output(0).set_names({"position_ids"});
+
+    auto per_layer_inputs = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, -1, -1, -1});
+    per_layer_inputs->output(0).set_names({"per_layer_inputs"});
+
+    auto sibling = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1, 1, 42, 256}, {0.0f});
+    auto add = std::make_shared<ov::op::v1::Add>(per_layer_inputs, sibling);
+    auto result = std::make_shared<ov::op::v0::Result>(add);
+
+    return std::make_shared<ov::Model>(ov::ResultVector{result},
+                                       ov::ParameterVector{input_ids, attention_mask, position_ids, per_layer_inputs},
+                                       "per_layer_inputs_probe_model");
 }
 
 inline std::shared_ptr<ov::Model> build_sliding_window_test_model(size_t window_size = 512,
@@ -354,8 +382,8 @@ public:
 };
 
 struct CompileCall {
-    std::string                friendly_name;
-    ov::AnyMap                 props;
+    std::string friendly_name;
+    ov::AnyMap props;
     std::shared_ptr<ov::Model> model;
 };
 
