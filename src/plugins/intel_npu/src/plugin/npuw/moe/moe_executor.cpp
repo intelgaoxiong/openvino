@@ -369,6 +369,26 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
     const size_t num_experts = m_config.num_experts;
     const size_t num_active_experts = m_config.num_active_experts;
 
+    // Profile::operator[] does a std::map lookup by tag on every call, even when profiling is
+    // disabled. These tags are fixed for the whole call (or, for wait/scatter, keyed by the
+    // small fixed set of compiled chunk sizes) — resolve each Metric& once here instead of
+    // once per dispatch/drain. Kept local to this function rather than in MoEResources, since
+    // these are profiling accessors, not reusable inference resources.
+    using ProfileMetric = std::remove_reference_t<decltype(m_profile->iterative[tags::kUnpackClosure])>;
+    auto& unpack_closure_metric = m_profile->iterative[tags::kUnpackClosure];
+    auto& parse_router_row_metric = m_profile->iterative[tags::kParseRouterRow];
+    auto& get_io_tensors_metric = m_profile->iterative[tags::kGetIOTensors];
+    auto& gather_router_scores_metric = m_profile->iterative[tags::kGatherRouterScores];
+    auto& gather_expert_input_metric = m_profile->iterative[tags::kGatherExpertInput];
+    auto& npu_start_metric = m_profile->iterative[tags::kNpuStart];
+    auto& get_output_tensor_metric = m_profile->iterative[tags::kGetOutputTensor];
+    std::map<size_t, ProfileMetric*> wait_metric;
+    std::map<size_t, ProfileMetric*> scatter_metric;
+    for (size_t cs : m_resources.sorted_chunk_sizes) {
+        wait_metric[cs] = &m_profile->iterative[m_resources.wait_tag.at(cs)];
+        scatter_metric[cs] = &m_profile->iterative[m_resources.scatter_tag.at(cs)];
+    }
+
     // Chunk-size selector
     auto select_chunk = [&](size_t remaining) -> size_t {
         const size_t smallest = m_resources.sorted_chunk_sizes.back();
@@ -397,7 +417,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
         const size_t key = cs * 2 + (slot & 1);
         auto it = req_expert_state.find(key);
         if (it == req_expert_state.end() || it->second != expert_id) {
-            m_profile->iterative[tags::kUnpackClosure].record([&]() {
+            unpack_closure_metric.record([&]() {
                 unpack_single_expert_closure(idx, req, expert_id);
             });
             req_expert_state[key] = expert_id;
@@ -426,18 +446,13 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
     };
     std::optional<InflightItem> inflight;
 
-    // Profile::operator[] does a std::map lookup by tag every call, even when profiling is
-    // disabled — cache these hot-path buckets once instead of once per dispatch/drain.
-    auto& get_output_tensor_metric = m_profile->iterative[tags::kGetOutputTensor];
-    auto& get_io_tensors_metric = m_profile->iterative[tags::kGetIOTensors];
-
     // Drain the in-flight item referenced by `inflight` (wait + scatter).
     // Called both inside the pipeline loop (to drain the previous item while NPU
     // runs the current one) and once after the loop to drain the final item.
     auto do_drain = [&]() {
         NPUW_ASSERT(inflight.has_value() && "do_drain called with no in-flight item");
         auto& req = get_req(inflight->cs, inflight->req_slot);
-        m_profile->iterative[m_resources.wait_tag.at(inflight->cs)].record([&]() {
+        wait_metric.at(inflight->cs)->record([&]() {
             req->wait();
         });
         const auto& data = expert_ring[inflight->ring_idx & 1];
@@ -448,7 +463,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
         get_output_tensor_metric.record([&]() {
             output = req->get_tensor(cm->outputs()[0]);
         });
-        m_profile->iterative[m_resources.scatter_tag.at(inflight->cs)].record([&]() {
+        scatter_metric.at(inflight->cs)->record([&]() {
             ov::npuw::moe::scatter_expert_outputs(output,
                                                   m_resources.expert_output_accumulator,
                                                   data.tokens,
@@ -512,7 +527,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
             cur.slots.clear();
 
             const auto* row = data + expert_id * num_tokens;
-            m_profile->iterative[tags::kParseRouterRow].record([&]() {
+            parse_router_row_metric.record([&]() {
                 if (parse_ahead.expert_id == expert_id) {
                     // Fast path: tokens and slots were already resolved during the
                     // previous expert's prefetch phase — just adopt them directly.
@@ -558,7 +573,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
                         router_dest = req->get_tensor(cm->inputs()[m_config.router_scores.compiled.value()]);
                         input_dest = req->get_tensor(cm->inputs()[m_config.expert_input.compiled.value()]);
                     });
-                    m_profile->iterative[tags::kGatherRouterScores].record([&]() {
+                    gather_router_scores_metric.record([&]() {
                         ov::npuw::moe::gather_router_scores(io.router_scores,
                                                             router_dest,
                                                             expert_id,
@@ -566,7 +581,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
                                                             processed,
                                                             actual);
                     });
-                    m_profile->iterative[tags::kGatherExpertInput].record([&]() {
+                    gather_expert_input_metric.record([&]() {
                         ov::npuw::moe::gather_expert_inputs(expert_input_source,
                                                             input_dest,
                                                             cur.tokens,
@@ -576,7 +591,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
                 }
 
                 // Start NPU first, then drain previous — this creates the CPU/NPU overlap.
-                m_profile->iterative[tags::kNpuStart].record([&]() {
+                npu_start_metric.record([&]() {
                     req->start_async();
                 });
                 if (inflight) {
