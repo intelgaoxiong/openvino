@@ -426,6 +426,11 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
     };
     std::optional<InflightItem> inflight;
 
+    // Profile::operator[] does a std::map lookup by tag every call, even when profiling is
+    // disabled — cache these hot-path buckets once instead of once per dispatch/drain.
+    auto& get_output_tensor_metric = m_profile->iterative[tags::kGetOutputTensor];
+    auto& get_io_tensors_metric = m_profile->iterative[tags::kGetIOTensors];
+
     // Drain the in-flight item referenced by `inflight` (wait + scatter).
     // Called both inside the pipeline loop (to drain the previous item while NPU
     // runs the current one) and once after the loop to drain the final item.
@@ -440,7 +445,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
         // get_tensor() was previously unattributed overhead sitting between the
         // NPU Wait and Scatter Output buckets — give it its own bucket.
         ov::SoPtr<ov::ITensor> output;
-        m_profile->iterative[tags::kGetOutputTensor].record([&]() {
+        get_output_tensor_metric.record([&]() {
             output = req->get_tensor(cm->outputs()[0]);
         });
         m_profile->iterative[m_resources.scatter_tag.at(inflight->cs)].record([&]() {
@@ -549,7 +554,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
                     // between Unpack Closure and the Gather buckets — give them their own bucket.
                     ov::SoPtr<ov::ITensor> router_dest;
                     ov::SoPtr<ov::ITensor> input_dest;
-                    m_profile->iterative[tags::kGetIOTensors].record([&]() {
+                    get_io_tensors_metric.record([&]() {
                         router_dest = req->get_tensor(cm->inputs()[m_config.router_scores.compiled.value()]);
                         input_dest = req->get_tensor(cm->inputs()[m_config.expert_input.compiled.value()]);
                     });
