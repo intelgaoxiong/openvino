@@ -236,7 +236,7 @@ void MoEExecutor::run(size_t real_idx, size_t idx) {
         });
     } else {
         m_profile->iterative[tags::kTotalExpertIterative].record([&]() {
-            run_expert_iterative(idx);
+            run_expert_iterative(idx, m_config.input_token_count, m_resources.expert_output_accumulator);
         });
     }
 
@@ -250,25 +250,13 @@ void MoEExecutor::run_batched(size_t idx,
                               size_t num_tokens) {
     OPENVINO_ASSERT(expert_input && router_scores && output,
                     "MoE run_batched: expert_input/router_scores/output are all required");
-    OPENVINO_ASSERT(num_tokens == m_config.input_token_count,
-                    "MoE run_batched: requested ",
-                    num_tokens,
-                    " tokens but the compiled MoE subgraph[",
-                    idx,
-                    "] only supports ",
-                    m_config.input_token_count,
-                    " (add an input_token_count compiled variant in llm_compiled_model.cpp to enable batching)");
 
     auto& io = m_moe_io[idx];
     io.expert_input = expert_input;
     io.router_scores = router_scores;
-    if (io.outputs.empty()) {
-        io.outputs.resize(1);
-    }
-    io.outputs[0] = output;
 
     m_profile->iterative[tags::kTotalExpertIterative].record([&]() {
-        run_expert_iterative(idx);
+        run_expert_iterative(idx, num_tokens, output);
     });
 }
 
@@ -353,13 +341,13 @@ void MoEExecutor::run_expert_batch(size_t idx, size_t real_idx, const std::vecto
     });
 }
 
-void MoEExecutor::run_expert_iterative(size_t idx) {
+void MoEExecutor::run_expert_iterative(size_t idx, size_t num_tokens, const ov::SoPtr<ov::ITensor>& accumulator) {
     LOG_DEBUG("\n[EXPERT_ITERATIVE] Processing multiple tokens with async inference and overlapping NPU execution");
 
     const auto& io = m_moe_io[idx];
 
     // Precondition checks
-    if (!m_resources.expert_output_accumulator)
+    if (!accumulator)
         OPENVINO_THROW("MoE: Expert output accumulator is null");
     if (!io.expert_input)
         OPENVINO_THROW("MoE: Expert input tensor is not set — prologue must bind it before run()");
@@ -392,9 +380,8 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
 
     // num_tokens, num_experts and num_active_experts come from config, validated once
     // during prepare(). The router tensor's token dimension is guaranteed to match
-    // input_token_count because both are derived from the same compiled model structure
-    // at prepare() time.
-    const size_t num_tokens = m_config.input_token_count;
+    // num_tokens because the caller (run()/run_batched()) sizes accumulator/expert_input/
+    // router_scores consistently with it.
     const size_t num_experts = m_config.num_experts;
     const size_t num_active_experts = m_config.num_active_experts;
 
@@ -494,7 +481,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
         });
         scatter_metric.at(inflight->cs)->record([&]() {
             ov::npuw::moe::scatter_expert_outputs(output,
-                                                  m_resources.expert_output_accumulator,
+                                                  accumulator,
                                                   data.tokens,
                                                   inflight->chunk_start,
                                                   inflight->chunk_tokens,
@@ -680,7 +667,7 @@ void MoEExecutor::run_expert_iterative(size_t idx) {
     // comment above token_slot_count's declaration). No-op in the common case where every
     // token reached num_active_experts.
     m_profile->iterative[tags::kClearUnfilledSlots].record([&]() {
-        ov::npuw::moe::clear_unfilled_accumulator_slots(m_resources.expert_output_accumulator,
+        ov::npuw::moe::clear_unfilled_accumulator_slots(accumulator,
                                                          token_slot_count,
                                                          num_active_experts,
                                                          embed_dim,

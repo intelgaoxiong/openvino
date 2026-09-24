@@ -183,17 +183,16 @@ public:
      * (e.g. HiddenStateBridge::whole()) instead of the per-idx one bound in
      * function_prologue_moe_input/output.
      *
-     * NOTE: num_tokens must match m_config.input_token_count, which is baked in at
-     * model-compile time (see MoEConfig::input_token_count). A batch window spanning
-     * more than one chunk therefore requires the compiled MoE subgraph itself to have
-     * an input_token_count variant for the full window size - this call does not (and
-     * cannot) reshape/rerun a model compiled for a different token count.
+     * The compiled expert-body variants are bucketed by moe_chunk_size and are already
+     * agnostic to the total token count, so no dedicated compiled variant is needed for
+     * the batch window - num_tokens/output are used as-is instead of the shared,
+     * chunk-sized m_resources.expert_output_accumulator.
      *
      * @param idx Function call index (selects m_moe_io[idx] / m_config's compiled model)
      * @param expert_input Token embeddings for the whole batch window
      * @param router_scores Router scores for the whole batch window
-     * @param output Output buffer for the whole batch window
-     * @param num_tokens Total token count in the batch window (must equal input_token_count)
+     * @param output Output accumulator sized for the whole batch window
+     * @param num_tokens Total token count in the batch window
      */
     void run_batched(size_t idx,
                      const ov::SoPtr<ov::ITensor>& expert_input,
@@ -301,8 +300,10 @@ private:
      * execution window of expert k.
      *
      * @param idx Function call index
+     * @param num_tokens Total tokens spanned by expert_input/router_scores/accumulator
+     * @param accumulator Output buffer sized [num_active_experts, 1, num_tokens, expert_hidden_dim]
      */
-    void run_expert_iterative(size_t idx);
+    void run_expert_iterative(size_t idx, size_t num_tokens, const ov::SoPtr<ov::ITensor>& accumulator);
 
     /**
      * @brief Execute batch experts inference (deprecated)
