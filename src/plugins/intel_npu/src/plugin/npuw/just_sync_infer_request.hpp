@@ -99,6 +99,10 @@ public:
     const ov::npuw::v1::subgraphs::CompiledPipeline& subgraph_pipeline(size_t idx) const;
     std::size_t subgraph_param_base(size_t idx) const;
 
+    // Submodel idxs (in infer_range()'s [0, m_num_submodels) space) that invoke the MoE
+    // function body, in ascending order. Empty if the model has no MoE layers.
+    const std::vector<std::size_t>& moe_occurrence_idxs() const;
+
 protected:
     ////////////////////////////////////
     // implement IBaseInferRequest
@@ -178,6 +182,9 @@ protected:
 
     // MoE executor (encapsulates MoE inference logic and profiling)
     std::unique_ptr<ov::npuw::moe::MoEExecutor> m_moe_executor;
+
+    // See moe_occurrence_idxs()
+    std::vector<std::size_t> m_moe_occurrence_idxs;
 
     std::vector<ov::npuw::v1::subgraphs::ISubgraphBehavior::Ptr> m_subgraph_behaviors;
     std::vector<ov::npuw::v1::subgraphs::Context> m_subgraph_runtime_states;

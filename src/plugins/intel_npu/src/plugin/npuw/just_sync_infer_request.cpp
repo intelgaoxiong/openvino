@@ -371,6 +371,7 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
                 }
                 has_moe = true;
                 moe_real_idx = real_idx;
+                m_moe_occurrence_idxs.push_back(i);
             }  // if(moe_experts)
 
             for (size_t out_idx = 0; out_idx < num_outputs; out_idx++) {
@@ -884,6 +885,10 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
         }
     }
     LOG_DEBUG("Done");
+}
+
+const std::vector<std::size_t>& ov::npuw::JustInferRequest::moe_occurrence_idxs() const {
+    return m_moe_occurrence_idxs;
 }
 
 void ov::npuw::JustInferRequest::initialize_moe_executor() {
