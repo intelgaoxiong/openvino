@@ -201,6 +201,24 @@ public:
                      size_t num_tokens);
 
     /**
+     * @brief Override what the downstream (post-MoE) submodel's expert-output input binds to
+     *
+     * For a layer-major chunked-prefill driver: after run_batched() fills a batch-window-sized
+     * output buffer, the downstream submodel still runs chunk-major (once per chunk, see
+     * §4.5.1) and needs each chunk's ROI slice of that buffer instead of the chunk-sized,
+     * shared m_resources.expert_output_accumulator that function_prologue_moe_input binds by
+     * default. Call this with each chunk's slice right before that chunk's downstream
+     * infer_range() call; call clear_downstream_output_override() to restore the default
+     * (legacy, non-batched) binding.
+     *
+     * @param tensor ROI view into the batch-window output buffer for the chunk about to run
+     */
+    void set_downstream_output_override(const ov::SoPtr<ov::ITensor>& tensor);
+
+    // Restores function_prologue_moe_input's default binding (m_resources.expert_output_accumulator).
+    void clear_downstream_output_override();
+
+    /**
      * @brief Handle MoE output binding in function_prologue
      *
      * Called for each output in function_prologue loop.
@@ -268,6 +286,11 @@ private:
     // - sorted_chunk_sizes: shared (single instance)
     // - expert_output_accumulator: shared (single instance)
     MoEResources m_resources;  // Single instance, shared by all sublayers
+
+    // Optional ROI override for the downstream submodel's expert-output input (see
+    // set_downstream_output_override()). Empty means: use the default
+    // m_resources.expert_output_accumulator binding.
+    ov::SoPtr<ov::ITensor> m_downstream_output_override;
 
     // Routing maps (reused across inferences to avoid repeated allocation)
     std::map<size_t, std::vector<size_t>> m_token_to_experts;

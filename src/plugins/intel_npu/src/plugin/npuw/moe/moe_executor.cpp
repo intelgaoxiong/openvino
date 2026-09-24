@@ -166,8 +166,10 @@ bool MoEExecutor::function_prologue_moe_input(size_t idx,
         auto real_request = m_accessor.get_subrequest(real_idx);
 
         if (param_idx == moe_downstream->expert_output_param_idx) {
-            // Bind expert output accumulator
-            auto output_buffer = m_resources.expert_output_accumulator;
+            // Bind expert output accumulator (or the caller-supplied ROI override, see
+            // set_downstream_output_override())
+            auto output_buffer = m_downstream_output_override ? m_downstream_output_override
+                                                               : m_resources.expert_output_accumulator;
             NPUW_ASSERT(output_buffer && "MoE output buffer not available");
             real_request->set_tensor(iport, output_buffer);
         } else {
@@ -258,6 +260,14 @@ void MoEExecutor::run_batched(size_t idx,
     m_profile->iterative[tags::kTotalExpertIterative].record([&]() {
         run_expert_iterative(idx, num_tokens, output);
     });
+}
+
+void MoEExecutor::set_downstream_output_override(const ov::SoPtr<ov::ITensor>& tensor) {
+    m_downstream_output_override = tensor;
+}
+
+void MoEExecutor::clear_downstream_output_override() {
+    m_downstream_output_override = {};
 }
 
 void MoEExecutor::run_expert_batch(size_t idx, size_t real_idx, const std::vector<size_t>& selected_experts) {
