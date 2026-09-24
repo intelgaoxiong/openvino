@@ -204,12 +204,12 @@ public:
      * @brief Override what the downstream (post-MoE) submodel's expert-output input binds to
      *
      * For a layer-major chunked-prefill driver: after run_batched() fills a batch-window-sized
-     * output buffer, the downstream submodel still runs chunk-major (once per chunk, see
-     * §4.5.1) and needs each chunk's ROI slice of that buffer instead of the chunk-sized,
-     * shared m_resources.expert_output_accumulator that function_prologue_moe_input binds by
-     * default. Call this with each chunk's slice right before that chunk's downstream
-     * infer_range() call; call clear_downstream_output_override() to restore the default
-     * (legacy, non-batched) binding.
+     * output buffer, the downstream submodel is still dispatched once per chunk (not merged
+     * into a single call like MoE - see §4.5.1) and needs each chunk's ROI slice of that buffer
+     * instead of the chunk-sized, shared m_resources.expert_output_accumulator that
+     * function_prologue_moe_input binds by default. Call this with each chunk's slice right
+     * before that chunk's downstream infer_range() call; call
+     * clear_downstream_output_override() to restore the default (legacy, non-batched) binding.
      *
      * @param tensor ROI view into the batch-window output buffer for the chunk about to run
      */
