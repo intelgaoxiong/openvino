@@ -254,7 +254,15 @@ void ov::npuw::IBaseInferRequest::infer() {
     if (m_sublayer_timing_enabled) {
         m_sublayer_timings_ms.clear();
     }
-    for (std::size_t idx = 0u; idx < m_num_submodels; idx++) {
+    infer_range(0u, m_num_submodels);
+
+    // Increment counter regardless if dumps etc are enabled or not.
+    m_run_iter++;
+    m_now_idx.reset();
+}
+
+void ov::npuw::IBaseInferRequest::infer_range(std::size_t idx_begin, std::size_t idx_end) {
+    for (std::size_t idx = idx_begin; idx < idx_end; idx++) {
         m_now_idx = idx;
         if (!valid_subrequest(idx)) {
             continue;
@@ -272,10 +280,6 @@ void ov::npuw::IBaseInferRequest::infer() {
         }
         complete_subrequest(idx);
     }
-
-    // Increment counter regardless if dumps etc are enabled or not.
-    m_run_iter++;
-    m_now_idx.reset();
 }
 
 std::size_t ov::npuw::IBaseInferRequest::total_subrequests() const {

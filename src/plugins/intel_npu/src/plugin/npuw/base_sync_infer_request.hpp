@@ -42,6 +42,12 @@ public:
     // Execution API - explicitly "finalize" the infer() here
     void infer() override;  // final - not final yet
 
+    // Dispatches subrequests [idx_begin, idx_end) only, skipping the per-call setup/teardown
+    // (prepare_for_infer(), m_run_iter bookkeeping) that infer() does around the full sweep.
+    // Callers that invoke this directly are responsible for calling prepare_for_infer() once
+    // beforehand.
+    void infer_range(std::size_t idx_begin, std::size_t idx_end);
+
     // I/O APIs - supply default implementations
     ov::SoPtr<ov::ITensor> get_tensor(const ov::Output<const ov::Node>& port) const override;
     void set_tensor(const ov::Output<const ov::Node>& port, const ov::SoPtr<ov::ITensor>& tensor) override;
