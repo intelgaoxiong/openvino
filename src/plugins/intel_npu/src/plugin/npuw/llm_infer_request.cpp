@@ -25,6 +25,17 @@
 namespace {
 using ov::npuw::LLMInferRequest;
 
+// Lincache names carry the layer index as a trailing group, e.g.
+// "cache_params.past.conv.3" / "cache_params.past.ssm.3" -> 3. Returns nullopt if absent.
+std::optional<uint32_t> extract_lincache_layer_idx(const std::string& name) {
+    static const std::regex lincache_layer_regex(R"(cache_params\.(?:past|present)\.(?:conv|ssm)\.(\d+)$)");
+    std::smatch match;
+    if (std::regex_search(name, match, lincache_layer_regex)) {
+        return static_cast<uint32_t>(std::stoul(match[1].str()));
+    }
+    return std::nullopt;
+}
+
 int64_t get_max_position_id(const ov::SoPtr<ov::ITensor>& position_ids) {
     OPENVINO_ASSERT(position_ids->get_size() > 0, "position_ids tensor must not be empty");
     auto* pos_ids_data = position_ids->data<int64_t>();
@@ -901,12 +912,19 @@ void ov::npuw::LLMInferRequest::copy_lincache(
     std::shared_ptr<ov::IAsyncInferRequest> from_request,
     std::shared_ptr<ov::IAsyncInferRequest> to_request,
     const std::unordered_map<std::string, ov::Output<const ov::Node>>& from_ports,
-    const std::unordered_map<std::string, ov::Output<const ov::Node>>& to_ports) {
+    const std::unordered_map<std::string, ov::Output<const ov::Node>>& to_ports,
+    std::optional<uint32_t> layer_filter) {
     namespace uu = ov::npuw::util;
     LOG_DEBUG("Copying linear cache.");
     LOG_BLOCK();
     ov::parallel_for(m_lincache_past_names.size(), [&](size_t out_idx) {
         const auto& input_name = m_lincache_past_names[out_idx];
+        if (layer_filter.has_value()) {
+            const auto name_layer_idx = extract_lincache_layer_idx(input_name);
+            if (!name_layer_idx.has_value() || *name_layer_idx != *layer_filter) {
+                return;
+            }
+        }
         OPENVINO_ASSERT(to_ports.find(input_name) != to_ports.end(),
                         "Incosistent input/output naming for linear cache: ",
                         input_name,

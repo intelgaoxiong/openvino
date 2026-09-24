@@ -5,6 +5,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 
 #include "base_sync_infer_request.hpp"
 #include "llm_compiled_model.hpp"
@@ -54,10 +55,14 @@ protected:
                             const PortsMap& out_ports,
                             uint32_t num_tokens,
                             bool v_transposed) override;
+    // layer_filter: when set, only lincache names belonging to that layer are copied —
+    // used by the layer-major driver, which produces one transformer layer's lincache
+    // output at a time instead of all layers per chunk.
     void copy_lincache(std::shared_ptr<ov::IAsyncInferRequest> from_request,
                        std::shared_ptr<ov::IAsyncInferRequest> to_request,
                        const std::unordered_map<std::string, ov::Output<const ov::Node>>& from_ports,
-                       const std::unordered_map<std::string, ov::Output<const ov::Node>>& to_ports);
+                       const std::unordered_map<std::string, ov::Output<const ov::Node>>& to_ports,
+                       std::optional<uint32_t> layer_filter = std::nullopt);
     // Share lincache tensors from the largest generate variant to all smaller variants so
     // that a variant switch requires no explicit lincache migration. Called once after
     // m_kvcache_strategy->on_initialize() and is strategy-independent.
