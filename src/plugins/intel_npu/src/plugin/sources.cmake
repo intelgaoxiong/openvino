@@ -59,6 +59,8 @@ set(NPUW_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/flux2_compiled_model.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/gqa_compiled_model.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/gqa_compiled_model.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/npuw/hidden_state_bridge.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/npuw/hidden_state_bridge.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/host_flash_attention.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/host_flash_attention.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/infer_request_utils.cpp
