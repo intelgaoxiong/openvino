@@ -839,6 +839,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     const ::intel_npu::npuw::llm::PrefillHint prefill_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_HINT>();
     m_prefill_chunk_size = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>();
     m_use_chunk_prefill = (prefill_hint == ::intel_npu::npuw::llm::PrefillHint::DYNAMIC && m_prefill_chunk_size > 0);
+    m_moe_batch_chunks = m_cfg.get<::intel_npu::NPUW_LLM_MOE_BATCH_CHUNKS>();
+    OPENVINO_ASSERT(m_moe_batch_chunks >= 1, "NPUW_LLM_MOE_BATCH_CHUNKS must be >= 1");
 
     uint32_t max_prompt_len = align_to(m_cfg.get<::intel_npu::NPUW_LLM_MAX_PROMPT_LEN>(), 64u);
     const uint32_t min_response_len = align_to(m_cfg.get<::intel_npu::NPUW_LLM_MIN_RESPONSE_LEN>(), 64u);
@@ -968,6 +970,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     // may clamp the prompt length. Logging earlier would print values that never took effect.
     LOG_VERB("Enabled prefill chunking: " << m_use_chunk_prefill);
     LOG_VERB("Prefill chunk size: " << m_prefill_chunk_size);
+    LOG_VERB("MoE batch chunks: " << m_moe_batch_chunks);
     LOG_VERB("Maximum prompt length: " << max_prompt_len);
 
     ov::npuw::LoraStatefulToStatelessPass().run_on_model(kvcache_model);
@@ -1586,7 +1589,7 @@ void ov::npuw::LLMCompiledModel::serialize(std::ostream& raw_stream, const ov::n
             m_kvcache_desc.v_tensors_transposed_gen & m_prefill_chunk_size & m_use_chunk_prefill & m_max_lora_rank &
             m_enable_prefix_caching & m_prefix_caching_block_size & m_prefix_caching_max_num_blocks &
             m_longrope_context_limit & m_is_whisper & m_eos_token_id & m_decomposed_sdpa_size & m_is_eagle &
-            m_is_embedding & m_is_block_kv_cache & m_is_encoder_embedding & m_swa_window_size;
+            m_is_embedding & m_is_block_kv_cache & m_is_encoder_embedding & m_swa_window_size & m_moe_batch_chunks;
 
         // LongRoPE cos/sin tables: the transformed graphs have npuw_lr_cos/npuw_lr_sin
         // inputs the host must fill every call, but deserialization imports already-
@@ -1784,7 +1787,8 @@ std::shared_ptr<ov::npuw::LLMCompiledModel> ov::npuw::LLMCompiledModel::deserial
             compiled->m_prefix_caching_block_size & compiled->m_prefix_caching_max_num_blocks &
             compiled->m_longrope_context_limit & compiled->m_is_whisper & compiled->m_eos_token_id &
             compiled->m_decomposed_sdpa_size & compiled->m_is_eagle & compiled->m_is_embedding &
-            compiled->m_is_block_kv_cache & compiled->m_is_encoder_embedding & compiled->m_swa_window_size;
+            compiled->m_is_block_kv_cache & compiled->m_is_encoder_embedding & compiled->m_swa_window_size &
+            compiled->m_moe_batch_chunks;
 
         // LongRoPE cos/sin tables - see the matching comment in serialize()
         stream & compiled->m_longrope_tables;
@@ -1992,6 +1996,7 @@ void ov::npuw::LLMCompiledModel::implement_properties() {
                           BIND(npuw::llm::generate_moe_hint, NPUW_LLM_GENERATE_MOE_HINT, get),
                           BIND(npuw::llm::generate_pyramid, NPUW_LLM_GENERATE_PYRAMID, get),
                           BIND(npuw::llm::prefill_chunk_size, NPUW_LLM_PREFILL_CHUNK_SIZE, get),
+                          BIND(npuw::llm::moe_batch_chunks, NPUW_LLM_MOE_BATCH_CHUNKS, get),
                           BIND(npuw::llm::prefill_hint, NPUW_LLM_PREFILL_HINT, getString),
                           BIND(npuw::llm::generate_hint, NPUW_LLM_GENERATE_HINT, getString),
                           BIND(npuw::llm::prefill_attn_hint, NPUW_LLM_PREFILL_ATTENTION_HINT, getString),

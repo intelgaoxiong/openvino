@@ -124,6 +124,9 @@ private:
     KVCacheDesc m_kvcache_desc;
     uint64_t m_prefill_chunk_size = 0;
     bool m_use_chunk_prefill = false;
+    // Number of chunks batched into a single MoE call by the layer-major chunked-prefill
+    // driver (see LayerMajorInferRequest). 1 == old, chunk-major MoE path.
+    uint32_t m_moe_batch_chunks = 1;
     bool m_is_block_kv_cache = false;
     std::shared_ptr<ov::npuw::ICompiledModel_v0> m_kvcache_compiled;
     std::shared_ptr<ov::npuw::ICompiledModel_v0> m_prefill_compiled;
