@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -57,8 +58,20 @@ public:
     // Circular SWA past KV update for the generate model.
     void update_generate(uint32_t num_tokens);
 
+    // Layer-major variant of update_prefill(): scopes the KV copy to a single layer's own
+    // SWA-tagged names, and takes num_stored_before explicitly instead of deriving it from
+    // the shared kvcache_desc.num_stored_tokens counter (meaningless once layers are
+    // visited out of lockstep). Under v1's layer-major restrictions (fixed chunking, no
+    // prefix caching), num_stored_before for chunk c is the same deterministic value for
+    // every layer, so the driver can compute and pass it directly.
+    void update_prefill_for_layer(uint32_t layer_idx, uint32_t num_stored_before, uint32_t num_tokens);
+
     // Fills the externalized sliding-window attention mask input for `request`, and, if
     // present, overlays the vision-bidirectional mask from token type ids.
+    //
+    // NOTE: the mask lives on a single port shared by every SWA layer (see
+    // kSlidingWindowAttentionMaskParamName), so this call is inherently layer-invariant —
+    // it only needs to run once per chunk (e.g. alongside layer 0), not once per layer.
     void fill_attention_masks(const std::shared_ptr<ov::IAsyncInferRequest>& request,
                               const PortsMap& in_ports,
                               uint32_t num_new_tokens,
@@ -70,7 +83,9 @@ private:
                       const PortsMap& out_ports,
                       uint32_t num_tokens,
                       bool v_transposed,
-                      bool use_circular_layout);
+                      bool use_circular_layout,
+                      std::optional<uint32_t> layer_filter = std::nullopt,
+                      std::optional<uint32_t> num_stored_before_override = std::nullopt);
 
     LLMInferRequest& m_request;
     uint32_t m_window_size;

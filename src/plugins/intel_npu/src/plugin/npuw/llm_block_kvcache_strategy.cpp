@@ -405,6 +405,66 @@ void LLMBlockKVCacheStrategy::on_prefill_chunk_done(uint32_t current_prompts_len
     }
 }
 
+uint32_t LLMBlockKVCacheStrategy::layer_num_stored_tokens(uint32_t layer_idx) const {
+    auto it = m_kv_cache_block_managers.find(layer_idx);
+    OPENVINO_ASSERT(it != m_kv_cache_block_managers.end(), "No block managers for layer ", layer_idx);
+    KVCacheBlockManager* manager =
+        it->second.key_manager ? it->second.key_manager.get() : it->second.value_manager.get();
+    OPENVINO_ASSERT(manager, "Layer ", layer_idx, " has neither key nor value block manager.");
+    const auto allocated = manager->get_allocated_blocks();
+    if (allocated.empty()) {
+        return 0u;
+    }
+    const uint32_t full_blocks = static_cast<uint32_t>(allocated.size()) - 1u;
+    return full_blocks * m_block_size + manager->get_block_tokens(allocated.back());
+}
+
+void LLMBlockKVCacheStrategy::on_prefill_chunk_begin_for_layer(uint32_t layer_idx, uint32_t current_prompts_len) {
+    OPENVINO_ASSERT(!m_kv_cache_block_managers.empty(),
+                    "Block-based KV cache is enabled but no block inputs were found. "
+                    "Ensure NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE is only set together with "
+                    "chunk prefill and a supported attention pattern (HFA or Pyramid).");
+
+    load_past_kv_blocks_to_prefill(m_req.m_prefill_request, m_req.m_prefill_in_ports, layer_idx);
+
+    const uint32_t layer_position = layer_num_stored_tokens(layer_idx);
+    bool zero_copy = false;
+    if (layer_position % m_block_size == 0) {
+        zero_copy = redirect_prefill_outputs_to_new_blocks(m_req.m_prefill_request,
+                                                           m_req.m_prefill_out_ports,
+                                                           current_prompts_len,
+                                                           layer_idx,
+                                                           layer_position);
+    }
+    m_zero_copy_last_chunk_per_layer[layer_idx] = zero_copy;
+    if (!zero_copy) {
+        LOG_DEBUG("Layer " << layer_idx << " chunk not block-aligned (" << layer_position << " % " << m_block_size
+                           << " != 0), falling back to copy path");
+        restore_prefill_output_buffers(m_req.m_prefill_request, m_req.m_prefill_out_ports, layer_idx);
+    }
+}
+
+void LLMBlockKVCacheStrategy::on_prefill_chunk_done_for_layer(uint32_t layer_idx,
+                                                              uint32_t current_prompts_len,
+                                                              bool /*is_last*/) {
+    const bool zero_copy = m_zero_copy_last_chunk_per_layer[layer_idx];
+    if (zero_copy) {
+        LOG_DEBUG("Zero-copy prefill complete for layer " << layer_idx << " — no post-inference work needed");
+        return;
+    }
+    const uint32_t write_start = layer_num_stored_tokens(layer_idx);
+    LOG_DEBUG("Copying prefill outputs to blocks for layer " << layer_idx << ": num_tokens=" << current_prompts_len
+                                                             << " kv_position=" << write_start);
+    const auto& kvcache_desc = m_req.m_npuw_llm_compiled_model->m_kvcache_desc;
+    const bool v_transposed = kvcache_desc.v_tensors_transposed_pre;
+    copy_outputs_to_blocks(m_req.m_prefill_request,
+                           m_req.m_prefill_out_ports,
+                           current_prompts_len,
+                           v_transposed,
+                           write_start,
+                           layer_idx);
+}
+
 void LLMBlockKVCacheStrategy::on_generate_kv_init() {
     if (m_kv_cache_block_managers.empty()) {
         return;
@@ -581,12 +641,16 @@ void LLMBlockKVCacheStrategy::continue_prefill(uint32_t keep, uint32_t delta_len
 
 void LLMBlockKVCacheStrategy::load_past_kv_blocks_to_prefill(
     const std::shared_ptr<ov::IAsyncInferRequest>& prefill_request,
-    const PortsMap& prefill_in_ports) {
+    const PortsMap& prefill_in_ports,
+    std::optional<uint32_t> layer_filter) {
     if (m_kv_cache_block_managers.empty()) {
         return;
     }
     LOG_DEBUG("=== Binding Block Tensors to Prefill Model Inputs ===");
     for (const auto& [layer_idx, layer_managers] : m_kv_cache_block_managers) {
+        if (layer_filter.has_value() && layer_idx != *layer_filter) {
+            continue;
+        }
         const std::string layer_idx_str = std::to_string(layer_idx);
         auto bind_kv_blocks = [&](KVCacheBlockManager* manager, const char* kv_type) {
             if (!manager) {
@@ -611,12 +675,19 @@ void LLMBlockKVCacheStrategy::load_past_kv_blocks_to_prefill(
 bool LLMBlockKVCacheStrategy::redirect_prefill_outputs_to_new_blocks(
     const std::shared_ptr<ov::IAsyncInferRequest>& prefill_request,
     const PortsMap& prefill_out_ports,
-    uint32_t num_new_tokens) {
+    uint32_t num_new_tokens,
+    std::optional<uint32_t> layer_filter,
+    std::optional<uint32_t> position_override) {
     if (m_kv_cache_block_managers.empty()) {
         return false;
     }
-    auto& kvcache_desc = m_req.m_npuw_llm_compiled_model->m_kvcache_desc;
-    uint32_t current_position = kvcache_desc.num_stored_tokens;
+    uint32_t current_position;
+    if (position_override.has_value()) {
+        current_position = *position_override;
+    } else {
+        auto& kvcache_desc = m_req.m_npuw_llm_compiled_model->m_kvcache_desc;
+        current_position = kvcache_desc.num_stored_tokens;
+    }
     if (current_position % m_block_size != 0) {
         return false;
     }
@@ -696,6 +767,9 @@ bool LLMBlockKVCacheStrategy::redirect_prefill_outputs_to_new_blocks(
     };
 
     for (const auto& [layer_idx, layer_managers] : m_kv_cache_block_managers) {
+        if (layer_filter.has_value() && layer_idx != *layer_filter) {
+            continue;
+        }
         if (layer_managers.key_manager) {
             process_kv_blocks(layer_idx, layer_managers.key_manager.get(), "key");
         }
@@ -711,7 +785,8 @@ bool LLMBlockKVCacheStrategy::redirect_prefill_outputs_to_new_blocks(
 
 void LLMBlockKVCacheStrategy::restore_prefill_output_buffers(
     const std::shared_ptr<ov::IAsyncInferRequest>& prefill_request,
-    const PortsMap& prefill_out_ports) {
+    const PortsMap& prefill_out_ports,
+    std::optional<uint32_t> layer_filter) {
     if (m_kv_cache_block_managers.empty()) {
         return;
     }
@@ -731,6 +806,9 @@ void LLMBlockKVCacheStrategy::restore_prefill_output_buffers(
     LOG_DEBUG("=== Restoring Original Output Tensors (Non-Zero-Copy Path) ===");
     size_t total_restored = 0;
     for (const auto& [layer_idx, layer_managers] : m_kv_cache_block_managers) {
+        if (layer_filter.has_value() && layer_idx != *layer_filter) {
+            continue;
+        }
         const std::string layer_str = std::to_string(layer_idx);
         for (const char* kv_type : {"key", "value"}) {
             std::string output_name = "present." + layer_str + "." + kv_type;
@@ -850,7 +928,8 @@ void LLMBlockKVCacheStrategy::copy_outputs_to_blocks(const std::shared_ptr<ov::I
                                                      const PortsMap& src_ports,
                                                      uint32_t num_tokens,
                                                      bool v_transposed,
-                                                     uint32_t current_kv_position) {
+                                                     uint32_t current_kv_position,
+                                                     std::optional<uint32_t> layer_filter) {
     namespace uu = ov::npuw::util;
     auto& kvcache_desc = m_req.m_npuw_llm_compiled_model->m_kvcache_desc;
     auto& compiled = request->get_compiled_model();
@@ -865,6 +944,9 @@ void LLMBlockKVCacheStrategy::copy_outputs_to_blocks(const std::shared_ptr<ov::I
         }
         const bool is_key = info_it->second.is_key;
         const uint32_t layer_idx = info_it->second.layer_idx;
+        if (layer_filter.has_value() && layer_idx != *layer_filter) {
+            continue;
+        }
 
         auto it = m_kv_cache_block_managers.find(layer_idx);
         if (it == m_kv_cache_block_managers.end()) {

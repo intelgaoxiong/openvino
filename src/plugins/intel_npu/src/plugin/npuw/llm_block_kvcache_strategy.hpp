@@ -135,6 +135,20 @@ public:
     // block pool to it, releasing all suffix bindings.
     void continue_prefill(uint32_t keep, uint32_t delta_len) override;
 
+    // -------------------------------------------------------------------------
+    // Layer-major variants (NPUW_LLM_MOE_BATCH_CHUNKS): scope one chunk's bookkeeping
+    // to a single transformer layer's own KV ports. The write position is derived from
+    // that layer's own block-manager state via layer_num_stored_tokens(), NOT from the
+    // shared kvcache_desc.num_stored_tokens counter (which only reflects a single,
+    // whole-model-wide chunk progress and is meaningless once layers are visited
+    // out of lockstep).
+    void on_prefill_chunk_begin_for_layer(uint32_t layer_idx, uint32_t current_prompts_len);
+    void on_prefill_chunk_done_for_layer(uint32_t layer_idx, uint32_t current_prompts_len, bool is_last);
+
+    // Tokens already persisted in this layer's own KV blocks, derived purely from that
+    // layer's block manager state (allocated block count + last block's token count).
+    uint32_t layer_num_stored_tokens(uint32_t layer_idx) const;
+
 private:
     friend struct ov::test::npuw::LLMContinuedPrefillTestAccess;
 
@@ -163,11 +177,15 @@ private:
     // Core KV copy/bind engine (shared by prefill and generate paths)
     // -------------------------------------------------------------------------
 
+    // layer_filter: when set, only the given layer's KV output ports are copied — used by
+    // the *_for_layer() driver hooks so a single (layer, chunk) call never touches other
+    // layers' (possibly stale, not-yet-produced) present.* tensors.
     void copy_outputs_to_blocks(const std::shared_ptr<ov::IAsyncInferRequest>& request,
                                 const PortsMap& src_ports,
                                 uint32_t num_tokens,
                                 bool v_transposed,
-                                uint32_t current_kv_position);
+                                uint32_t current_kv_position,
+                                std::optional<uint32_t> layer_filter = std::nullopt);
 
     void update_generate_bindings(uint32_t old_num_tokens,
                                   uint32_t new_num_tokens,
@@ -178,14 +196,21 @@ private:
     // -------------------------------------------------------------------------
 
     void load_past_kv_blocks_to_prefill(const std::shared_ptr<ov::IAsyncInferRequest>& prefill_request,
-                                        const PortsMap& prefill_in_ports);
+                                        const PortsMap& prefill_in_ports,
+                                        std::optional<uint32_t> layer_filter = std::nullopt);
 
+    // position_override: when set, used as the write position instead of reading
+    // kvcache_desc.num_stored_tokens — required by the *_for_layer() hooks, since that
+    // shared counter does not reflect any single layer's own progress under layer-major.
     bool redirect_prefill_outputs_to_new_blocks(const std::shared_ptr<ov::IAsyncInferRequest>& prefill_request,
                                                 const PortsMap& prefill_out_ports,
-                                                uint32_t num_new_tokens);
+                                                uint32_t num_new_tokens,
+                                                std::optional<uint32_t> layer_filter = std::nullopt,
+                                                std::optional<uint32_t> position_override = std::nullopt);
 
     void restore_prefill_output_buffers(const std::shared_ptr<ov::IAsyncInferRequest>& prefill_request,
-                                        const PortsMap& prefill_out_ports);
+                                        const PortsMap& prefill_out_ports,
+                                        std::optional<uint32_t> layer_filter = std::nullopt);
 
     // -------------------------------------------------------------------------
     // Data members
@@ -217,6 +242,10 @@ private:
 
     // Whether the most recent on_prefill_chunk_begin() chose the zero-copy path.
     bool m_zero_copy_last_chunk = false;
+
+    // Per-layer equivalent of m_zero_copy_last_chunk, populated/read only by the
+    // *_for_layer() hooks (layer-major driver). Keyed by layer_idx.
+    std::unordered_map<uint32_t, bool> m_zero_copy_last_chunk_per_layer;
 
     // Block size in tokens — fixed at on_initialize() time, equal to m_prefill_chunk_size.
     // Cached here to avoid repeated map lookups into m_kv_cache_block_managers.

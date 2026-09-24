@@ -19,6 +19,19 @@ ov::npuw::SwaKVCacheHelper::SwaKVCacheHelper(LLMInferRequest& request, uint32_t 
     : m_request(request),
       m_window_size(window_size) {}
 
+namespace {
+// SWA-managed names carry the layer index right before the ".swa." segment, e.g.
+// "past_key_values.0.swa.key" -> 0. Returns nullopt if the pattern is not found.
+std::optional<uint32_t> extract_swa_layer_idx(const std::string& name) {
+    static const std::regex swa_layer_regex(R"(\.(\d+)\.swa\.)");
+    std::smatch match;
+    if (std::regex_search(name, match, swa_layer_regex)) {
+        return static_cast<uint32_t>(std::stoul(match[1].str()));
+    }
+    return std::nullopt;
+}
+}  // namespace
+
 void ov::npuw::SwaKVCacheHelper::share_across_generate_variants() {
     if (m_request.m_swa_past_names.empty()) {
         return;
@@ -175,7 +188,9 @@ void ov::npuw::SwaKVCacheHelper::update_cache(const std::shared_ptr<ov::IAsyncIn
                                               const PortsMap& out_ports,
                                               uint32_t num_tokens,
                                               bool v_transposed,
-                                              bool use_circular_layout) {
+                                              bool use_circular_layout,
+                                              std::optional<uint32_t> layer_filter,
+                                              std::optional<uint32_t> num_stored_before_override) {
     if (m_request.m_swa_past_names.empty()) {
         return;
     }
@@ -184,6 +199,12 @@ void ov::npuw::SwaKVCacheHelper::update_cache(const std::shared_ptr<ov::IAsyncIn
 
     ov::parallel_for(m_request.m_swa_past_names.size(), [&](size_t i) {
         const auto& input_name = m_request.m_swa_past_names[i];
+        if (layer_filter.has_value()) {
+            const auto name_layer_idx = extract_swa_layer_idx(input_name);
+            if (!name_layer_idx.has_value() || *name_layer_idx != *layer_filter) {
+                return;
+            }
+        }
         OPENVINO_ASSERT(in_ports.find(input_name) != in_ports.end(),
                         "There is no ",
                         input_name,
@@ -199,8 +220,11 @@ void ov::npuw::SwaKVCacheHelper::update_cache(const std::shared_ptr<ov::IAsyncIn
         const auto& kv_dim = (output_name.find("value") != std::string::npos && v_transposed) ? 3u : kvcache_desc.dim;
         auto src_tensor = request->get_tensor(out_ports.at(output_name));
 
-        // num_stored_tokens was already advanced by the caller past the tokens written here.
-        const uint32_t num_stored_before = kvcache_desc.num_stored_tokens - num_tokens;
+        // num_stored_tokens was already advanced by the caller past the tokens written here,
+        // unless an explicit override is supplied (layer-major driver: the shared counter
+        // does not reflect this layer's own progress once layers run out of lockstep).
+        const uint32_t num_stored_before =
+            num_stored_before_override.value_or(kvcache_desc.num_stored_tokens - num_tokens);
         if (use_circular_layout) {
             uu::write_swa_kv_slice_circular(dst_tensor, src_tensor, kv_dim, kv_dim, num_stored_before, num_tokens);
         } else {
@@ -217,6 +241,20 @@ void ov::npuw::SwaKVCacheHelper::update_prefill(uint32_t num_tokens) {
                  num_tokens,
                  kvcache_desc.v_tensors_transposed_pre,
                  /*use_circular_layout=*/false);
+}
+
+void ov::npuw::SwaKVCacheHelper::update_prefill_for_layer(uint32_t layer_idx,
+                                                          uint32_t num_stored_before,
+                                                          uint32_t num_tokens) {
+    auto& kvcache_desc = m_request.m_npuw_llm_compiled_model->m_kvcache_desc;
+    update_cache(m_request.m_prefill_request,
+                 m_request.m_prefill_in_ports,
+                 m_request.m_prefill_out_ports,
+                 num_tokens,
+                 kvcache_desc.v_tensors_transposed_pre,
+                 /*use_circular_layout=*/false,
+                 layer_idx,
+                 num_stored_before);
 }
 
 void ov::npuw::SwaKVCacheHelper::update_generate(uint32_t num_tokens) {
