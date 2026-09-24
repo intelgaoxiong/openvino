@@ -75,7 +75,7 @@ private:
     AllocFcn m_alloc;
 };
 
-class JustInferRequest final : public IBaseInferRequest, public ISubrequestAccessor {
+class JustInferRequest : public IBaseInferRequest, public ISubrequestAccessor {
 public:
     explicit JustInferRequest(const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model);
 
@@ -136,6 +136,13 @@ protected:
                              RqPtr request) override;
 
     void function_prologue(std::size_t idx);
+
+    // Resolves the tensor currently bound to idx's param_idx-th input, following the
+    // producer-submodel link (m_submodels_input_to_prev_output) without dispatching idx
+    // itself. Returns an empty SoPtr if param_idx has no such link (e.g. a global input) or
+    // the producer hasn't run yet. Subclasses use this to peek at a repeated function's
+    // input (e.g. MoE's expert_input/router_scores) while skipping the function's own call.
+    ov::SoPtr<ov::ITensor> resolve_prev_output(std::size_t idx, std::size_t param_idx) const;
 
     void unsafe_during(std::size_t real_idx, std::size_t idx, const std::function<void()>& f);
     void unsafe_infer(std::size_t real_idx, std::size_t idx);

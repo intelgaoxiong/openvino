@@ -42,6 +42,8 @@ set(NPUW_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/attn/attn_subgraph.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/base_sync_infer_request.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/base_sync_infer_request.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/npuw/chunk_major_moe_infer_request.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/npuw/chunk_major_moe_infer_request.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/common.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/compiled_model.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/npuw/compiled_model.hpp

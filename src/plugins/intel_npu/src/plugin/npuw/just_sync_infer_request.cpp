@@ -779,6 +779,25 @@ void ov::npuw::JustInferRequest::bind_global_results(std::size_t idx) {
     IBaseInferRequest::bind_global_results(idx, m_subrequests[idx]);
 }
 
+ov::SoPtr<ov::ITensor> ov::npuw::JustInferRequest::resolve_prev_output(std::size_t idx, std::size_t param_idx) const {
+    auto link_iter = m_npuw_model->m_submodels_input_to_prev_output.find({idx, param_idx});
+    if (link_iter == m_npuw_model->m_submodels_input_to_prev_output.end()) {
+        return {};  // idx's param_idx is not fed from another submodel's output (e.g. a global input)
+    }
+    std::size_t prod_idx;
+    std::size_t prod_port;
+    std::tie(prod_idx, prod_port) = link_iter->second;
+
+    if (!m_npuw_model->m_compiled_submodels[prod_idx].replaced_by) {
+        // Producer is a normal model -> take its tensor directly
+        const auto& oport = m_npuw_model->m_compiled_submodels[prod_idx].compiled_model->outputs()[prod_port];
+        return m_subrequests[prod_idx]->get_tensor(oport);
+    }
+    // Producer is a function - maybe the same as we're calling now.
+    // Take its tensor from the storage
+    return m_funcall_result.at({prod_idx, prod_port});
+}
+
 void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
     LOG_DEBUG("Preparing Subgraph[" << idx << "] funcall prologue");
     LOG_BLOCK();
@@ -805,25 +824,8 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
         LOG_BLOCK();
         const auto& iport = func_desc.compiled_model->inputs()[i];
 
-        auto link_iter = m_npuw_model->m_submodels_input_to_prev_output.find({idx, i});
-        if (link_iter != m_npuw_model->m_submodels_input_to_prev_output.end()) {
-            std::size_t prod_idx;
-            std::size_t prod_port;
-            std::tie(prod_idx, prod_port) = link_iter->second;
-
-            const auto& i_tensor = [&]() {
-                if (!m_npuw_model->m_compiled_submodels[prod_idx].replaced_by) {
-                    // Producer is a normal model -> take its tensor directly
-                    const auto& oport =
-                        m_npuw_model->m_compiled_submodels[prod_idx].compiled_model->outputs()[prod_port];
-                    return m_subrequests[prod_idx]->get_tensor(oport);
-                } else {
-                    // Producer is a function - maybe the same as we're calling now.
-                    // Take its tensor from the storage
-                    return m_funcall_result.at({prod_idx, prod_port});
-                }
-            }();
-
+        auto i_tensor = resolve_prev_output(idx, i);
+        if (i_tensor) {
             if (is_spatial) {
                 // Spatial case - defer
                 m_spatial_io[real_idx].inputs.at(i) = i_tensor;
@@ -839,7 +841,7 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
                 // Default case
                 m_subrequests[real_idx]->set_tensor(iport, i_tensor);
             }
-        }  // if (link_iter)
+        }  // if (i_tensor)
     }  // for(param_base)
 
     // 2. Unpack the function closure -- right here, if pipelining if not enabled.
