@@ -16,9 +16,9 @@ namespace npuw {
 // input tensors (expert_input/router_scores) without dispatching the MoE call itself, so
 // LLMInferRequest can accumulate them across a chunk window before issuing a single batched
 // MoE call (see MoEExecutor::run_batched).
-class ChunkMajorMoEInferRequest : public JustInferRequest {
+class LayerMajorInferRequest : public JustInferRequest {
 public:
-    explicit ChunkMajorMoEInferRequest(const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model);
+    explicit LayerMajorInferRequest(const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model);
 
     // Peeks at the tensor currently bound to submodel idx's param_idx-th input by following
     // the producer link, without running idx. Empty if there's no such link or the producer
