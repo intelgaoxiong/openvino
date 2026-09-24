@@ -243,6 +243,35 @@ void MoEExecutor::run(size_t real_idx, size_t idx) {
     LOG_DEBUG("========== MoE Expert Inference Completed ==========");
 }
 
+void MoEExecutor::run_batched(size_t idx,
+                              const ov::SoPtr<ov::ITensor>& expert_input,
+                              const ov::SoPtr<ov::ITensor>& router_scores,
+                              const ov::SoPtr<ov::ITensor>& output,
+                              size_t num_tokens) {
+    OPENVINO_ASSERT(expert_input && router_scores && output,
+                    "MoE run_batched: expert_input/router_scores/output are all required");
+    OPENVINO_ASSERT(num_tokens == m_config.input_token_count,
+                    "MoE run_batched: requested ",
+                    num_tokens,
+                    " tokens but the compiled MoE subgraph[",
+                    idx,
+                    "] only supports ",
+                    m_config.input_token_count,
+                    " (add an input_token_count compiled variant in llm_compiled_model.cpp to enable batching)");
+
+    auto& io = m_moe_io[idx];
+    io.expert_input = expert_input;
+    io.router_scores = router_scores;
+    if (io.outputs.empty()) {
+        io.outputs.resize(1);
+    }
+    io.outputs[0] = output;
+
+    m_profile->iterative[tags::kTotalExpertIterative].record([&]() {
+        run_expert_iterative(idx);
+    });
+}
+
 void MoEExecutor::run_expert_batch(size_t idx, size_t real_idx, const std::vector<size_t>& selected_experts) {
     LOG_DEBUG("\n[EXPERT_BATCH] Processing single token with " << selected_experts.size() << " experts in parallel");
 

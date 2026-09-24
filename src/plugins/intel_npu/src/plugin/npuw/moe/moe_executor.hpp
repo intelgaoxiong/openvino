@@ -175,6 +175,33 @@ public:
                                      const ov::SoPtr<ov::ITensor>& i_tensor);
 
     /**
+     * @brief Execute MoE inference on an externally-supplied, multi-chunk-batched buffer
+     *
+     * For a layer-major chunked-prefill driver: reuses the existing EXPERT_ITERATIVE
+     * chunk-bucketing/double-buffering machinery in run_expert_iterative() unchanged,
+     * just against a caller-owned I/O buffer that already spans the whole batch window
+     * (e.g. HiddenStateBridge::whole()) instead of the per-idx one bound in
+     * function_prologue_moe_input/output.
+     *
+     * NOTE: num_tokens must match m_config.input_token_count, which is baked in at
+     * model-compile time (see MoEConfig::input_token_count). A batch window spanning
+     * more than one chunk therefore requires the compiled MoE subgraph itself to have
+     * an input_token_count variant for the full window size - this call does not (and
+     * cannot) reshape/rerun a model compiled for a different token count.
+     *
+     * @param idx Function call index (selects m_moe_io[idx] / m_config's compiled model)
+     * @param expert_input Token embeddings for the whole batch window
+     * @param router_scores Router scores for the whole batch window
+     * @param output Output buffer for the whole batch window
+     * @param num_tokens Total token count in the batch window (must equal input_token_count)
+     */
+    void run_batched(size_t idx,
+                     const ov::SoPtr<ov::ITensor>& expert_input,
+                     const ov::SoPtr<ov::ITensor>& router_scores,
+                     const ov::SoPtr<ov::ITensor>& output,
+                     size_t num_tokens);
+
+    /**
      * @brief Handle MoE output binding in function_prologue
      *
      * Called for each output in function_prologue loop.
