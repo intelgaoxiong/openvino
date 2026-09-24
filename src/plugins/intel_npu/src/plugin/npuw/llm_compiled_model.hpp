@@ -127,6 +127,9 @@ private:
     // Number of chunks batched into a single MoE call by the layer-major chunked-prefill
     // driver (see LayerMajorInferRequest). 1 == old, chunk-major MoE path.
     uint32_t m_moe_batch_chunks = 1;
+    // Cached result of is_moe_model() on the original input model, so it survives past the
+    // constructor for the create_base_infer_request() layer-major/chunk-major selection.
+    bool m_has_moe = false;
     bool m_is_block_kv_cache = false;
     std::shared_ptr<ov::npuw::ICompiledModel_v0> m_kvcache_compiled;
     std::shared_ptr<ov::npuw::ICompiledModel_v0> m_prefill_compiled;

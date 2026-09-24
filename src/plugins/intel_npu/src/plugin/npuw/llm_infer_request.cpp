@@ -12,6 +12,7 @@
 
 #include "infer_request_utils.hpp"
 #include "kv_cache_sliding_window_manager.hpp"
+#include "layer_major_infer_request.hpp"
 #include "llm_block_kvcache_strategy.hpp"
 #include "llm_compiled_model.hpp"
 #include "llm_continuous_kvcache_strategy.hpp"
@@ -332,7 +333,22 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     m_kvcache_in_ports = m_generate_variant_in_ports.at(m_kvcache_request);
     m_kvcache_out_ports = m_generate_variant_out_ports.at(m_kvcache_request);
 
-    m_prefill_base_request = compiled_model->m_prefill_compiled->create_base_infer_request();
+    // Layer-major chunked-prefill MoE driver: batches every layer's MoE call across the whole
+    // chunk window instead of once per chunk (see LayerMajorInferRequest). Only relevant when
+    // chunked prefill is active, the model has MoE layers, and the user asked for it via
+    // NPUW_LLM_MOE_BATCH_CHUNKS > 1; otherwise falls back to the existing chunk-major path
+    // unchanged.
+    const bool use_layer_major_moe =
+        compiled_model->m_has_moe && compiled_model->m_use_chunk_prefill && compiled_model->m_moe_batch_chunks > 1;
+    if (use_layer_major_moe) {
+        auto* prefill_compiled_model = dynamic_cast<ov::npuw::CompiledModel*>(compiled_model->m_prefill_compiled.get());
+        OPENVINO_ASSERT(prefill_compiled_model,
+                        "NPUW: NPUW_LLM_MOE_BATCH_CHUNKS > 1 requires the production CompiledModel "
+                        "implementation for the prefill submodel");
+        m_prefill_base_request = prefill_compiled_model->create_layer_major_infer_request();
+    } else {
+        m_prefill_base_request = compiled_model->m_prefill_compiled->create_base_infer_request();
+    }
     m_prefill_request = compiled_model->m_prefill_compiled->wrap_async_infer_request(m_prefill_base_request);
 
     // Register every tensor name of a port, not just get_any_name(): kv-cache copy derives lookup

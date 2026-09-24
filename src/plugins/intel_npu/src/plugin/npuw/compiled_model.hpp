@@ -79,6 +79,7 @@ public:
 
 // Forward declarations
 class InferRequest;
+class LayerMajorInferRequest;
 struct CompiledModelDescTestAccessor;
 
 namespace v1::subgraphs {
@@ -131,6 +132,10 @@ public:
 
     // ICompiledModel_v0 overrides
     std::shared_ptr<IBaseInferRequest> create_base_infer_request() const override;
+    // Builds a LayerMajorInferRequest directly (bypassing the Unfold/Just selection in
+    // create_base_infer_request()) for the layer-major chunked-prefill MoE driver. See
+    // LLMInferRequest's prefill base-request construction.
+    std::shared_ptr<LayerMajorInferRequest> create_layer_major_infer_request() const;
     std::shared_ptr<ov::IAsyncInferRequest> wrap_async_infer_request(
         std::shared_ptr<IBaseInferRequest> internal_request) const override;
     std::string submodel_device(std::size_t idx) const override;

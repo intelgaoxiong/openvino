@@ -15,6 +15,7 @@
 #include "gqa_compiled_model.hpp"
 #include "intel_npu/npu_private_properties.hpp"
 #include "just_sync_infer_request.hpp"
+#include "layer_major_infer_request.hpp"
 #include "logging.hpp"
 #include "moe/moe_subgraph.hpp"
 #include "openvino/core/parallel.hpp"
@@ -2714,6 +2715,19 @@ std::shared_ptr<ov::npuw::IBaseInferRequest> ov::npuw::CompiledModel::create_bas
     } else {
         result = std::make_shared<ov::npuw::JustInferRequest>(non_const_this_sptr);
     }
+    NPUW_ASSERT(result);
+    return result;
+}
+
+std::shared_ptr<ov::npuw::LayerMajorInferRequest> ov::npuw::CompiledModel::create_layer_major_infer_request() const {
+    // The layer-major chunked-prefill MoE driver (LLMInferRequest::infer_chunked_prefill_layer_major)
+    // needs direct access to LayerMajorInferRequest's HiddenStateBridge accessors, which
+    // JustInferRequest doesn't have. It is otherwise built exactly like the JustInferRequest
+    // branch of create_base_infer_request() - the Unfold path caches direct submodel
+    // references and isn't compatible with the new driver's per-chunk ROI rebinding.
+    auto* non_const_this = const_cast<ov::npuw::CompiledModel*>(this);  // because of const in API
+    auto non_const_this_sptr = std::static_pointer_cast<ov::npuw::CompiledModel>(non_const_this->shared_from_this());
+    auto result = std::make_shared<ov::npuw::LayerMajorInferRequest>(non_const_this_sptr);
     NPUW_ASSERT(result);
     return result;
 }
