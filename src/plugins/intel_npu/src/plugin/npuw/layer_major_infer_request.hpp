@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "hidden_state_bridge.hpp"
 #include "just_sync_infer_request.hpp"
 
 namespace ov {
@@ -24,6 +25,16 @@ public:
     // the producer link, without running idx. Empty if there's no such link or the producer
     // hasn't run yet in this infer_range() call.
     ov::SoPtr<ov::ITensor> peek_prev_output(std::size_t idx, std::size_t param_idx) const;
+
+    // Buffers for the current MoE layer boundary's chunk batch window - filled via
+    // peek_prev_output() as the driver walks the window's chunks, then consumed whole
+    // by MoEExecutor::run_batched(). Reused (re-configured, not reallocated) across layers.
+    HiddenStateBridge& expert_input_bridge();
+    HiddenStateBridge& router_scores_bridge();
+
+private:
+    HiddenStateBridge m_expert_input_bridge;
+    HiddenStateBridge m_router_scores_bridge;
 };
 
 }  // namespace npuw

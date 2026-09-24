@@ -11,3 +11,11 @@ ov::SoPtr<ov::ITensor> ov::npuw::LayerMajorInferRequest::peek_prev_output(std::s
                                                                            std::size_t param_idx) const {
     return resolve_prev_output(idx, param_idx);
 }
+
+ov::npuw::HiddenStateBridge& ov::npuw::LayerMajorInferRequest::expert_input_bridge() {
+    return m_expert_input_bridge;
+}
+
+ov::npuw::HiddenStateBridge& ov::npuw::LayerMajorInferRequest::router_scores_bridge() {
+    return m_router_scores_bridge;
+}
