@@ -153,6 +153,7 @@ private:
     friend struct CompiledModelDescTestAccessor;
     friend class IBaseInferRequest;
     friend class JustInferRequest;
+    friend class LayerMajorInferRequest;
     friend class UnfoldInferRequest;
     friend class MemAccessSim;
     friend class FuncMemMgr;
