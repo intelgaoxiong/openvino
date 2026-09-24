@@ -247,6 +247,17 @@ public:
         return m_chunk_stats;
     }
 
+    // Submodel input param_idx (as seen in function_prologue_moe_input) bound to expert_input /
+    // router_scores. nullopt until prepare() has run at least once. Lets a layer-major driver
+    // resolve LayerMajorInferRequest::bridge_for_link(idx, *expert_input_param_idx()) without
+    // hand-computing which param_idx a role corresponds to.
+    std::optional<size_t> expert_input_param_idx() const {
+        return m_config.expert_input.original;
+    }
+    std::optional<size_t> router_scores_param_idx() const {
+        return m_config.router_scores.original;
+    }
+
 private:
     // === Dependency injection ===
     ISubrequestAccessor& m_accessor;  // Access to JustInferRequest internals
