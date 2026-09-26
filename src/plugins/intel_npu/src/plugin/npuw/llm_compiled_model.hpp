@@ -126,7 +126,7 @@ private:
     bool m_use_chunk_prefill = false;
     // Number of chunks batched into a single MoE call by the layer-major chunked-prefill
     // driver (see LayerMajorInferRequest). 1 == old, chunk-major MoE path.
-    uint32_t m_moe_batch_chunks = 1;
+    uint32_t m_moe_batch_chunks = 0;
     // Cached result of is_moe_model() on the original input model, so it survives past the
     // constructor for the create_base_infer_request() layer-major/chunk-major selection.
     bool m_has_moe = false;

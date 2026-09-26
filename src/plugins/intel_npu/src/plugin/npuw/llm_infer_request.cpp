@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
+#include <iostream>
 #include <regex>
 #include <sstream>
 
@@ -335,6 +337,9 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     m_generate_base_requests.reserve(num_variants);
     for (size_t i = 0; i < num_variants; ++i) {
         auto base_req = compiled_model->m_generate_compiled_variants[i]->create_base_infer_request();
+        // Generate/decode runs infer() once per token - cap NPUW_DUMP_IO to the first token
+        // only, or a multi-token generation would dump the whole submodel set per token.
+        base_req->limit_dump_to_first_iter();
         m_generate_base_requests.push_back(base_req);
         register_generate_request(compiled_model->m_generate_compiled_variants[i]->wrap_async_infer_request(base_req));
     }
@@ -345,16 +350,22 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     m_kvcache_out_ports = m_generate_variant_out_ports.at(m_kvcache_request);
 
     // Layer-major chunked-prefill MoE driver: batches every layer's MoE call across the whole
-    // chunk window instead of once per chunk (see LayerMajorInferRequest). Only relevant when
-    // chunked prefill is active, the model has MoE layers, and the user asked for it via
-    // NPUW_LLM_MOE_BATCH_CHUNKS > 1; otherwise falls back to the existing chunk-major path
-    // unchanged.
-    const bool use_layer_major_moe =
-        compiled_model->m_has_moe && compiled_model->m_use_chunk_prefill && compiled_model->m_moe_batch_chunks > 1;
+    // chunk window instead of once per chunk (see LayerMajorInferRequest). Relevant whenever
+    // chunked prefill is active, the model has MoE layers, and NPUW_LLM_MOE_BATCH_CHUNKS >= 1
+    // (default 0 keeps the original chunk-major infer_chunked_prefill() path). At
+    // moe_batch_chunks==1 it just skips the cross-chunk MoE batching (no perf gain over the
+    // plain per-chunk driver), but still runs through the same fused-segment infer_range()s
+    // (see LayerGroup's declaration comment), so it's the same code path validated at any group
+    // size.
+    // DEBUG escape hatch: forces the original infer_chunked_prefill() path even when the model
+    // has MoE, for side-by-side NPUW_DUMP_IO comparison against the layer-major driver above.
+    const bool debug_force_chunk_major = std::getenv("NPUW_DEBUG_FORCE_CHUNK_MAJOR") != nullptr;
+    const bool use_layer_major_moe = !debug_force_chunk_major && compiled_model->m_has_moe &&
+                                     compiled_model->m_use_chunk_prefill && compiled_model->m_moe_batch_chunks >= 1;
     if (use_layer_major_moe) {
         auto* prefill_compiled_model = dynamic_cast<ov::npuw::CompiledModel*>(compiled_model->m_prefill_compiled.get());
         OPENVINO_ASSERT(prefill_compiled_model,
-                        "NPUW: NPUW_LLM_MOE_BATCH_CHUNKS > 1 requires the production CompiledModel "
+                        "NPUW: layer-major chunked prefill requires the production CompiledModel "
                         "implementation for the prefill submodel");
         m_prefill_base_request = prefill_compiled_model->create_layer_major_infer_request();
     } else {
@@ -1071,6 +1082,115 @@ static void print_prefill_sublayer_timing_report(
     std::cerr << std::fixed << std::setprecision(1) << std::setw(cw) << grand_avg << "\n\n";
 }
 
+void ov::npuw::LLMInferRequest::prepare_prefill_chunk_masks_and_positions(ov::SoPtr<ov::ITensor> attention_mask,
+                                                                          ov::SoPtr<ov::ITensor> position_ids,
+                                                                          uint64_t current_prompts_len,
+                                                                          uint64_t num_stored_tokens_before) {
+    const uint64_t chunk_prompt_len = m_npuw_llm_compiled_model->m_prefill_chunk_size;
+    auto attn_mask_in_tensor = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask));
+    auto pos_ids_in_tensor = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::position_ids));
+
+    // Populate the attention mask for the present chunk
+    // For the already processed tokens, they will be added into the attention mask after inference call
+    size_t last_chunk_offset = attn_mask_in_tensor->get_size() - chunk_prompt_len;
+    if (current_prompts_len < chunk_prompt_len) {
+        // We will populate current_prompts_len on the right side of attention mask for the processing tokens
+        // If the current prompt length is smaller than the chunk prompt length,
+        // clear the last chunk of the attention mask to ensure non-relevant tokens are masked
+        ov::npuw::util::fill_tensor<int64_t>(attn_mask_in_tensor, 0, last_chunk_offset);
+    }
+
+    std::copy_n(attention_mask->data<int64_t>() + num_stored_tokens_before,
+                current_prompts_len,
+                attn_mask_in_tensor->data<int64_t>() + attn_mask_in_tensor->get_size() - current_prompts_len);
+
+    // NB: Regular LLM uses 2D position_ids [BATCH, SEQ_LEN], Qwen2.5 VL/Omni, Qwen3.5 VL use 3D position_ids
+    // [3, BATCH, SEQ_LEN]
+    // Copy postion ids with considering the 3D position_ids
+    // The caller tensor is delta-relative during a continued prefill.
+    auto last_dim = position_ids->get_shape().size() - 1;
+    const uint32_t pos_src_offset = static_cast<uint32_t>(num_stored_tokens_before - m_continued_prefill_base);
+    auto actual_position_ids_slice =
+        ov::npuw::util::make_tensor_slice(position_ids,
+                                          static_cast<uint32_t>(last_dim),
+                                          pos_src_offset,
+                                          pos_src_offset + static_cast<uint32_t>(current_prompts_len));
+
+    auto pos_ids_slice =
+        ov::npuw::util::make_tensor_slice(pos_ids_in_tensor,
+                                          static_cast<uint32_t>(last_dim),
+                                          static_cast<uint32_t>(chunk_prompt_len - current_prompts_len),
+                                          static_cast<uint32_t>(chunk_prompt_len));
+
+    // Copy with proper stride handling
+    NPUW_ASSERT(pos_ids_slice._ptr &&
+                "null slice of position IDs tensor — source tensor may be uninitialized or have wrong shape");
+    actual_position_ids_slice->copy_to(pos_ids_slice._ptr);
+
+    // Update history size for dynamic context:
+    // dynamic attention selector needs history size to determin the past KV shape and attention mask shape
+    // The base request is absent when a test factory builds plain sub-requests.
+    if (m_prefill_base_request) {
+        m_prefill_base_request->update_history_size(static_cast<int64_t>(num_stored_tokens_before));
+    }
+
+    // Fill the SWA attention mask for this chunk (prefill's past-KV buffer is not a ring).
+    // NB: reads m_kvcache_desc.num_stored_tokens directly - caller must keep it equal to
+    // num_stored_tokens_before at this point (see this function's declaration comment).
+    m_swa_cache->fill_attention_masks(m_prefill_request,
+                                      m_prefill_in_ports,
+                                      static_cast<uint32_t>(current_prompts_len),
+                                      /*use_circular_layout=*/false);
+}
+
+void ov::npuw::LLMInferRequest::prepare_prefill_chunk_front_inputs(ov::SoPtr<ov::ITensor> input_ids,
+                                                                   ov::SoPtr<ov::ITensor> token_type_ids,
+                                                                   uint64_t current_prompts_len,
+                                                                   uint64_t num_stored_tokens_before) {
+    const uint64_t chunk_prompt_len = m_npuw_llm_compiled_model->m_prefill_chunk_size;
+    // For LLM, model accepts 2d inputs_ids[BATCH, SEQ_LEN]
+    // For VLM, model accepts 3d inputs_embeds[BATCH, SEQ_LEN, EMB_SIZE]
+    const bool is_input_embeds = input_ids->get_shape().size() != 2;
+    const auto input_ids_elem_size = input_ids->get_element_type().size();
+    auto input_ids_in_tensor = m_prefill_request->get_tensor(m_prefill_in_ports.at(m_input_ids_name));
+
+    // Caller tensors hold only the delta during a continued prefill, so they are
+    // indexed relative to the absolute base the continuation started at. The
+    // base is zero for an ordinary prefill, keeping this the absolute position.
+    auto current_prefill_bytes = current_prompts_len * input_ids_elem_size;
+    auto prefilled_bytes = (num_stored_tokens_before - m_continued_prefill_base) * input_ids_elem_size;
+    if (is_input_embeds) {
+        current_prefill_bytes *= input_ids->get_shape().back();
+        prefilled_bytes *= input_ids->get_shape().back();
+    }
+
+    ov::npuw::util::fill_tensor_bytes(input_ids_in_tensor, 0u);
+    std::copy_n(reinterpret_cast<uint8_t*>(input_ids->data()) + prefilled_bytes,
+                current_prefill_bytes,
+                reinterpret_cast<uint8_t*>(input_ids_in_tensor->data()) + input_ids_in_tensor->get_byte_size() -
+                    current_prefill_bytes);
+
+    const auto token_type_ids_it = m_prefill_in_ports.find(layer_names::token_type_ids);
+    if (token_type_ids_it != m_prefill_in_ports.end()) {
+        OPENVINO_ASSERT(token_type_ids,
+                        "token_type_ids input is provided, but the prefill model does not have a token_type_ids port.");
+        auto token_type_ids_in_tensor = m_prefill_request->get_tensor(token_type_ids_it->second);
+
+        // Gemma4-26B-A4B MoE: token_type_ids is [BATCH, SEQ_LEN].
+        // clear the tail window only for last chunk, then right-align current tokens.
+        const size_t total_len = token_type_ids_in_tensor->get_size();
+        if (current_prompts_len < chunk_prompt_len) {
+            // Skip clear for full chunks since copy_n overwrites the whole window.
+            std::fill_n(token_type_ids_in_tensor->data<int64_t>() + total_len - chunk_prompt_len,
+                        chunk_prompt_len,
+                        int64_t{0});
+        }
+        std::copy_n(token_type_ids->data<int64_t>() + num_stored_tokens_before,
+                    current_prompts_len,
+                    token_type_ids_in_tensor->data<int64_t>() + total_len - current_prompts_len);
+    }
+}
+
 void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> input_ids,
                                                       ov::SoPtr<ov::ITensor> attention_mask,
                                                       ov::SoPtr<ov::ITensor> position_ids,
@@ -1080,15 +1200,10 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                                                       ov::SoPtr<ov::ITensor> deepstack_visual_embeds) {
     LOG_DEBUG("Calling chunked inference for prefill model.");
     LOG_BLOCK();
+    std::cout << "Starting chunked prefill inference." << std::endl;
 
     const auto input_prompt_len = input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM];
 
-    // For LLM, model accepts 2d inputs_ids[BATCH, SEQ_LEN]
-    // For VLM, model accepts 3d inputs_embeds[BATCH, SEQ_LEN, EMB_SIZE]
-    bool is_input_embeds = input_ids->get_shape().size() == 2 ? false : true;
-
-    const auto input_ids_elem_size = input_ids->get_element_type().size();
-    auto input_ids_in_tensor = m_prefill_request->get_tensor(m_prefill_in_ports.at(m_input_ids_name));
     const uint64_t chunk_prompt_len = m_npuw_llm_compiled_model->m_prefill_chunk_size;
 
     // DeepStack (Qwen3-VL): the deepstack injection is scattered per chunk inside the loop
@@ -1101,16 +1216,6 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
     }
 
     auto attn_mask_in_tensor = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask));
-    auto pos_ids_in_tensor = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::position_ids));
-
-    const auto token_type_ids_it = m_prefill_in_ports.find(layer_names::token_type_ids);
-    const bool has_token_type_ids = token_type_ids_it != m_prefill_in_ports.end();
-    ov::SoPtr<ov::ITensor> token_type_ids_in_tensor;
-    if (has_token_type_ids) {
-        OPENVINO_ASSERT(token_type_ids,
-                        "token_type_ids input is provided, but the prefill model does not have a token_type_ids port.");
-        token_type_ids_in_tensor = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::token_type_ids));
-    }
 
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
 
@@ -1154,58 +1259,14 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                 cache_context.restore_prefix_cache = false;
             }
 
-            // Populate the attention mask for the present chunk
-            // For the already processed tokens, they will be added into the attention mask after inference call
-            size_t last_chunk_offset = attn_mask_in_tensor->get_size() - chunk_prompt_len;
-            if (current_prompts_len < chunk_prompt_len) {
-                // We will populate current_prompts_len on the right side of attention mask for the processing tokens
-                // If the current prompt length is smaller than the chunk prompt length,
-                // clear the last chunk of the attention mask to ensure non-relevant tokens are masked
-                ov::npuw::util::fill_tensor<int64_t>(attn_mask_in_tensor, 0, last_chunk_offset);
-            }
-
-            std::copy_n(attention_mask->data<int64_t>() + kvcache_desc.num_stored_tokens,
-                        current_prompts_len,
-                        attn_mask_in_tensor->data<int64_t>() + attn_mask_in_tensor->get_size() - current_prompts_len);
-
-            // Caller tensors hold only the delta during a continued prefill, so they are
-            // indexed relative to the absolute base the continuation started at. The
-            // base is zero for an ordinary prefill, keeping this the absolute position.
-            auto current_prefill_bytes = current_prompts_len * input_ids_elem_size;
-            auto prefilled_bytes = (kvcache_desc.num_stored_tokens - m_continued_prefill_base) * input_ids_elem_size;
-            if (is_input_embeds) {
-                current_prefill_bytes *= input_ids->get_shape().back();
-                prefilled_bytes *= input_ids->get_shape().back();
-            }
-
-            ov::npuw::util::fill_tensor_bytes(input_ids_in_tensor, 0u);
-            std::copy_n(reinterpret_cast<uint8_t*>(input_ids->data()) + prefilled_bytes,
-                        current_prefill_bytes,
-                        reinterpret_cast<uint8_t*>(input_ids_in_tensor->data()) + input_ids_in_tensor->get_byte_size() -
-                            current_prefill_bytes);
-
-            // NB: Regular LLM uses 2D position_ids [BATCH, SEQ_LEN], Qwen2.5 VL/Omni, Qwen3.5 VL use 3D position_ids
-            // [3, BATCH, SEQ_LEN]
-            // Copy postion ids with considering the 3D position_ids
-            // The caller tensor is delta-relative during a continued prefill.
-            auto last_dim = position_ids->get_shape().size() - 1;
-            const uint32_t pos_src_offset = kvcache_desc.num_stored_tokens - m_continued_prefill_base;
-            auto actual_position_ids_slice =
-                ov::npuw::util::make_tensor_slice(position_ids,
-                                                  static_cast<uint32_t>(last_dim),
-                                                  pos_src_offset,
-                                                  pos_src_offset + static_cast<uint32_t>(current_prompts_len));
-
-            auto pos_ids_slice =
-                ov::npuw::util::make_tensor_slice(pos_ids_in_tensor,
-                                                  static_cast<uint32_t>(last_dim),
-                                                  static_cast<uint32_t>(chunk_prompt_len - current_prompts_len),
-                                                  static_cast<uint32_t>(chunk_prompt_len));
-
-            // Copy with proper stride handling
-            NPUW_ASSERT(pos_ids_slice._ptr &&
-                        "null slice of position IDs tensor — source tensor may be uninitialized or have wrong shape");
-            actual_position_ids_slice->copy_to(pos_ids_slice._ptr);
+            prepare_prefill_chunk_masks_and_positions(attention_mask,
+                                                      position_ids,
+                                                      current_prompts_len,
+                                                      kvcache_desc.num_stored_tokens);
+            prepare_prefill_chunk_front_inputs(input_ids,
+                                               token_type_ids,
+                                               current_prompts_len,
+                                               kvcache_desc.num_stored_tokens);
 
             // DeepStack (Qwen3-VL): scatter only the visual tokens that fall into the current
             // chunk. The chunk's visual_pos_masks slice gives their chunk-local positions, and
@@ -1231,13 +1292,6 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                                                       static_cast<uint32_t>(current_prompts_len));
             }
 
-            // Update history size for dynamic context:
-            // dynamic attention selector needs history size to determin the past KV shape and attention mask shape
-            // The base request is absent when a test factory builds plain sub-requests.
-            if (m_prefill_base_request) {
-                m_prefill_base_request->update_history_size(kvcache_desc.num_stored_tokens);
-            }
-
             // Gemma4 E2B/E4B: copy the current chunk of per_layer_inputs right-aligned on seq_len dim.
             // Source shape: [1, input_prompt_len, num_layers, proj_dim]
             // Dest shape:   [1, chunk_prompt_len, num_layers, proj_dim] (static)
@@ -1249,27 +1303,6 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                     kvcache_desc.num_stored_tokens - m_continued_prefill_base,
                     static_cast<uint32_t>(current_prompts_len));
             }
-
-            // Gemma4-26B-A4B MoE: token_type_ids is [BATCH, SEQ_LEN].
-            // clear the tail window only for last chunk, then right-align current tokens.
-            if (has_token_type_ids) {
-                const size_t total_len = token_type_ids_in_tensor->get_size();
-                if (current_prompts_len < chunk_prompt_len) {
-                    // Skip clear for full chunks since copy_n overwrites the whole window.
-                    std::fill_n(token_type_ids_in_tensor->data<int64_t>() + total_len - chunk_prompt_len,
-                                chunk_prompt_len,
-                                int64_t{0});
-                }
-                std::copy_n(token_type_ids->data<int64_t>() + kvcache_desc.num_stored_tokens,
-                            current_prompts_len,
-                            token_type_ids_in_tensor->data<int64_t>() + total_len - current_prompts_len);
-            }
-
-            // Fill the SWA attention mask for this chunk (prefill's past-KV buffer is not a ring).
-            m_swa_cache->fill_attention_masks(m_prefill_request,
-                                              m_prefill_in_ports,
-                                              static_cast<uint32_t>(current_prompts_len),
-                                              /*use_circular_layout=*/false);
 
             // Prepare KV blocks or bind memory for this chunk via strategy.
             m_kvcache_strategy->on_prefill_chunk_begin(static_cast<uint32_t>(current_prompts_len));
@@ -1332,6 +1365,381 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
     if (enable_prefix_caching) {
         prefix_caching_helper->print_cache_status();
     }
+}
+
+void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::ITensor> input_ids,
+                                                                   ov::SoPtr<ov::ITensor> attention_mask,
+                                                                   ov::SoPtr<ov::ITensor> position_ids,
+                                                                   ov::SoPtr<ov::ITensor> token_type_ids,
+                                                                   ov::SoPtr<ov::ITensor> per_layer_inputs,
+                                                                   ov::SoPtr<ov::ITensor> visual_pos_masks,
+                                                                   ov::SoPtr<ov::ITensor> deepstack_visual_embeds) {
+    LOG_DEBUG("Calling layer-major chunked inference for prefill model (batched MoE).");
+    LOG_BLOCK();
+    std::cout << "Starting layer-major chunked inference for prefill model." << std::endl;
+
+    // v1 scope (design doc moe-batched-chunked-prefill-design.md §6): plain-LLM MoE prefill
+    // only, validated against Gemma4-26B-A4B. VLM/Eagle3/prefix-caching/continued-prefill/
+    // per_layer_inputs each need their own bridging analysis and are out of scope for the
+    // first correctness pass.
+    OPENVINO_ASSERT(!visual_pos_masks && !deepstack_visual_embeds && !per_layer_inputs,
+                    "NPUW: layer-major chunked prefill does not yet support "
+                    "VLM/DeepStack/per_layer_inputs models.");
+    OPENVINO_ASSERT(!m_eagle3_ext.is_eagle3_model(),
+                    "NPUW: layer-major chunked prefill does not yet support Eagle3.");
+    OPENVINO_ASSERT(get_prefix_caching_helper(position_ids) == nullptr,
+                    "NPUW: layer-major chunked prefill does not yet support prefix caching.");
+    OPENVINO_ASSERT(m_continued_prefill_base == 0u,
+                    "NPUW: layer-major chunked prefill does not yet support continued prefill.");
+
+    auto* lm_request = dynamic_cast<LayerMajorInferRequest*>(m_prefill_base_request.get());
+    OPENVINO_ASSERT(lm_request, "NPUW: layer-major chunked prefill requires a LayerMajorInferRequest");
+    auto* block_strategy = dynamic_cast<LLMBlockKVCacheStrategy*>(m_kvcache_strategy.get());
+    OPENVINO_ASSERT(block_strategy,
+                    "NPUW: layer-major chunked prefill requires the "
+                    "Block KV cache strategy (NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE).");
+    auto* moe_executor = lm_request->moe_executor();
+    OPENVINO_ASSERT(moe_executor, "NPUW: layer-major chunked prefill requires an MoE model");
+    const auto expert_input_param_idx = moe_executor->expert_input_param_idx();
+    const auto router_scores_param_idx = moe_executor->router_scores_param_idx();
+    OPENVINO_ASSERT(expert_input_param_idx && router_scores_param_idx,
+                    "NPUW: MoE expert_input/router_scores param indices are not initialized");
+
+    // layer_groups() gives one entry per MoE-bearing layer, in ascending (= transformer layer)
+    // order, derived purely from moe_occurrence_idxs() (see LayerMajorInferRequest::LayerGroup's
+    // declaration comment - a layer's seg_end reaches the NEXT layer's own MoE occurrence, not
+    // just past its own downstream-combine, so that layer's downstream and the next layer's
+    // pre-MoE part run fused in one infer_range() call). v1 assumes every transformer layer has
+    // MoE (true for Gemma4-26B-A4B), so L doubles as the transformer layer_idx used for KV port
+    // naming (m_kvcache_strategy) and SWA port filtering.
+    const auto& layer_groups = lm_request->layer_groups();
+    OPENVINO_ASSERT(!layer_groups.empty(), "NPUW: layer-major chunked prefill requires MoE layers");
+    const std::size_t num_layers = layer_groups.size();
+
+    const auto input_prompt_len = input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM];
+    const uint64_t chunk_prompt_len = m_npuw_llm_compiled_model->m_prefill_chunk_size;
+    const uint32_t moe_batch_chunks = m_npuw_llm_compiled_model->m_moe_batch_chunks;
+    auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
+
+    // Locates the token-count axis of shape. Every tensor bridged across chunks here comes
+    // from a submodel occurrence statically compiled to a chunk_prompt_len-wide window, but
+    // layouts differ (masks/positions are [.., chunk_prompt_len] with token last, while MoE
+    // expert_input/router_scores put hidden_dim/a singleton last instead - see
+    // moe_infer_utils.hpp), so the chunk axis can't be assumed to sit at a fixed position and
+    // must be located by its extent instead.
+    auto find_chunk_dim = [chunk_prompt_len](const ov::Shape& shape) -> uint32_t {
+        for (std::size_t d = 0; d < shape.size(); ++d) {
+            if (shape[d] == chunk_prompt_len) {
+                return static_cast<uint32_t>(d);
+            }
+        }
+        OPENVINO_THROW("NPUW: layer-major chunked prefill: could not find a chunk_prompt_len(=",
+                      chunk_prompt_len,
+                      ") axis in shape ",
+                      shape);
+    };
+
+    // Snapshots live's current content into bridge's per-chunk slot chunk_id, (re)configuring
+    // the bridge for a group_size-chunk window sized from live's own shape (no-op if already
+    // configured with the same shape - see HiddenStateBridge::configure()).
+    auto capture = [&find_chunk_dim](HiddenStateBridge& bridge,
+                      const ov::SoPtr<ov::ITensor>& live,
+                      std::size_t chunk_id,
+                      std::size_t group_size) {
+        const auto& shape = live->get_shape();
+        const auto chunk_dim = find_chunk_dim(shape);
+        bridge.configure(
+            group_size,
+            chunk_dim,
+            live->get_element_type(),
+            shape,
+            [](const ov::element::Type& type, const ov::Shape& s) {
+                return ov::npuw::util::allocMem(type, s, "CPU", nullptr);
+            });
+        live->copy_to(bridge.slot(chunk_id)._ptr);
+    };
+    // Inverse of capture(): overwrites live's current content with bridge's per-chunk slot.
+    auto inject = [](HiddenStateBridge& bridge, const ov::SoPtr<ov::ITensor>& live, std::size_t chunk_id) {
+        bridge.slot(chunk_id)->copy_to(live._ptr);
+    };
+
+    // Dedicated to this driver only (not graph-discovered like Category A/B): buffers the
+    // batched MoE output across the group, scattered back to each chunk's slot via
+    // set_downstream_output_override() (see MoEExecutor::run_batched doc comment).
+    HiddenStateBridge moe_output_bridge;
+
+    // Sublayer timing: this driver interleaves infer_range() across many (layer, chunk) pairs
+    // rather than one infer() call per chunk, so a per-chunk breakdown (as chunk-major produces)
+    // doesn't map cleanly here - report a single whole-prefill column instead (same pattern as
+    // infer_whole_prefill).
+    const auto sublayer_counts = m_prefill_base_request->sublayer_call_counts();
+    m_prefill_base_request->enable_sublayer_timing();
+
+    // Global (whole-prefill) chunk counter, distinct from the per-group-local `c` used below -
+    // fed into set_run_iteration() so NPUW_DUMP_IO_ITERS dumps land under the same iter number
+    // chunk-major's infer_chunked_prefill() would use for the same absolute chunk (which bumps
+    // m_run_iter once per infer() call, i.e. once per chunk), letting the two drivers' dumps be
+    // diffed directly for the same (submodel idx, chunk) pair.
+    std::size_t global_chunk_idx = 0;
+
+    uint64_t remaining_prompts = input_prompt_len;
+    while (remaining_prompts > 0) {
+        const uint32_t group_size = static_cast<uint32_t>(
+            std::min<uint64_t>(moe_batch_chunks, (remaining_prompts + chunk_prompt_len - 1) / chunk_prompt_len));
+
+        std::vector<uint64_t> chunk_lens(group_size);
+        std::vector<uint64_t> chunk_stored_before(group_size);
+        uint64_t group_total = 0;
+        {
+            uint64_t rem = remaining_prompts;
+            uint64_t stored = kvcache_desc.num_stored_tokens;
+            for (uint32_t c = 0; c < group_size; ++c) {
+                chunk_lens[c] = std::min<uint64_t>(rem, chunk_prompt_len);
+                chunk_stored_before[c] = stored;
+                rem -= chunk_lens[c];
+                stored += chunk_lens[c];
+                group_total += chunk_lens[c];
+            }
+        }
+        const bool group_has_last_chunk = (remaining_prompts - group_total) == 0;
+
+        m_prefill_base_request->prepare_for_infer();
+
+        // ---- Stage 1: global-cache (Category B) fill, one chunk at a time, in order. ----
+        // attention_mask/SWA-mask fills read/advance kvcache_desc.num_stored_tokens as they go
+        // (see prepare_prefill_chunk_masks_and_positions's contract), so this must run strictly
+        // sequentially, mirroring chunk-major's per-chunk timing, before any layer runs.
+        auto* attn_mask_cache = lm_request->global_cache_for(layer_names::attention_mask);
+        auto* pos_ids_cache = lm_request->global_cache_for(layer_names::position_ids);
+        auto* swa_mask_cache = lm_request->global_cache_for(ov::npuw::util::kSlidingWindowAttentionMaskParamName);
+        const auto swa_port_it = m_prefill_in_ports.find(ov::npuw::util::kSlidingWindowAttentionMaskParamName);
+        const bool has_swa_mask = swa_port_it != m_prefill_in_ports.end();
+
+        for (uint32_t c = 0; c < group_size; ++c) {
+            prepare_prefill_chunk_masks_and_positions(attention_mask,
+                                                      position_ids,
+                                                      chunk_lens[c],
+                                                      chunk_stored_before[c]);
+
+            if (attn_mask_cache) {
+                capture(*attn_mask_cache,
+                       m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask)),
+                       c,
+                       group_size);
+            }
+            if (pos_ids_cache) {
+                capture(*pos_ids_cache,
+                       m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::position_ids)),
+                       c,
+                       group_size);
+            }
+            if (swa_mask_cache && has_swa_mask) {
+                capture(*swa_mask_cache, m_prefill_request->get_tensor(swa_port_it->second), c, group_size);
+            }
+
+            kvcache_desc.num_stored_tokens += static_cast<uint32_t>(chunk_lens[c]);
+        }
+
+        // ---- Stage 2: per-layer, per-chunk dispatch. ----
+        // Layer 0 has no fused predecessor (see LayerGroup's declaration comment), so its own
+        // pre-MoE (attention+router) segment is primed once, up front - every other layer's
+        // pre-MoE segment instead runs fused into the PREVIOUS layer's post-MoE dispatch below.
+        {
+            const auto& group0 = layer_groups[0];
+            for (uint32_t c = 0; c < group_size; ++c) {
+                prepare_prefill_chunk_front_inputs(input_ids, token_type_ids, chunk_lens[c], chunk_stored_before[c]);
+
+                if (attn_mask_cache) {
+                    inject(*attn_mask_cache,
+                          m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask)),
+                          c);
+                }
+                if (pos_ids_cache) {
+                    inject(*pos_ids_cache,
+                          m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::position_ids)),
+                          c);
+                }
+                if (swa_mask_cache && has_swa_mask) {
+                    inject(*swa_mask_cache, m_prefill_request->get_tensor(swa_port_it->second), c);
+                }
+
+                // prepare_for_infer() above only bound this submodel's globals (incl.
+                // host_gather/quant_unpack_gather on input_ids) once, before ANY chunk's own
+                // front inputs were written - re-bind now that this chunk's tokens are in
+                // place, or every chunk would gather using stale/zero-initialized ids.
+                lm_request->rebind_global_parameters(group0.seg_start);
+
+                lm_request->set_run_iteration(global_chunk_idx + c);
+                block_strategy->on_prefill_chunk_begin_for_layer(0, static_cast<uint32_t>(chunk_lens[c]));
+                lm_request->infer_range(group0.seg_start, group0.moe_idx);
+
+                auto* ei_bridge = lm_request->bridge_for_link(group0.moe_idx, *expert_input_param_idx);
+                auto* rs_bridge = lm_request->bridge_for_link(group0.moe_idx, *router_scores_param_idx);
+                OPENVINO_ASSERT(ei_bridge && rs_bridge,
+                                "NPUW: MoE expert_input/router_scores are not fed from a funcall-folded "
+                                "producer - layer-major batching needs a bridge for both");
+                capture(*ei_bridge, lm_request->peek_prev_output(group0.moe_idx, *expert_input_param_idx), c, group_size);
+                capture(*rs_bridge, lm_request->peek_prev_output(group0.moe_idx, *router_scores_param_idx), c, group_size);
+
+                // Layer 0's own attention/K-V just ran, sharing the funcall's physically-reused
+                // output buffer with every other layer occurrence (K/V outputs have no in-graph
+                // reader, so FuncMemMgr frees their slot for reuse as soon as the next occurrence
+                // runs) - copy it out now, before this loop's next chunk or layer 1's attention
+                // (fused into the next block below) clobbers it.
+                const bool is_last_chunk_global = group_has_last_chunk && (c + 1 == group_size);
+                block_strategy->on_prefill_chunk_done_for_layer(0u, static_cast<uint32_t>(chunk_lens[c]), is_last_chunk_global);
+                if (!is_last_chunk_global) {
+                    copy_lincache(m_prefill_request, m_prefill_request, m_prefill_out_ports, m_prefill_in_ports, 0u);
+                    m_swa_cache->update_prefill_for_layer(0u,
+                                                          static_cast<uint32_t>(chunk_stored_before[c]),
+                                                          static_cast<uint32_t>(chunk_lens[c]));
+                }
+            }
+        }
+
+        for (std::size_t L = 0; L < num_layers; ++L) {
+            const auto& group = layer_groups[L];
+
+            // ---- Batched MoE call for this layer, across the whole group. ----
+            auto* ei_bridge = lm_request->bridge_for_link(group.moe_idx, *expert_input_param_idx);
+            auto* rs_bridge = lm_request->bridge_for_link(group.moe_idx, *router_scores_param_idx);
+            // v1 assumption (flag for live-model validation): the MoE output has the same
+            // shape/type as expert_input - true whenever MoE output replaces/adds to the same
+            // hidden-state stream it consumed. The compiled expert body operates on
+            // chunk_prompt_len-wide, right-aligned/zero-padded windows regardless of the real
+            // token count (NPUW compiles static shapes), so the batched call spans the whole
+            // padded window, same as ei_bridge.
+            // NB: configure() wants a *single-chunk* shape (it multiplies chunk_dim by
+            // group_size itself) - use slot(0), not whole() (already group_size-wide), or the
+            // window gets multiplied twice and every slot()'s ROI lands out of bounds.
+            const auto ei_chunk_shape = ei_bridge->slot(0)->get_shape();
+            const auto ei_chunk_dim = find_chunk_dim(ei_chunk_shape);
+            // The output accumulator needs an extra leading num_active_experts slot dimension
+            // that expert_input doesn't have (each token's MoE result is written once per
+            // selected expert, not combined until the downstream submodel runs) - see
+            // MoEResources::initialize_expert_iterative_mode's buffer_shape derivation and
+            // MoEExecutor::run_expert_iterative's accumulator layout (accumulator[slot][token]).
+            // Reusing ei_chunk_shape/ei_chunk_dim as-is here would under-allocate this buffer to
+            // exactly 1 slot's worth, silently overflowing on any token selected by more than
+            // one expert.
+            const auto num_active_experts = moe_executor->num_active_experts();
+            ov::Shape moe_output_chunk_shape;
+            moe_output_chunk_shape.reserve(ei_chunk_shape.size() + 1);
+            moe_output_chunk_shape.push_back(num_active_experts);
+            moe_output_chunk_shape.insert(moe_output_chunk_shape.end(), ei_chunk_shape.begin(), ei_chunk_shape.end());
+            const auto moe_output_chunk_dim = ei_chunk_dim + 1;
+            moe_output_bridge.configure(
+                group_size,
+                moe_output_chunk_dim,
+                ei_bridge->whole()->get_element_type(),
+                moe_output_chunk_shape,
+                [](const ov::element::Type& type, const ov::Shape& s) {
+                    return ov::npuw::util::allocMem(type, s, "CPU", nullptr);
+                });
+            moe_executor->run_batched(group.moe_idx,
+                                      ei_bridge->whole(),
+                                      rs_bridge->whole(),
+                                      moe_output_bridge.whole(),
+                                      static_cast<std::size_t>(group_size) * chunk_prompt_len);
+
+            for (uint32_t c = 0; c < group_size; ++c) {
+                // run_batched() bypasses the normal per-occurrence dispatch/dump path (see
+                // run_subrequest_for_success), so this occurrence's own input/output never hits
+                // dump_input_tensors()/dump_output_tensors() - dump them here explicitly so
+                // NPUW_DUMP_IO still captures them, comparably to chunk-major's undbatched MoE
+                // call (which DOES go through the normal per-occurrence dump).
+                lm_request->set_run_iteration(global_chunk_idx + c);
+                lm_request->dump_named_tensor(group.moe_idx, "input_expert_input", ei_bridge->slot(c));
+                lm_request->dump_named_tensor(group.moe_idx, "input_router_scores", rs_bridge->slot(c));
+                lm_request->dump_named_tensor(group.moe_idx, "output", moe_output_bridge.slot(c));
+
+                moe_executor->set_downstream_output_override(moe_output_bridge.slot(c));
+
+                // The fused span [group.moe_idx, group.seg_end) silently contains the NEXT
+                // layer's own pre-MoE (attention+router) part (see LayerGroup's declaration
+                // comment) - prime its KV block binding and masks before this infer_range()
+                // call starts, same as any other layer's own pre-MoE priming above.
+                if (L + 1 < num_layers) {
+                    if (attn_mask_cache) {
+                        inject(*attn_mask_cache,
+                              m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask)),
+                              c);
+                    }
+                    if (pos_ids_cache) {
+                        inject(*pos_ids_cache,
+                              m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::position_ids)),
+                              c);
+                    }
+                    if (swa_mask_cache && has_swa_mask) {
+                        inject(*swa_mask_cache, m_prefill_request->get_tensor(swa_port_it->second), c);
+                    }
+                    block_strategy->on_prefill_chunk_begin_for_layer(static_cast<uint32_t>(L + 1),
+                                                                     static_cast<uint32_t>(chunk_lens[c]));
+                }
+
+                lm_request->set_run_iteration(global_chunk_idx + c);
+                lm_request->infer_range(group.moe_idx, group.seg_end);
+                moe_executor->clear_downstream_output_override();
+
+                const bool is_last_chunk_global = group_has_last_chunk && (c + 1 == group_size);
+
+                // The next layer's own attention/router already ran above (fused into this
+                // layer's post-MoE segment) - capture its MoE inputs directly, mirroring the
+                // group0 priming loop above, instead of re-running its pre-MoE segment.
+                if (L + 1 < num_layers) {
+                    const auto& next_group = layer_groups[L + 1];
+                    auto* next_ei_bridge = lm_request->bridge_for_link(next_group.moe_idx, *expert_input_param_idx);
+                    auto* next_rs_bridge = lm_request->bridge_for_link(next_group.moe_idx, *router_scores_param_idx);
+                    OPENVINO_ASSERT(next_ei_bridge && next_rs_bridge,
+                                    "NPUW: MoE expert_input/router_scores are not fed from a funcall-folded "
+                                    "producer - layer-major batching needs a bridge for both");
+                    capture(*next_ei_bridge,
+                           lm_request->peek_prev_output(next_group.moe_idx, *expert_input_param_idx),
+                           c,
+                           group_size);
+                    capture(*next_rs_bridge,
+                           lm_request->peek_prev_output(next_group.moe_idx, *router_scores_param_idx),
+                           c,
+                           group_size);
+
+                    // Layer L+1's own attention/K-V just ran above, sharing the same physically-
+                    // reused funcall output buffer - copy it out now, before this loop's next
+                    // chunk (or the next outer iteration's fused attention) clobbers it. Layer L's
+                    // own capture already happened one iteration ago (or in the group0 priming
+                    // block, for L==0), when ITS attention was fresh - doing it here again would
+                    // be reading data layer L+1 has already overwritten.
+                    const auto next_layer_idx = static_cast<uint32_t>(L + 1);
+                    block_strategy->on_prefill_chunk_done_for_layer(next_layer_idx,
+                                                                    static_cast<uint32_t>(chunk_lens[c]),
+                                                                    is_last_chunk_global);
+                    if (!is_last_chunk_global) {
+                        copy_lincache(m_prefill_request,
+                                      m_prefill_request,
+                                      m_prefill_out_ports,
+                                      m_prefill_in_ports,
+                                      next_layer_idx);
+                        m_swa_cache->update_prefill_for_layer(next_layer_idx,
+                                                              static_cast<uint32_t>(chunk_stored_before[c]),
+                                                              static_cast<uint32_t>(chunk_lens[c]));
+                    }
+                }
+            }
+        }
+
+        remaining_prompts -= group_total;
+        global_chunk_idx += group_size;
+        if (group_has_last_chunk) {
+            LOG_DEBUG("All prompts have been prefilled in chunks (layer-major)");
+            m_tokens_in_present_chunk = chunk_lens.back();
+        }
+    }
+
+    LOG_DEBUG("Done.");
+
+    m_prefill_base_request->disable_sublayer_timing();
+    print_prefill_sublayer_timing_report({m_prefill_base_request->get_sublayer_timings()},
+                                         sublayer_counts,
+                                         *m_prefill_base_request);
 }
 
 void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input_ids,
@@ -1458,8 +1866,20 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
     });
 
     const bool use_chunk_prefill = m_npuw_llm_compiled_model->m_use_chunk_prefill;
+    // Layer-major chunked-prefill is only constructed (see LayerMajorInferRequest) when
+    // chunked prefill + MoE both held at request-creation time; detecting it here via
+    // dynamic_cast avoids duplicating that condition.
+    auto* lm_request_probe = dynamic_cast<LayerMajorInferRequest*>(m_prefill_base_request.get());
     m_llm_profile["1/prefill:3.infer"].record([&]() {
-        if (use_chunk_prefill) {
+        if (lm_request_probe) {
+            infer_chunked_prefill_layer_major(input_ids,
+                                              attention_mask,
+                                              position_ids,
+                                              token_type_ids,
+                                              per_layer_inputs,
+                                              visual_pos_masks,
+                                              deepstack_visual_embeds);
+        } else if (use_chunk_prefill) {
             infer_chunked_prefill(input_ids,
                                   attention_mask,
                                   position_ids,

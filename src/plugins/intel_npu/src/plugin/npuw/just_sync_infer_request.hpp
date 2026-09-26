@@ -103,6 +103,18 @@ public:
     // function body, in ascending order. Empty if the model has no MoE layers.
     const std::vector<std::size_t>& moe_occurrence_idxs() const;
 
+    // Submodel idxs (same index space) that invoke the MoE downstream-combine function body,
+    // in ascending order, one per moe_occurrence_idxs() entry - i.e. downstream_occurrence_idxs()[k]
+    // is the downstream call belonging to the same layer as moe_occurrence_idxs()[k]. A layer's
+    // post-MoE segment ends right after this idx, not at the next layer's own MoE occurrence.
+    const std::vector<std::size_t>& moe_downstream_occurrence_idxs() const;
+
+    // MoE executor for a layer-major driver's batched calls (run_batched(),
+    // set_downstream_output_override()). nullptr if the model has no MoE layers.
+    ov::npuw::moe::MoEExecutor* moe_executor() const {
+        return m_moe_executor.get();
+    }
+
 protected:
     ////////////////////////////////////
     // implement IBaseInferRequest
@@ -192,6 +204,9 @@ protected:
 
     // See moe_occurrence_idxs()
     std::vector<std::size_t> m_moe_occurrence_idxs;
+
+    // See moe_downstream_occurrence_idxs()
+    std::vector<std::size_t> m_moe_downstream_occurrence_idxs;
 
     std::vector<ov::npuw::v1::subgraphs::ISubgraphBehavior::Ptr> m_subgraph_behaviors;
     std::vector<ov::npuw::v1::subgraphs::Context> m_subgraph_runtime_states;

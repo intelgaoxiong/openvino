@@ -310,6 +310,28 @@ void scatter_expert_outputs(const ov::SoPtr<ov::ITensor>& expert_output,
     // slot_stride = number of elements between consecutive expert slots in the output buffer.
     const size_t slot_stride = input_token_count * embed_dim;
 
+    // Validate every (token_id, slot) pair is within the accumulator bounds before
+    // touching memory, so an OOB write shows up as a thrown message instead of a silent crash.
+    {
+        const size_t* ids = token_ids.data() + chunk_start;
+        const size_t* slots = expert_slots_for_tokens.data() + chunk_start;
+        size_t max_slot = 0;
+        size_t max_id = 0;
+        for (size_t i = 0; i < chunk_size; ++i) {
+            max_slot = std::max(max_slot, slots[i]);
+            max_id = std::max(max_id, ids[i]);
+            if (ids[i] >= input_token_count) {
+                OPENVINO_THROW("MoE scatter: token_id ", ids[i], " out of range (input_token_count=",
+                               input_token_count, ") at i=", i, " chunk_start=", chunk_start);
+            }
+        }
+        const size_t max_dst_offset = max_slot * slot_stride + max_id * embed_dim + embed_dim;
+        if (max_dst_offset > global_output_buffer->get_size()) {
+            OPENVINO_THROW("MoE scatter: computed dst offset ", max_dst_offset,
+                           " exceeds accumulator size ", global_output_buffer->get_size());
+        }
+    }
+
     auto scatter = [&](const auto* src_base, auto* dst_base) {
         const size_t elem_bytes = embed_dim * sizeof(*src_base);
         const size_t* ids = token_ids.data() + chunk_start;

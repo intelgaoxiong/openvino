@@ -393,7 +393,7 @@ ov::AnyMap get_default_generate_config(const std::optional<NPUDesc>& npudesc,
         config.emplace("NPUW_ONLINE_PIPELINE", "NONE");
     }
     if (hint == ::intel_npu::npuw::llm::GenerateHint::FAST_COMPILE) {
-        config.emplace("NPUW_UNFOLD_IREQS", "YES");
+        config.emplace("NPUW_UNFOLD_IREQS", "NO");
     }
     // Specify NPUW DQ if Compiler DQ is not enabled
     if (!npudesc.has_value() || !npudesc->compiler_dq) {
@@ -580,7 +580,7 @@ void apply_moe_config(ov::AnyMap& stage_config,
                                  "DEVICE_ROUTED mode uses in-graph gather-based expert selection which is only "
                                  "optimized for GENERATE stage. Please use HOST_ROUTED or DENSE for PREFILL.");
         }
-        stage_config["NPUW_UNFOLD_IREQS"] = "YES";
+        stage_config["NPUW_UNFOLD_IREQS"] = "NO";
     } else if (moe_hint == ::intel_npu::npuw::llm::MoEHint::DENSE) {
         LOG_INFO("MoE config for " << stage_name << " stage: DENSE (all experts active)");
         // DENSE mode requires CPU-only device due to extremely long NPU compilation time and high resource consumption
@@ -840,8 +840,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     const ::intel_npu::npuw::llm::PrefillHint prefill_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_HINT>();
     m_prefill_chunk_size = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>();
     m_use_chunk_prefill = (prefill_hint == ::intel_npu::npuw::llm::PrefillHint::DYNAMIC && m_prefill_chunk_size > 0);
+    // 0 (default) means: don't use the layer-major chunked-prefill MoE driver at all - fall
+    // back to the original infer_chunked_prefill() path. >=1 selects the layer-major driver,
+    // batching MoE calls across up to that many chunks (see use_layer_major_moe in
+    // llm_infer_request.cpp).
     m_moe_batch_chunks = m_cfg.get<::intel_npu::NPUW_LLM_MOE_BATCH_CHUNKS>();
-    OPENVINO_ASSERT(m_moe_batch_chunks >= 1, "NPUW_LLM_MOE_BATCH_CHUNKS must be >= 1");
 
     uint32_t max_prompt_len = align_to(m_cfg.get<::intel_npu::NPUW_LLM_MAX_PROMPT_LEN>(), 64u);
     const uint32_t min_response_len = align_to(m_cfg.get<::intel_npu::NPUW_LLM_MIN_RESPONSE_LEN>(), 64u);

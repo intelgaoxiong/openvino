@@ -365,7 +365,7 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
 
             // Initialize the MoE IO placeholders, if required
             if (ov::npuw::moe::has_compiled_experts(proto_comp_model_desc.pipeline)) {
-                // Sanity check: ensure only one MoE function type exists
+                // Sanity check: ensure only one MoE type exists
                 if (has_moe && moe_real_idx != real_idx) {
                     OPENVINO_THROW("Only single MoE type is permitted for model");
                 }
@@ -373,6 +373,9 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
                 moe_real_idx = real_idx;
                 m_moe_occurrence_idxs.push_back(i);
             }  // if(moe_experts)
+            if (ov::npuw::moe::has_compiled_downstream(proto_comp_model_desc.pipeline)) {
+                m_moe_downstream_occurrence_idxs.push_back(i);
+            }  // if(moe_downstream)
 
             for (size_t out_idx = 0; out_idx < num_outputs; out_idx++) {
                 const auto from = LinkFrom{i, out_idx};
@@ -891,6 +894,10 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
 
 const std::vector<std::size_t>& ov::npuw::JustInferRequest::moe_occurrence_idxs() const {
     return m_moe_occurrence_idxs;
+}
+
+const std::vector<std::size_t>& ov::npuw::JustInferRequest::moe_downstream_occurrence_idxs() const {
+    return m_moe_downstream_occurrence_idxs;
 }
 
 void ov::npuw::JustInferRequest::initialize_moe_executor() {

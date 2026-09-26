@@ -95,6 +95,39 @@ protected:
                                ov::SoPtr<ov::ITensor> per_layer_inputs,
                                ov::SoPtr<ov::ITensor> visual_pos_masks,
                                ov::SoPtr<ov::ITensor> deepstack_visual_embeds);
+
+    // Fills the prefill model's attention_mask/position_ids ports plus the SWA mask and
+    // history-size bookkeeping for one chunk. num_stored_tokens_before must equal
+    // m_npuw_llm_compiled_model->m_kvcache_desc.num_stored_tokens at call time (fill_attention_masks()
+    // reads that field directly). Shared by infer_chunked_prefill (chunk-major) and
+    // infer_chunked_prefill_layer_major (Stage 1: filled for every chunk in a batch group up
+    // front, before any layer runs).
+    void prepare_prefill_chunk_masks_and_positions(ov::SoPtr<ov::ITensor> attention_mask,
+                                                   ov::SoPtr<ov::ITensor> position_ids,
+                                                   uint64_t current_prompts_len,
+                                                   uint64_t num_stored_tokens_before);
+
+    // Fills the prefill model's input_ids/token_type_ids ports for one chunk. Shared by
+    // infer_chunked_prefill (chunk-major) and infer_chunked_prefill_layer_major (Stage 2,
+    // layer 0 only - later layers source their input from the previous layer's hidden-state
+    // bridge instead).
+    void prepare_prefill_chunk_front_inputs(ov::SoPtr<ov::ITensor> input_ids,
+                                            ov::SoPtr<ov::ITensor> token_type_ids,
+                                            uint64_t current_prompts_len,
+                                            uint64_t num_stored_tokens_before);
+
+    // Layer-major counterpart of infer_chunked_prefill(): batches every transformer layer's
+    // MoE call across a group of up to NPUW_LLM_MOE_BATCH_CHUNKS chunks instead of running
+    // MoE once per chunk (see design doc moe-batched-chunked-prefill-design.md §4/§6). v1
+    // scope: plain LLM prefill only (asserted below) - validated against Gemma4-26B-A4B.
+    void infer_chunked_prefill_layer_major(ov::SoPtr<ov::ITensor> input_ids,
+                                           ov::SoPtr<ov::ITensor> attention_mask,
+                                           ov::SoPtr<ov::ITensor> position_ids,
+                                           ov::SoPtr<ov::ITensor> token_type_ids,
+                                           ov::SoPtr<ov::ITensor> per_layer_inputs,
+                                           ov::SoPtr<ov::ITensor> visual_pos_masks,
+                                           ov::SoPtr<ov::ITensor> deepstack_visual_embeds);
+
     PrefixCachingHelper* get_prefix_caching_helper(const ov::SoPtr<ov::ITensor>& position_ids);
     bool use_longrope_prefix_cache(const ov::SoPtr<ov::ITensor>& position_ids) const;
 

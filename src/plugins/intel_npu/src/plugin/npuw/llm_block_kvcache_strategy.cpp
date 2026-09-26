@@ -429,7 +429,14 @@ void LLMBlockKVCacheStrategy::on_prefill_chunk_begin_for_layer(uint32_t layer_id
 
     const uint32_t layer_position = layer_num_stored_tokens(layer_idx);
     bool zero_copy = false;
-    if (layer_position % m_block_size == 0) {
+    // Zero-copy binds the model's whole (chunk_prompt_len-wide, right-aligned/padded) output
+    // tensor straight onto the block, with no slicing - correct only when this chunk fills the
+    // entire block (current_prompts_len == m_block_size). A short chunk's real tokens sit at the
+    // right/end of the padded output (see copy_outputs_to_blocks's src_seq_len-num_tokens slice),
+    // so redirecting the whole thing would leave block position 0 holding padding garbage while
+    // update_block_tokens() reports it as valid - matching on_prefill_chunk_begin()'s stricter
+    // current_prompts_len-based gate used by the chunk-major driver.
+    if (layer_position % m_block_size == 0 && current_prompts_len % m_block_size == 0) {
         zero_copy = redirect_prefill_outputs_to_new_blocks(m_req.m_prefill_request,
                                                            m_req.m_prefill_out_ports,
                                                            current_prompts_len,

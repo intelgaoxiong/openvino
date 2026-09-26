@@ -258,6 +258,12 @@ public:
         return m_config.router_scores.original;
     }
 
+    // Number of experts selected per token (top-K). A layer-major driver's batched output
+    // accumulator must reserve this many slots per token - see run_batched()'s doc comment.
+    size_t num_active_experts() const {
+        return m_config.num_active_experts;
+    }
+
 private:
     // === Dependency injection ===
     ISubrequestAccessor& m_accessor;  // Access to JustInferRequest internals

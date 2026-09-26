@@ -5,7 +5,10 @@
 
 #include "base_sync_infer_request.hpp"
 
+#include <chrono>
+#include <iostream>
 #include <sstream>
+#include <thread>
 
 #include "attn/attn_subgraph.hpp"
 #include "compiled_model.hpp"
@@ -670,7 +673,28 @@ void ov::npuw::IBaseInferRequest::bind_global_results(std::size_t idx, RqPtr req
     LOG_DEBUG("Done");
 }
 
+void ov::npuw::IBaseInferRequest::dump_named_tensor(std::size_t idx,
+                                                    const std::string& name,
+                                                    const ov::SoPtr<ov::ITensor>& tensor) {
+    if (m_dump_first_iter_only && m_run_iter > 0) {
+        return;
+    }
+    const std::string dump_ios_opt = m_npuw_model->m_cfg.get<::intel_npu::NPUW_DUMP_IO>();
+    const std::size_t end_idx = m_npuw_model->m_compiled_submodels.size();
+    auto real_idx = m_npuw_model->m_compiled_submodels[idx].replaced_by.value_or(idx);
+
+    if (!ov::npuw::util::is_set(idx, dump_ios_opt, real_idx, end_idx)) {
+        return;
+    }
+
+    const auto& comp_submodel_path = m_npuw_model->m_name + subgr_path_suffix(idx) + iter_path_suffix(idx);
+    ov::npuw::dump_tensor(tensor, comp_submodel_path + "_" + name);
+}
+
 void ov::npuw::IBaseInferRequest::dump_input_tensors(std::size_t idx) {
+    if (m_dump_first_iter_only && m_run_iter > 0) {
+        return;
+    }
     const std::string dump_ios_opt = m_npuw_model->m_cfg.get<::intel_npu::NPUW_DUMP_IO>();
     const std::size_t end_idx = m_npuw_model->m_compiled_submodels.size();
     auto real_idx = m_npuw_model->m_compiled_submodels[idx].replaced_by.value_or(idx);
@@ -752,6 +776,9 @@ void ov::npuw::IBaseInferRequest::dump_input_tensors(std::size_t idx) {
 }
 
 void ov::npuw::IBaseInferRequest::dump_output_tensors(std::size_t idx) {
+    if (m_dump_first_iter_only && m_run_iter > 0) {
+        return;
+    }
     const std::string dump_ios_opt = m_npuw_model->m_cfg.get<::intel_npu::NPUW_DUMP_IO>();
     const std::size_t end_idx = m_npuw_model->m_compiled_submodels.size();
     auto real_idx = m_npuw_model->m_compiled_submodels[idx].replaced_by.value_or(idx);

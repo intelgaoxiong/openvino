@@ -89,6 +89,26 @@ public:
         return m_run_iter;
     }
 
+    // Lets a driver that dispatches subrequests via infer_range() instead of infer() (which
+    // is the only place m_run_iter normally advances) keep NPUW_DUMP_IO_ITERS dump filenames
+    // aligned with another driver's per-chunk numbering, for side-by-side comparison.
+    void set_run_iteration(std::size_t iter) {
+        m_run_iter = iter;
+    }
+
+    // Opt-in for drivers (e.g. generate/decode) whose infer() runs many times in a row -
+    // caps NPUW_DUMP_IO output to the very first iteration instead of dumping every single
+    // decode step, which would otherwise dump the whole submodel set per generated token.
+    void limit_dump_to_first_iter() {
+        m_dump_first_iter_only = true;
+    }
+
+    // Dumps tensor under submodel idx's NPUW_DUMP_IO path/iter naming, tagged with name -
+    // for a driver that (like the layer-major MoE driver's batched call) bypasses
+    // dump_input_tensors()/dump_output_tensors() for that submodel and needs to dump its
+    // out-of-band input/output tensors itself, comparably to a normal dispatch's dump.
+    void dump_named_tensor(std::size_t idx, const std::string& name, const ov::SoPtr<ov::ITensor>& tensor);
+
     bool should_copy_subgraph_input(std::size_t idx) const {
         return needs_copy(idx);
     }
@@ -240,6 +260,7 @@ protected:
     std::string iter_path_suffix(std::size_t idx) const;
     mutable std::optional<bool> m_iter_suffix_required;
     std::size_t m_run_iter = 0u;
+    bool m_dump_first_iter_only = false;
 
     // Per-sublayer timing state. The generate path never sets m_sublayer_timing_enabled,
     // so this incurs zero overhead outside of prefill timing sessions.
