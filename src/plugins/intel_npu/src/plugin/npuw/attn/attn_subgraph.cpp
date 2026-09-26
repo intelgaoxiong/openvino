@@ -908,6 +908,11 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                     }
                     return;
                 case BehaviorKind::HFA:
+                    // prepare() (called from prepare_for_infer()) only fires once per
+                    // infer_range()-batched group of chunks, not once per chunk - re-run it
+                    // here (once per real per-chunk dispatch) so the selector's past_length
+                    // reflects THIS chunk's history_size, not the group's first chunk's.
+                    prepare_hfa(ctx);
                     return;
                 }
                 OPENVINO_THROW("Unsupported attention behavior kind");
@@ -1233,6 +1238,31 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                          true,   // async
                                          true,   // process_with_mask
                                          true);  // is_final_tile: use the dedicated final mask buffer
+
+                            // dump_input_tensors()/dump_output_tensors() run before this behavior's
+                            // run(ctx) binds the final tile's real per-chunk tensors (see
+                            // run_subrequest_for_success), so their snapshot of this occurrence is
+                            // one call stale. Dump the tensors actually consumed/produced here instead
+                            // -- gated by the same NPUW_DUMP_IO idx filter as the normal dump path, so
+                            // scoping NPUW_DUMP_IO to this occurrence's idx keeps the extra dump small.
+                            auto& dbg_request = get_request(ctx);
+                            const auto& final_model = hfa_desc->_compiled_final_tile_model;
+                            dbg_request.dump_named_tensor(ctx.subgraph_idx,
+                                                          "hfa_final_q",
+                                                          final_tile_request->get_tensor(final_model->inputs()[tile_in.q]));
+                            dbg_request.dump_named_tensor(ctx.subgraph_idx,
+                                                          "hfa_final_k",
+                                                          final_tile_request->get_tensor(final_model->inputs()[tile_in.k]));
+                            dbg_request.dump_named_tensor(ctx.subgraph_idx,
+                                                          "hfa_final_v",
+                                                          final_tile_request->get_tensor(final_model->inputs()[tile_in.v]));
+                            dbg_request.dump_named_tensor(ctx.subgraph_idx,
+                                                          "hfa_final_mask",
+                                                          final_tile_request->get_tensor(final_model->inputs()[tile_in.mask]));
+                            dbg_request.dump_named_tensor(ctx.subgraph_idx, "hfa_final_past_acc", state_acc);
+                            dbg_request.dump_named_tensor(ctx.subgraph_idx, "hfa_final_past_max", state_max);
+                            dbg_request.dump_named_tensor(ctx.subgraph_idx, "hfa_final_past_d", state_sum);
+                            dbg_request.dump_named_tensor(ctx.subgraph_idx, "hfa_final_output", attention_output_tensor);
                         }
 
                         if (state.hfa_runtime_ctx && state.hfa_runtime_ctx->has_state_buffers()) {

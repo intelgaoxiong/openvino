@@ -1467,6 +1467,14 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
     // batched MoE output across the group, scattered back to each chunk's slot via
     // set_downstream_output_override() (see MoEExecutor::run_batched doc comment).
     HiddenStateBridge moe_output_bridge;
+    // moe_output_bridge.slot(c) is a zero-copy ROI along the token/chunk dim, but that dim sits
+    // AFTER the leading num_active_experts dim in the accumulator layout the downstream submodel
+    // requires (see buffer_shape derivation in moe_resources.cpp) - a sub-range slice of it is
+    // only contiguous when group_size==1 (slot(0) then spans the whole buffer). With
+    // group_size>1 and num_active_experts>1, the slice is a strided, multi-block view that the
+    // NPU driver's set_tensor() rejects (tensor->is_continuous() check). Falls back to copying
+    // the slice into this single-chunk scratch tensor before binding it as the override.
+    ov::SoPtr<ov::ITensor> moe_output_scratch;
 
     // Sublayer timing: this driver interleaves infer_range() across many (layer, chunk) pairs
     // rather than one infer() call per chunk, so a per-chunk breakdown (as chunk-major produces)
@@ -1538,6 +1546,19 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
             }
 
             kvcache_desc.num_stored_tokens += static_cast<uint32_t>(chunk_lens[c]);
+
+            // prepare_prefill_chunk_masks_and_positions() only ever (re)writes the tail
+            // chunk_prompt_len window of attn_mask_in_tensor - propagate this chunk's tail into
+            // its own history slot now, mirroring infer_chunked_prefill()'s post-chunk shift, or
+            // the next chunk's own tail write (later in this group, or in a future group) would
+            // see stale/zeroed history here and silently drop this chunk from attention.
+            const bool is_last_chunk_overall = group_has_last_chunk && (c + 1 == group_size);
+            if (!is_last_chunk_overall) {
+                auto attn_mask_live = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask));
+                std::copy_n(attn_mask_live->data<int64_t>() + attn_mask_live->get_size() - chunk_lens[c],
+                           chunk_lens[c],
+                           attn_mask_live->data<int64_t>() + kvcache_desc.num_stored_tokens - chunk_lens[c]);
+            }
         }
 
         // ---- Stage 2: per-layer, per-chunk dispatch. ----
@@ -1568,6 +1589,12 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 // front inputs were written - re-bind now that this chunk's tokens are in
                 // place, or every chunk would gather using stale/zero-initialized ids.
                 lm_request->rebind_global_parameters(group0.seg_start);
+
+                // Stage 1's calls to prepare_prefill_chunk_masks_and_positions() left this at
+                // whichever chunk it last processed (the group's LAST chunk, not this one) -
+                // attention selectors (HFA/dynamic/pyramid) read it during infer_range() below,
+                // so it must be re-pinned to THIS chunk's own pre-chunk value now.
+                m_prefill_base_request->update_history_size(static_cast<int64_t>(chunk_stored_before[c]));
 
                 lm_request->set_run_iteration(global_chunk_idx + c);
                 block_strategy->on_prefill_chunk_begin_for_layer(0, static_cast<uint32_t>(chunk_lens[c]));
@@ -1642,6 +1669,13 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                                       moe_output_bridge.whole(),
                                       static_cast<std::size_t>(group_size) * chunk_prompt_len);
 
+            if (!moe_output_scratch || moe_output_scratch->get_shape() != moe_output_chunk_shape) {
+                moe_output_scratch = ov::npuw::util::allocMem(ei_bridge->whole()->get_element_type(),
+                                                              moe_output_chunk_shape,
+                                                              "CPU",
+                                                              nullptr);
+            }
+
             for (uint32_t c = 0; c < group_size; ++c) {
                 // run_batched() bypasses the normal per-occurrence dispatch/dump path (see
                 // run_subrequest_for_success), so this occurrence's own input/output never hits
@@ -1653,7 +1687,12 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 lm_request->dump_named_tensor(group.moe_idx, "input_router_scores", rs_bridge->slot(c));
                 lm_request->dump_named_tensor(group.moe_idx, "output", moe_output_bridge.slot(c));
 
-                moe_executor->set_downstream_output_override(moe_output_bridge.slot(c));
+                auto moe_output_slot = moe_output_bridge.slot(c);
+                if (!moe_output_slot->is_continuous()) {
+                    moe_output_slot->copy_to(moe_output_scratch._ptr);
+                    moe_output_slot = moe_output_scratch;
+                }
+                moe_executor->set_downstream_output_override(moe_output_slot);
 
                 // The fused span [group.moe_idx, group.seg_end) silently contains the NEXT
                 // layer's own pre-MoE (attention+router) part (see LayerGroup's declaration
@@ -1676,6 +1715,12 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                     block_strategy->on_prefill_chunk_begin_for_layer(static_cast<uint32_t>(L + 1),
                                                                      static_cast<uint32_t>(chunk_lens[c]));
                 }
+
+                // Same re-pin as group0's own dispatch above - this span's attention
+                // occurrence(s) (this layer's post-MoE tail and/or the next layer's own
+                // pre-MoE part) must see THIS chunk's pre-chunk history size, not whatever
+                // Stage 1 left behind.
+                m_prefill_base_request->update_history_size(static_cast<int64_t>(chunk_stored_before[c]));
 
                 lm_request->set_run_iteration(global_chunk_idx + c);
                 lm_request->infer_range(group.moe_idx, group.seg_end);
