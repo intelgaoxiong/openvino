@@ -4,10 +4,23 @@
 
 #include "layer_major_infer_request.hpp"
 
+#include <algorithm>
+#include <set>
+
 #include "compiled_model.hpp"
 
 ov::npuw::LayerMajorInferRequest::LayerMajorInferRequest(const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model)
     : JustInferRequest(compiled_model) {
+    // Function-call pipelining's primary/reserve buffer swap (see JustInferRequest's
+    // run_subrequest_for_success()) assumes every funcall-folded occurrence is dispatched at
+    // most once before the driver moves on to `next_idx`. This driver's group loop instead
+    // calls infer_range() on the SAME [seg_start, moe_idx) span once per chunk: after the
+    // first chunk's dispatch succeeds, the swap silently replaces the occurrence's primary
+    // closure buffer with whatever was speculatively prefetched for `next_idx`, so the second
+    // (and any later) chunk in the group runs with a wrong/foreign layer's weights. Disable
+    // pipelining here - it's a pure perf optimization, and the non-pipelined path below is
+    // otherwise identical and already exercised by the chunk-major driver.
+    m_use_function_pipelining = false;
     register_bridges();
     discover_layer_groups();
 }
@@ -38,7 +51,18 @@ ov::SoPtr<ov::ITensor> ov::npuw::LayerMajorInferRequest::peek_prev_output(std::s
 }
 
 void ov::npuw::LayerMajorInferRequest::rebind_global_parameters(std::size_t idx) {
-    bind_global_parameters(idx);
+    // Deliberately bypass JustInferRequest::bind_global_parameters(): its now_idx()-based
+    // primary/reserve subrequest selection assumes idx is the occurrence currently
+    // in-flight inside unsafe_during()'s async window. now_idx() only compares real_idx
+    // (the shared funcall-folded function), and infer_range() never resets it on return -
+    // so it can still match real_idx from any earlier same-function dispatch (a previous
+    // chunk, layer, or even a prior generate() call on a reused request), misrouting our
+    // synchronous rebind-then-dispatch onto the reserve m_funcall_pipeline subrequest
+    // instead of the primary one that actually gets executed (and dumped). Always bind
+    // the primary subrequest directly.
+    const auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
+    const auto real_idx = comp_model_desc.replaced_by.value_or(idx);
+    bind_global_params(idx, m_subrequests[real_idx]);
 }
 
 void ov::npuw::LayerMajorInferRequest::register_bridges() {
@@ -56,6 +80,18 @@ void ov::npuw::LayerMajorInferRequest::register_bridges() {
     // Category B: one cache per top-level input read by more than one submodel occurrence
     // (e.g. attention_mask/position_ids/sliding_window_attention_mask - re-filled once per
     // chunk by the driver, then re-read by every layer as the group's layer loop advances).
+    //
+    // attention_mask/position_ids/sliding_window_attention_mask are ALWAYS bridged below,
+    // regardless of num_readers: num_readers only counts distinct submodel *occurrences*
+    // wired to this global by the graph-level input/subscriber maps, which - because every
+    // attention layer's own pre-MoE part is funcall-folded onto the same shared real_idx -
+    // can come out <= 1 even though the driver's Stage 2 dispatches that SAME occurrence
+    // group_size times per group (once per chunk), each needing that chunk's own content.
+    // num_readers is the wrong proxy for "does this need a per-chunk bridge" for these
+    // specific globals; name-match them explicitly instead.
+    static const std::set<std::string> kAlwaysBridgedGlobalNames = {"attention_mask",
+                                                                     "position_ids",
+                                                                     "sliding_window_attention_mask"};
     const auto num_global_inputs = m_npuw_model->m_inputs_to_submodels_inputs.size();
     for (std::size_t global_idx = 0; global_idx < num_global_inputs; ++global_idx) {
         std::size_t num_readers = 0;
@@ -66,7 +102,12 @@ void ov::npuw::LayerMajorInferRequest::register_bridges() {
         if (extra != m_npuw_model->m_param_subscribers.end()) {
             num_readers += extra->second.size();
         }
-        if (num_readers > 1) {
+        const auto& g_names = m_npuw_model->inputs().at(global_idx).get_names();
+        const bool always_bridged =
+            std::any_of(g_names.begin(), g_names.end(), [](const std::string& n) {
+                return kAlwaysBridgedGlobalNames.count(n) != 0;
+            });
+        if (num_readers > 1 || always_bridged) {
             m_global_caches[global_idx];  // default-construct if not present yet
         }
     }
@@ -78,6 +119,16 @@ std::size_t ov::npuw::LayerMajorInferRequest::num_params(std::size_t idx) const 
     const auto& desc = m_npuw_model->m_compiled_submodels[idx];
     const auto real_idx = desc.replaced_by.value_or(idx);
     return m_npuw_model->m_compiled_submodels[real_idx].compiled_model->inputs().size();
+}
+
+std::optional<std::pair<std::size_t, std::size_t>> ov::npuw::LayerMajorInferRequest::producer_of(
+    std::size_t consumer_idx,
+    std::size_t consumer_param_idx) const {
+    const auto link_iter = m_npuw_model->m_submodels_input_to_prev_output.find({consumer_idx, consumer_param_idx});
+    if (link_iter == m_npuw_model->m_submodels_input_to_prev_output.end()) {
+        return std::nullopt;
+    }
+    return link_iter->second;
 }
 
 ov::npuw::HiddenStateBridge* ov::npuw::LayerMajorInferRequest::bridge_for_link(std::size_t consumer_idx,

@@ -6,7 +6,9 @@
 
 #include <cstddef>
 #include <map>
+#include <optional>
 #include <string>
+#include <utility>
 
 #include "hidden_state_bridge.hpp"
 #include "just_sync_infer_request.hpp"
@@ -16,7 +18,10 @@ namespace npuw {
 
 // A specialization of JustInferRequest for the layer-major chunked-prefill MoE driver
 // (NPUW_LLM_MOE_BATCH_CHUNKS >= 1). Reuses JustInferRequest's dispatch machinery (closures,
-// spatial, function pipelining, subgraph behaviors) unchanged, and adds only the extra
+// spatial, subgraph behaviors) unchanged, but forces function-call pipelining OFF (see ctor):
+// its primary/reserve buffer swap assumes every funcall-folded occurrence is visited at most
+// once before the pipeline moves on to `next_idx`, which this driver violates by re-dispatching
+// the SAME occurrence once per chunk within a group via infer_range(). Adds only the extra
 // capability the layer-major driver needs: peeking at a repeated function's per-chunk input
 // tensors without dispatching the call itself, plus a generic, graph-discovered set of
 // HiddenStateBridge instances (see design doc §4.4.2) that let the driver buffer any
@@ -71,6 +76,14 @@ public:
     // through m_submodels_input_to_prev_output to the producer-keyed shared instance. Returns
     // nullptr if that link isn't fed from a funcall-folded producer (no bridge needed).
     HiddenStateBridge* bridge_for_link(std::size_t consumer_idx, std::size_t consumer_param_idx);
+
+    // Which occurrence (and its output port) feeds consumer_idx's consumer_param_idx-th input,
+    // if any - lets a driver filter bridge_for_link() candidates by producer identity (e.g. "only
+    // links produced within this specific infer_range() span") without duplicating
+    // bridge_for_link()'s own m_submodels_input_to_prev_output lookup. Empty if param_idx isn't
+    // fed from another submodel's output (e.g. a global input).
+    std::optional<std::pair<std::size_t, std::size_t>> producer_of(std::size_t consumer_idx,
+                                                                    std::size_t consumer_param_idx) const;
 
     // Number of inputs submodel idx's compiled model accepts - lets a driver generically loop
     // over every param of a submodel to discover which ones need bridging (bridge_for_link),

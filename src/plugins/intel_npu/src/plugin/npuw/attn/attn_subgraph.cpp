@@ -759,6 +759,12 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                 auto& io = get_behavior_io(state, ctx.subgraph_idx, get_param_base(ctx, ctx.real_subgraph_idx), 0u);
                 switch (m_kind) {
                 case BehaviorKind::Dynamic:
+                    // prepare() (called from prepare_for_infer()) only fires once per
+                    // infer_range()-batched group of chunks, not once per chunk - re-run it
+                    // here (once per real per-chunk dispatch, same as the HFA case below) so
+                    // the selector's past_length/pos_id and the cached 2D mask reflect THIS
+                    // chunk's history_size, not the group's first chunk's.
+                    prepare_dynamic(ctx);
                     if (const auto* dynamic = ov::npuw::attn::get_compiled_dynamic(pipeline.context)) {
                         auto mask_iport = compiled_model->inputs()[dynamic->mask_idx];
                         const auto& graph_mask = io.inputs.at(dynamic->mask_idx);
@@ -830,6 +836,11 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                     }
                     return;
                 case BehaviorKind::Pyramid:
+                    // Same reasoning as the Dynamic case above: prepare_pyramid() must be
+                    // re-run once per real per-chunk dispatch, not once per group, since it
+                    // also reselects pyramid_id (and therefore the active subrequest) from
+                    // THIS chunk's own history_size.
+                    prepare_pyramid(ctx);
                     if (const auto* pyramid = ov::npuw::attn::get_compiled_pyramid(pipeline.context)) {
                         const auto pyramid_id = state.pyramid_selector->pyramid_id();
                         const std::size_t mask_idx_local = pyramid->mask_idx_local_at(pyramid_id);
