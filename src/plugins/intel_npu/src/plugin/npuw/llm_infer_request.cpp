@@ -1536,6 +1536,14 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
         const auto swa_port_it = m_prefill_in_ports.find(ov::npuw::util::kSlidingWindowAttentionMaskParamName);
         const bool has_swa_mask = swa_port_it != m_prefill_in_ports.end();
 
+        // Perf breakdown (NPUW_LLM_PROFILE=1): isolates host-side bridging/bookkeeping overhead
+        // from actual NPU dispatch time, since this driver's per-(layer,chunk) capture()/inject()
+        // copies and MoE batching never go through infer_range()'s own do_run() timing. NB: MoE's
+        // own real cost only shows up under "5.moe_batched" below, NOT in the "Prefill Sublayer
+        // Timing" table - group.moe_idx is deliberately excluded from every infer_range() call
+        // (see design doc §7.2), so a nonzero real=<MoE> row reappearing there would mean MoE is
+        // being computed twice again.
+        m_llm_profile["2/prefill_lm:0.stage1_masks"].record([&]() {
         for (uint32_t c = 0; c < group_size; ++c) {
             prepare_prefill_chunk_masks_and_positions(attention_mask,
                                                       position_ids,
@@ -1570,6 +1578,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                            attn_mask_live->data<int64_t>() + kvcache_desc.num_stored_tokens - chunk_lens[c]);
             }
         }
+        });
 
         // ---- Stage 2: per-layer, per-chunk dispatch. ----
         // Layer 0 has no fused predecessor (see LayerGroup's declaration comment), so its own
@@ -1578,6 +1587,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
         {
             const auto& group0 = layer_groups[0];
             for (uint32_t c = 0; c < group_size; ++c) {
+                m_llm_profile["2/prefill_lm:1.pre_chunk"].record([&]() {
                 prepare_prefill_chunk_front_inputs(input_ids, token_type_ids, chunk_lens[c], chunk_stored_before[c]);
 
                 if (attn_mask_cache) {
@@ -1603,19 +1613,38 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 // attention selectors (HFA/dynamic/pyramid) read it during infer_range() below,
                 // so it must be re-pinned to THIS chunk's own pre-chunk value now.
                 m_prefill_base_request->update_history_size(static_cast<int64_t>(chunk_stored_before[c]));
+                });
 
                 lm_request->set_run_iteration(global_chunk_idx + c);
                 block_strategy->on_prefill_chunk_begin_for_layer(0, static_cast<uint32_t>(chunk_lens[c]));
-                lm_request->infer_range(group0.seg_start, group0.moe_idx);
 
                 auto* ei_bridge = lm_request->bridge_for_link(group0.moe_idx, *expert_input_param_idx);
                 auto* rs_bridge = lm_request->bridge_for_link(group0.moe_idx, *router_scores_param_idx);
                 OPENVINO_ASSERT(ei_bridge && rs_bridge,
                                 "NPUW: MoE expert_input/router_scores are not fed from a funcall-folded "
                                 "producer - layer-major batching needs a bridge for both");
+
+                // This span gets re-dispatched again (same [seg_start, moe_idx) idx range) by
+                // the next chunk in this group unless this is already the group's last chunk -
+                // function-call pipelining's swap can't tell the difference from a genuine
+                // forward advance, so it must be disabled for every dispatch except the last
+                // one (see LayerMajorInferRequest::set_function_pipelining()'s declaration
+                // comment and design doc §7.1).
+                const bool will_repeat_this_span = (c + 1 < group_size);
+                bool prev_pipelining = false;
+                if (will_repeat_this_span) {
+                    prev_pipelining = lm_request->set_function_pipelining(false);
+                }
+                m_llm_profile["2/prefill_lm:2.infer_range"].record([&]() {
+                lm_request->infer_range(group0.seg_start, group0.moe_idx);
+                });
+                if (will_repeat_this_span) {
+                    lm_request->set_function_pipelining(prev_pipelining);
+                }
+
+                m_llm_profile["2/prefill_lm:3.bridge_capture"].record([&]() {
                 capture(*ei_bridge, lm_request->peek_prev_output(group0.moe_idx, *expert_input_param_idx), c, group_size);
                 capture(*rs_bridge, lm_request->peek_prev_output(group0.moe_idx, *router_scores_param_idx), c, group_size);
-
                 // Layer 0's pre-MoE segment (just run above, idx in [seg_start, moe_idx)) is
                 // primed once for ALL chunks before the L-loop below even starts - unlike every
                 // other layer's own attention/router, which the L-loop re-dispatches once per
@@ -1623,8 +1652,8 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 // rest of this fused span (downstream, layer 1's own attention, layer 1's own
                 // router, ...) that consumes one of THIS segment's outputs directly therefore
                 // goes stale for every chunk except the group's last one, once the L-loop
-                // re-dispatches per chunk. Snapshot every such link here, mirroring
-                // ei_bridge/rs_bridge above.
+                // re-dispatches per chunk. Snapshot every such link here, same as ei_bridge/
+                // rs_bridge just above.
                 for (auto fused_idx = group0.moe_idx + 1; fused_idx < group0.seg_end; ++fused_idx) {
                     const auto num_fused_params = lm_request->num_params(fused_idx);
                     for (std::size_t p = 0; p < num_fused_params; ++p) {
@@ -1639,6 +1668,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                         capture(*bridge, lm_request->peek_prev_output(fused_idx, p), c, group_size);
                     }
                 }
+                });
 
                 // Layer 0's own attention/K-V just ran, sharing the funcall's physically-reused
                 // output buffer with every other layer occurrence (K/V outputs have no in-graph
@@ -1646,6 +1676,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 // runs) - copy it out now, before this loop's next chunk or layer 1's attention
                 // (fused into the next block below) clobbers it.
                 const bool is_last_chunk_global = group_has_last_chunk && (c + 1 == group_size);
+                m_llm_profile["2/prefill_lm:4.kv_bookkeeping"].record([&]() {
                 block_strategy->on_prefill_chunk_done_for_layer(0u, static_cast<uint32_t>(chunk_lens[c]), is_last_chunk_global);
                 if (!is_last_chunk_global) {
                     copy_lincache(m_prefill_request, m_prefill_request, m_prefill_out_ports, m_prefill_in_ports, 0u);
@@ -1653,6 +1684,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                                                           static_cast<uint32_t>(chunk_stored_before[c]),
                                                           static_cast<uint32_t>(chunk_lens[c]));
                 }
+                });
             }
         }
 
@@ -1695,11 +1727,13 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 [](const ov::element::Type& type, const ov::Shape& s) {
                     return ov::npuw::util::allocMem(type, s, "CPU", nullptr);
                 });
+            m_llm_profile["2/prefill_lm:5.moe_batched"].record([&]() {
             moe_executor->run_batched(group.moe_idx,
                                       ei_bridge->whole(),
                                       rs_bridge->whole(),
                                       moe_output_bridge.whole(),
                                       static_cast<std::size_t>(group_size) * chunk_prompt_len);
+            });
 
             if (!moe_output_scratch || moe_output_scratch->get_shape() != moe_output_chunk_shape) {
                 moe_output_scratch = ov::npuw::util::allocMem(ei_bridge->whole()->get_element_type(),
@@ -1714,6 +1748,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 // dump_input_tensors()/dump_output_tensors() - dump them here explicitly so
                 // NPUW_DUMP_IO still captures them, comparably to chunk-major's undbatched MoE
                 // call (which DOES go through the normal per-occurrence dump).
+                m_llm_profile["2/prefill_lm:6.moe_output_copy"].record([&]() {
                 lm_request->set_run_iteration(global_chunk_idx + c);
                 lm_request->dump_named_tensor(group.moe_idx, "input_expert_input", ei_bridge->slot(c));
                 lm_request->dump_named_tensor(group.moe_idx, "input_router_scores", rs_bridge->slot(c));
@@ -1725,7 +1760,9 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                     moe_output_slot = moe_output_scratch;
                 }
                 moe_executor->set_downstream_output_override(moe_output_slot);
+                });
 
+                m_llm_profile["2/prefill_lm:1.pre_chunk"].record([&]() {
                 // The fused span [group.moe_idx, group.seg_end) silently contains the NEXT
                 // layer's own pre-MoE (attention+router) part (see LayerGroup's declaration
                 // comment) - prime its KV block binding and masks before this infer_range()
@@ -1751,6 +1788,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 // pre-MoE part) must see THIS chunk's pre-chunk history size, not whatever
                 // Stage 1 left behind.
                 m_prefill_base_request->update_history_size(static_cast<int64_t>(chunk_stored_before[c]));
+                });
 
                 // Restore this chunk's own snapshot of whichever earlier, already-fully-drained
                 // span produced this span's non-local inputs (downstream's cos/sin/hidden_state -
@@ -1761,6 +1799,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 // so its non-MoE producers (unlike expert_input/router_scores, refreshed via
                 // next_ei_bridge/next_rs_bridge below) live outside this span and go stale the
                 // moment that earlier span's own per-chunk loop moves past chunk `c`.
+                m_llm_profile["2/prefill_lm:3b.bridge_inject"].record([&]() {
                 for (auto fused_idx = group.moe_idx + 1; fused_idx < group.seg_end; ++fused_idx) {
                     const auto num_fused_params = lm_request->num_params(fused_idx);
                     for (std::size_t p = 0; p < num_fused_params; ++p) {
@@ -1775,23 +1814,60 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                         inject(*bridge, lm_request->peek_prev_output(fused_idx, p), c);
                     }
                 }
+                });
+
+                // Next layer's own pre-MoE segment is about to run below (fused into this
+                // layer's post-MoE dispatch, see LayerGroup's declaration comment) - resolve
+                // its expert_input/router_scores bridges now; they are captured (copy_to) right
+                // after infer_range() below runs it, same as every other fused-span input.
+                ov::npuw::HiddenStateBridge* next_ei_bridge = nullptr;
+                ov::npuw::HiddenStateBridge* next_rs_bridge = nullptr;
+                if (L + 1 < num_layers) {
+                    const auto& next_group = layer_groups[L + 1];
+                    next_ei_bridge = lm_request->bridge_for_link(next_group.moe_idx, *expert_input_param_idx);
+                    next_rs_bridge = lm_request->bridge_for_link(next_group.moe_idx, *router_scores_param_idx);
+                    OPENVINO_ASSERT(next_ei_bridge && next_rs_bridge,
+                                    "NPUW: MoE expert_input/router_scores are not fed from a funcall-folded "
+                                    "producer - layer-major batching needs a bridge for both");
+                }
 
                 lm_request->set_run_iteration(global_chunk_idx + c);
-                lm_request->infer_range(group.moe_idx, group.seg_end);
+                // Same reasoning as the group0 priming loop's own infer_range() call above:
+                // this (moe_idx, seg_end) span repeats once per chunk within this group, so
+                // pipelining is only safe on the group's last chunk for this layer.
+                //
+                // NB: group.moe_idx itself is deliberately EXCLUDED from this range. Its real
+                // computation for every chunk in this group was already performed once, up
+                // front, by the run_batched() call above (which computes all group_size chunks
+                // in a single shot). Dispatching group.moe_idx again here through the normal
+                // per-occurrence path would re-run MoEBehavior::run() -> MoEExecutor::run() for
+                // this one chunk unconditionally (see moe_subgraph.cpp - it has no awareness of
+                // run_batched() having already produced the result), performing a full, real,
+                // and entirely redundant expert computation whose output is simply discarded
+                // (downstream reads the set_downstream_output_override() slot instead). The
+                // bridge_inject loop above already treats group.moe_idx as out-of-band for this
+                // same reason (its own re-injection loop starts at `group.moe_idx + 1`).
+                const bool will_repeat_this_span = (c + 1 < group_size);
+                bool prev_pipelining = false;
+                if (will_repeat_this_span) {
+                    prev_pipelining = lm_request->set_function_pipelining(false);
+                }
+                m_llm_profile["2/prefill_lm:2.infer_range"].record([&]() {
+                lm_request->infer_range(group.moe_idx + 1, group.seg_end);
+                });
+                if (will_repeat_this_span) {
+                    lm_request->set_function_pipelining(prev_pipelining);
+                }
                 moe_executor->clear_downstream_output_override();
 
                 const bool is_last_chunk_global = group_has_last_chunk && (c + 1 == group_size);
 
                 // The next layer's own attention/router already ran above (fused into this
-                // layer's post-MoE segment) - capture its MoE inputs directly, mirroring the
-                // group0 priming loop above, instead of re-running its pre-MoE segment.
+                // layer's post-MoE segment) - snapshot its expert_input/router_scores plus
+                // every other non-MoE output it produced for chunk `c`.
                 if (L + 1 < num_layers) {
                     const auto& next_group = layer_groups[L + 1];
-                    auto* next_ei_bridge = lm_request->bridge_for_link(next_group.moe_idx, *expert_input_param_idx);
-                    auto* next_rs_bridge = lm_request->bridge_for_link(next_group.moe_idx, *router_scores_param_idx);
-                    OPENVINO_ASSERT(next_ei_bridge && next_rs_bridge,
-                                    "NPUW: MoE expert_input/router_scores are not fed from a funcall-folded "
-                                    "producer - layer-major batching needs a bridge for both");
+                    m_llm_profile["2/prefill_lm:3.bridge_capture"].record([&]() {
                     capture(*next_ei_bridge,
                            lm_request->peek_prev_output(next_group.moe_idx, *expert_input_param_idx),
                            c,
@@ -1800,12 +1876,11 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                            lm_request->peek_prev_output(next_group.moe_idx, *router_scores_param_idx),
                            c,
                            group_size);
-
                     // Next layer's downstream (fused into ITS OWN post-MoE dispatch, one L
                     // iteration from now) needs its own non-MoE inputs (cos/sin/hidden_state)
                     // from whatever THIS span's occurrences (this layer's own attention/router,
                     // just dispatched above) produced for chunk `c` - snapshot them now, while
-                    // fresh, mirroring ei/rs above (see the inject side of this a few layer
+                    // fresh, same as ei/rs above (see the inject side of this a few layer
                     // iterations later, above the next infer_range() call).
                     const auto next_downstream_idx = next_group.moe_idx + 1;
                     if (next_downstream_idx < next_group.seg_end) {
@@ -1822,6 +1897,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                             capture(*bridge, lm_request->peek_prev_output(next_downstream_idx, p), c, group_size);
                         }
                     }
+                    });
 
                     // Layer L+1's own attention/K-V just ran above, sharing the same physically-
                     // reused funcall output buffer - copy it out now, before this loop's next
@@ -1830,6 +1906,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                     // block, for L==0), when ITS attention was fresh - doing it here again would
                     // be reading data layer L+1 has already overwritten.
                     const auto next_layer_idx = static_cast<uint32_t>(L + 1);
+                    m_llm_profile["2/prefill_lm:4.kv_bookkeeping"].record([&]() {
                     block_strategy->on_prefill_chunk_done_for_layer(next_layer_idx,
                                                                     static_cast<uint32_t>(chunk_lens[c]),
                                                                     is_last_chunk_global);
@@ -1843,6 +1920,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                                                               static_cast<uint32_t>(chunk_stored_before[c]),
                                                               static_cast<uint32_t>(chunk_lens[c]));
                     }
+                    });
                 }
             }
         }

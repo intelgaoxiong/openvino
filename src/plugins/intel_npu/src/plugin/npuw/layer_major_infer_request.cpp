@@ -11,18 +11,20 @@
 
 ov::npuw::LayerMajorInferRequest::LayerMajorInferRequest(const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model)
     : JustInferRequest(compiled_model) {
-    // Function-call pipelining's primary/reserve buffer swap (see JustInferRequest's
-    // run_subrequest_for_success()) assumes every funcall-folded occurrence is dispatched at
-    // most once before the driver moves on to `next_idx`. This driver's group loop instead
-    // calls infer_range() on the SAME [seg_start, moe_idx) span once per chunk: after the
-    // first chunk's dispatch succeeds, the swap silently replaces the occurrence's primary
-    // closure buffer with whatever was speculatively prefetched for `next_idx`, so the second
-    // (and any later) chunk in the group runs with a wrong/foreign layer's weights. Disable
-    // pipelining here - it's a pure perf optimization, and the non-pipelined path below is
-    // otherwise identical and already exercised by the chunk-major driver.
-    m_use_function_pipelining = false;
+    // Leave m_use_function_pipelining at whatever the base ctor derived from
+    // NPUW_FUNCALL_ASYNC (the LLM prefill sub-config forces this to YES - see
+    // llm_compiled_model.cpp). The driver (llm_infer_request.cpp) is responsible for
+    // disabling it via set_function_pipelining() immediately around any infer_range() call
+    // that repeats a span already dispatched earlier in the SAME group - see this class's
+    // declaration comment and design doc §7.1 for why that's the only unsafe case.
     register_bridges();
     discover_layer_groups();
+}
+
+bool ov::npuw::LayerMajorInferRequest::set_function_pipelining(bool enable) {
+    const bool prev = m_use_function_pipelining;
+    m_use_function_pipelining = enable;
+    return prev;
 }
 
 const std::vector<ov::npuw::LayerMajorInferRequest::LayerGroup>& ov::npuw::LayerMajorInferRequest::layer_groups()

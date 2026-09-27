@@ -18,15 +18,20 @@ namespace npuw {
 
 // A specialization of JustInferRequest for the layer-major chunked-prefill MoE driver
 // (NPUW_LLM_MOE_BATCH_CHUNKS >= 1). Reuses JustInferRequest's dispatch machinery (closures,
-// spatial, subgraph behaviors) unchanged, but forces function-call pipelining OFF (see ctor):
-// its primary/reserve buffer swap assumes every funcall-folded occurrence is visited at most
-// once before the pipeline moves on to `next_idx`, which this driver violates by re-dispatching
-// the SAME occurrence once per chunk within a group via infer_range(). Adds only the extra
-// capability the layer-major driver needs: peeking at a repeated function's per-chunk input
-// tensors without dispatching the call itself, plus a generic, graph-discovered set of
-// HiddenStateBridge instances (see design doc §4.4.2) that let the driver buffer any
-// funcall-folded producer's output, or any per-chunk global input, across a chunk-batch
-// window before/after a single batched call (e.g. MoEExecutor::run_batched).
+// spatial, subgraph behaviors) unchanged. Function-call pipelining's primary/reserve buffer
+// swap (see JustInferRequest::run_subrequest_for_success()) assumes every funcall-folded
+// occurrence is visited at most once before the pipeline moves on to `next_idx` - this
+// driver's group loop instead calls infer_range() on the SAME span once per chunk within a
+// group, which would corrupt that assumption for every chunk except the group's last one.
+// set_function_pipelining() lets the driver selectively disable pipelining around exactly
+// those repeated dispatches (see design doc §7.1) while leaving it enabled for the (safe)
+// last-chunk-of-group dispatch and letting prepare_for_infer()'s own per-group head-unpack
+// keep every funcall-folded occurrence's "head" (first-ever occurrence) correct regardless.
+// Adds only the extra capability the layer-major driver needs: peeking at a repeated
+// function's per-chunk input tensors without dispatching the call itself, plus a generic,
+// graph-discovered set of HiddenStateBridge instances (see design doc §4.4.2) that let the
+// driver buffer any funcall-folded producer's output, or any per-chunk global input, across a
+// chunk-batch window before/after a single batched call (e.g. MoEExecutor::run_batched).
 class LayerMajorInferRequest : public JustInferRequest {
 public:
     explicit LayerMajorInferRequest(const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model);
@@ -102,6 +107,15 @@ public:
     // compiled-model input index via get_compiled_model()->inputs(), then delegates to the
     // index-based overload above. Returns nullptr if the name isn't a top-level input.
     HiddenStateBridge* global_cache_for(const std::string& global_input_name);
+
+    // Toggles function-call pipelining (m_use_function_pipelining, protected in the base
+    // class) for subsequent infer_range() calls. The driver must disable this immediately
+    // before any infer_range() call that repeats a span it already dispatched earlier in the
+    // SAME group (i.e. whenever this isn't the group's last chunk for that span), and may
+    // leave/restore it enabled otherwise - see this class's declaration comment and design doc
+    // §7.1. Returns the previous value, so callers can restore it without tracking it
+    // separately.
+    bool set_function_pipelining(bool enable);
 
 private:
     // One-time constructor walk that discovers which links/global-inputs need bridging (keys
