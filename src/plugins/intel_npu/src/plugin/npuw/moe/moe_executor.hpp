@@ -264,6 +264,17 @@ public:
         return m_config.num_active_experts;
     }
 
+    // idx's expert-output input param index, if idx (a funcall occurrence or a real body index -
+    // resolved internally, same convention as LayerMajorInferRequest's own accessors) is a
+    // compiled MoE downstream (post-expert combine) submodel - nullopt otherwise. Unlike
+    // expert_input_param_idx()/router_scores_param_idx() (single shared m_config, same for
+    // every MoE occurrence), this is per-submodel (looked up via the accessor), since the
+    // downstream submodel is a different compiled body than the expert body. Lets a
+    // layer-major driver check
+    // LayerMajorInferRequest::supports_strided_consumer_input(idx, *expert_output_param_idx(idx))
+    // before deciding whether set_downstream_output_override() needs a contiguous copy.
+    std::optional<size_t> expert_output_param_idx(size_t idx) const;
+
 private:
     // === Dependency injection ===
     ISubrequestAccessor& m_accessor;  // Access to JustInferRequest internals

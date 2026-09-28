@@ -1476,6 +1476,107 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
         bridge.slot(chunk_id)->copy_to(live._ptr);
     };
 
+    // Configures bridge for a group_size-chunk window using producer_idx's producer_port-th
+    // own output port shape/type, read from its function body's compiled model (always
+    // available at runtime, unlike a submodel's ov::Model which detach_memory() may release).
+    // Needed so bind_producer_output() below has a ready slot(chunk_id) tensor to bind BEFORE
+    // the producer has ever been dispatched - capture() only learns the shape from a live peek
+    // taken AFTER dispatch, too late for a pre-bind.
+    auto configure_from_producer =
+        [&find_chunk_dim, lm_request](HiddenStateBridge& bridge,
+                                      std::size_t producer_idx,
+                                      std::size_t producer_port,
+                                      std::size_t group_size) {
+            const auto& oport = lm_request->producer_output_port(producer_idx, producer_port);
+            const auto& shape = oport.get_shape();
+            const auto chunk_dim = find_chunk_dim(shape);
+            bridge.configure(group_size, chunk_dim, oport.get_element_type(), shape,
+                             [lm_request](const ov::element::Type& type, const ov::Shape& s) {
+                                 return lm_request->alloc_strided_mem(type, s);
+                             });
+        };
+
+    // Tries to bind bridge's chunk_id-th slot directly as producer_idx's own producer_port-th
+    // output (zero-copy: the NPU writes straight into the bridge, see
+    // LayerMajorInferRequest::bind_producer_output()'s declaration comment). Must be called
+    // BEFORE the infer_range() call that dispatches producer_idx. Returns true if the bind was
+    // done - callers must then SKIP the copy-based capture() for this link/chunk. Falls back
+    // (returns false, no-op) when CompiledModel's MoE-bridge pre-pass didn't confirm
+    // NPU_ENABLE_STRIDES_FOR support for this exact producer output at compile time.
+    auto try_bind_strided = [&configure_from_producer, lm_request](HiddenStateBridge& bridge,
+                                                                    std::size_t producer_idx,
+                                                                    std::size_t producer_port,
+                                                                    std::size_t chunk_id,
+                                                                    std::size_t group_size) -> bool {
+        if (!lm_request->supports_strided_producer_output(producer_idx, producer_port)) {
+            std::cout << "Strided producer output not supported for producer_idx=" << producer_idx
+                      << ", producer_port=" << producer_port << std::endl;
+            return false;
+        }
+        configure_from_producer(bridge, producer_idx, producer_port, group_size);
+        lm_request->bind_producer_output(producer_idx, producer_port, bridge.slot(chunk_id));
+        return true;
+    };
+
+    // Tries to re-point producer_idx's registered output (m_funcall_result[{producer_idx,
+    // producer_port}]) at bridge's chunk_id-th slot, so consumer_idx's own function_prologue()
+    // picks it up directly (zero-copy) instead of inject()'s copy_to(). Unlike try_bind_strided()
+    // above, this doesn't care HOW bridge's slot got its data (copy-based capture() or the
+    // zero-copy producer bind both leave it populated) - it only needs consumer_idx's own input
+    // port to accept a non-contiguous tensor. Must be called BEFORE the infer_range() call that
+    // dispatches consumer_idx. Returns true if the bind was done - callers must then SKIP the
+    // copy-based inject() for this link/chunk.
+    auto try_bind_strided_consumer = [lm_request](HiddenStateBridge& bridge,
+                                                  std::size_t producer_idx,
+                                                  std::size_t producer_port,
+                                                  std::size_t consumer_idx,
+                                                  std::size_t consumer_param_idx,
+                                                  std::size_t chunk_id) -> bool {
+        if (!lm_request->supports_strided_consumer_input(consumer_idx, consumer_param_idx)) {
+            return false;
+        }
+        lm_request->bind_producer_output(producer_idx, producer_port, bridge.slot(chunk_id));
+        return true;
+    };
+
+    // One Category A link discovered by collect_fused_links() below - fields mirror
+    // try_bind_strided()'s own parameters plus the consumer side needed for the post-dispatch
+    // capture() fallback (peek_prev_output(consumer_idx, param_idx)).
+    struct FusedSpanLink {
+        ov::npuw::HiddenStateBridge* bridge;
+        std::size_t consumer_idx;
+        std::size_t param_idx;
+        std::size_t producer_idx;
+        std::size_t producer_port;
+    };
+
+    // Enumerates every (consumer_idx in [consumer_lo, consumer_hi), param) whose producer lies
+    // in [producer_lo, producer_hi) - i.e. every Category A link fed by the span about to be
+    // dispatched. One enumeration feeds both the pre-dispatch try_bind_strided() attempts and
+    // the post-dispatch capture() fallbacks, so the two passes can't drift out of sync (unlike
+    // writing the same loop/skip-condition twice).
+    auto collect_fused_links = [lm_request](std::size_t consumer_lo,
+                                            std::size_t consumer_hi,
+                                            std::size_t producer_lo,
+                                            std::size_t producer_hi) {
+        std::vector<FusedSpanLink> links;
+        for (auto consumer_idx = consumer_lo; consumer_idx < consumer_hi; ++consumer_idx) {
+            const auto num_params = lm_request->num_params(consumer_idx);
+            for (std::size_t p = 0; p < num_params; ++p) {
+                const auto producer = lm_request->producer_of(consumer_idx, p);
+                if (!producer || producer->first < producer_lo || producer->first >= producer_hi) {
+                    continue;  // global input, or fed from within this same span
+                }
+                auto* bridge = lm_request->bridge_for_link(consumer_idx, p);
+                OPENVINO_ASSERT(bridge,
+                                "NPUW: layer-major fused-span input is not fed from a funcall-folded "
+                                "producer");
+                links.push_back({bridge, consumer_idx, p, producer->first, producer->second});
+            }
+        }
+        return links;
+    };
+
     // Dedicated to this driver only (not graph-discovered like Category A/B): buffers the
     // batched MoE output across the group, scattered back to each chunk's slot via
     // set_downstream_output_override() (see MoEExecutor::run_batched doc comment).
@@ -1485,8 +1586,11 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
     // requires (see buffer_shape derivation in moe_resources.cpp) - a sub-range slice of it is
     // only contiguous when group_size==1 (slot(0) then spans the whole buffer). With
     // group_size>1 and num_active_experts>1, the slice is a strided, multi-block view that the
-    // NPU driver's set_tensor() rejects (tensor->is_continuous() check). Falls back to copying
-    // the slice into this single-chunk scratch tensor before binding it as the override.
+    // NPU driver's set_tensor() rejects UNLESS the downstream submodel's expert-output input
+    // port was registered in NPU_ENABLE_STRIDES_FOR at compile time (see compiled_model.cpp's
+    // layer-major bridge pre-pass and MoEExecutor::expert_output_param_idx()) - falls back to
+    // copying the slice into this single-chunk scratch tensor only when that registration isn't
+    // in effect (e.g. non-NPU device, or the pre-pass's any_device_supports check failed).
     ov::SoPtr<ov::ITensor> moe_output_scratch;
 
     // Sublayer timing: this driver interleaves infer_range() across many (layer, chunk) pairs
@@ -1624,6 +1728,30 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                                 "NPUW: MoE expert_input/router_scores are not fed from a funcall-folded "
                                 "producer - layer-major batching needs a bridge for both");
 
+                // Try zero-copy binding (see try_bind_strided()'s declaration comment) before
+                // this span's own infer_range() dispatch below - must happen BEFORE dispatch,
+                // or the producer would already have written into its own default buffer.
+                const auto ei_producer = lm_request->producer_of(group0.moe_idx, *expert_input_param_idx);
+                const auto rs_producer = lm_request->producer_of(group0.moe_idx, *router_scores_param_idx);
+                OPENVINO_ASSERT(ei_producer && rs_producer,
+                                "NPUW: MoE expert_input/router_scores have a bridge but no producer link");
+                const bool ei_zero_copy =
+                    try_bind_strided(*ei_bridge, ei_producer->first, ei_producer->second, c, group_size);
+                const bool rs_zero_copy =
+                    try_bind_strided(*rs_bridge, rs_producer->first, rs_producer->second, c, group_size);
+
+                // Layer 0's pre-MoE segment is about to run below - resolve every OTHER
+                // fused-span link it feeds (see the capture loop's own declaration comment
+                // further down) and try the same zero-copy bind, still before dispatch.
+                const auto group0_fused_links =
+                    collect_fused_links(group0.moe_idx + 1, group0.seg_end, group0.seg_start, group0.moe_idx);
+                std::vector<bool> group0_fused_zero_copy(group0_fused_links.size());
+                for (std::size_t i = 0; i < group0_fused_links.size(); ++i) {
+                    const auto& link = group0_fused_links[i];
+                    group0_fused_zero_copy[i] =
+                        try_bind_strided(*link.bridge, link.producer_idx, link.producer_port, c, group_size);
+                }
+
                 // This span gets re-dispatched again (same [seg_start, moe_idx) idx range) by
                 // the next chunk in this group unless this is already the group's last chunk -
                 // function-call pipelining's swap can't tell the difference from a genuine
@@ -1643,8 +1771,12 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 }
 
                 m_llm_profile["2/prefill_lm:3.bridge_capture"].record([&]() {
-                capture(*ei_bridge, lm_request->peek_prev_output(group0.moe_idx, *expert_input_param_idx), c, group_size);
-                capture(*rs_bridge, lm_request->peek_prev_output(group0.moe_idx, *router_scores_param_idx), c, group_size);
+                if (!ei_zero_copy) {
+                    capture(*ei_bridge, lm_request->peek_prev_output(group0.moe_idx, *expert_input_param_idx), c, group_size);
+                }
+                if (!rs_zero_copy) {
+                    capture(*rs_bridge, lm_request->peek_prev_output(group0.moe_idx, *router_scores_param_idx), c, group_size);
+                }
                 // Layer 0's pre-MoE segment (just run above, idx in [seg_start, moe_idx)) is
                 // primed once for ALL chunks before the L-loop below even starts - unlike every
                 // other layer's own attention/router, which the L-loop re-dispatches once per
@@ -1653,20 +1785,13 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 // router, ...) that consumes one of THIS segment's outputs directly therefore
                 // goes stale for every chunk except the group's last one, once the L-loop
                 // re-dispatches per chunk. Snapshot every such link here, same as ei_bridge/
-                // rs_bridge just above.
-                for (auto fused_idx = group0.moe_idx + 1; fused_idx < group0.seg_end; ++fused_idx) {
-                    const auto num_fused_params = lm_request->num_params(fused_idx);
-                    for (std::size_t p = 0; p < num_fused_params; ++p) {
-                        const auto producer = lm_request->producer_of(fused_idx, p);
-                        if (!producer || producer->first < group0.seg_start || producer->first >= group0.moe_idx) {
-                            continue;  // global input, or fed from within this fused span itself
-                        }
-                        auto* bridge = lm_request->bridge_for_link(fused_idx, p);
-                        OPENVINO_ASSERT(bridge,
-                                        "NPUW: layer 0's fused-span input is not fed from a funcall-folded "
-                                        "producer");
-                        capture(*bridge, lm_request->peek_prev_output(fused_idx, p), c, group_size);
+                // rs_bridge just above - skipping the ones already bound zero-copy pre-dispatch.
+                for (std::size_t i = 0; i < group0_fused_links.size(); ++i) {
+                    if (group0_fused_zero_copy[i]) {
+                        continue;
                     }
+                    const auto& link = group0_fused_links[i];
+                    capture(*link.bridge, lm_request->peek_prev_output(link.consumer_idx, link.param_idx), c, group_size);
                 }
                 });
 
@@ -1742,6 +1867,30 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                                                               nullptr);
             }
 
+            // group.moe_idx + 1 is always the downstream (post-expert combine) submodel fused
+            // into this same span (see LayerGroup's declaration comment) - resolve once per
+            // group, not once per chunk, since it can't change within this loop.
+            const auto moe_downstream_idx = group.moe_idx + 1;
+            const auto moe_downstream_output_param_idx = moe_executor->expert_output_param_idx(moe_downstream_idx);
+            // TEMPORARILY forced off (2026-09-27): binding moe_output_bridge.slot(c) directly
+            // (skipping the copy below) produces WRONG output vs. the always-copy path, even
+            // though NPU_ENABLE_STRIDES_FOR registration/compile-time port-name resolution is
+            // now confirmed correct - moe_output_bridge.slot(c) is a multi-block strided ROI
+            // (see its declaration comment above), not a simple single-axis slice, and
+            // something in that path (ROI stride computation, or the NPU driver's strided-
+            // tensor support for this pattern) doesn't reproduce the same data as copy_to().
+            // Root cause not yet found - see repo notes (layer-major-ei-rs-bridge-zerocopy-
+            // attempt.md). Always copy until this is resolved.
+            const bool moe_output_supports_strided =
+                false && moe_downstream_output_param_idx.has_value() &&
+                lm_request->supports_strided_consumer_input(moe_downstream_idx, *moe_downstream_output_param_idx);
+            if (L == 0) {
+                std::cout << "[STRIDE_DEBUG] L=" << L << " moe_downstream_idx=" << moe_downstream_idx
+                          << " has_param_idx=" << moe_downstream_output_param_idx.has_value()
+                          << " param_idx=" << moe_downstream_output_param_idx.value_or(0)
+                          << " moe_output_supports_strided=" << moe_output_supports_strided << std::endl;
+            }
+
             for (uint32_t c = 0; c < group_size; ++c) {
                 // run_batched() bypasses the normal per-occurrence dispatch/dump path (see
                 // run_subrequest_for_success), so this occurrence's own input/output never hits
@@ -1755,9 +1904,13 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 lm_request->dump_named_tensor(group.moe_idx, "output", moe_output_bridge.slot(c));
 
                 auto moe_output_slot = moe_output_bridge.slot(c);
-                if (!moe_output_slot->is_continuous()) {
+                if (!moe_output_slot->is_continuous() && !moe_output_supports_strided) {
                     moe_output_slot->copy_to(moe_output_scratch._ptr);
                     moe_output_slot = moe_output_scratch;
+                } else if (!moe_output_slot->is_continuous() && L == 0 && c == 0) {
+                    std::cout << "[STRIDE_DEBUG] binding non-continuous moe_output_slot directly, shape="
+                              << moe_output_slot->get_shape() << " strides=" << moe_output_slot->get_strides()
+                              << std::endl;
                 }
                 moe_executor->set_downstream_output_override(moe_output_slot);
                 });
@@ -1811,7 +1964,9 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                         OPENVINO_ASSERT(bridge,
                                         "NPUW: layer-major fused-span input is not fed from a funcall-folded "
                                         "producer");
-                        inject(*bridge, lm_request->peek_prev_output(fused_idx, p), c);
+                        if (!try_bind_strided_consumer(*bridge, producer->first, producer->second, fused_idx, p, c)) {
+                            inject(*bridge, lm_request->peek_prev_output(fused_idx, p), c);
+                        }
                     }
                 }
                 });
@@ -1822,6 +1977,10 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 // after infer_range() below runs it, same as every other fused-span input.
                 ov::npuw::HiddenStateBridge* next_ei_bridge = nullptr;
                 ov::npuw::HiddenStateBridge* next_rs_bridge = nullptr;
+                bool next_ei_zero_copy = false;
+                bool next_rs_zero_copy = false;
+                std::vector<FusedSpanLink> next_downstream_links;
+                std::vector<bool> next_downstream_zero_copy;
                 if (L + 1 < num_layers) {
                     const auto& next_group = layer_groups[L + 1];
                     next_ei_bridge = lm_request->bridge_for_link(next_group.moe_idx, *expert_input_param_idx);
@@ -1829,7 +1988,42 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                     OPENVINO_ASSERT(next_ei_bridge && next_rs_bridge,
                                     "NPUW: MoE expert_input/router_scores are not fed from a funcall-folded "
                                     "producer - layer-major batching needs a bridge for both");
+
+                    // Try zero-copy binding (see try_bind_strided()'s declaration comment)
+                    // before this span's own infer_range() dispatch below.
+                    const auto next_ei_producer = lm_request->producer_of(next_group.moe_idx, *expert_input_param_idx);
+                    const auto next_rs_producer = lm_request->producer_of(next_group.moe_idx, *router_scores_param_idx);
+                    OPENVINO_ASSERT(next_ei_producer && next_rs_producer,
+                                    "NPUW: MoE expert_input/router_scores have a bridge but no producer link");
+                    next_ei_zero_copy = try_bind_strided(*next_ei_bridge,
+                                                         next_ei_producer->first,
+                                                         next_ei_producer->second,
+                                                         c,
+                                                         group_size);
+                    next_rs_zero_copy = try_bind_strided(*next_rs_bridge,
+                                                         next_rs_producer->first,
+                                                         next_rs_producer->second,
+                                                         c,
+                                                         group_size);
+
+                    // Next layer's downstream (single occurrence, if it exists within this
+                    // group) is fed by the SAME span about to be dispatched below - same
+                    // pre-dispatch treatment as the ei/rs bridges just above.
+                    const auto next_downstream_idx = next_group.moe_idx + 1;
+                    if (next_downstream_idx < next_group.seg_end) {
+                        next_downstream_links = collect_fused_links(next_downstream_idx,
+                                                                    next_downstream_idx + 1,
+                                                                    group.moe_idx,
+                                                                    group.seg_end);
+                        next_downstream_zero_copy.resize(next_downstream_links.size());
+                        for (std::size_t i = 0; i < next_downstream_links.size(); ++i) {
+                            const auto& link = next_downstream_links[i];
+                            next_downstream_zero_copy[i] =
+                                try_bind_strided(*link.bridge, link.producer_idx, link.producer_port, c, group_size);
+                        }
+                    }
                 }
+
 
                 lm_request->set_run_iteration(global_chunk_idx + c);
                 // Same reasoning as the group0 priming loop's own infer_range() call above:
@@ -1868,34 +2062,31 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 if (L + 1 < num_layers) {
                     const auto& next_group = layer_groups[L + 1];
                     m_llm_profile["2/prefill_lm:3.bridge_capture"].record([&]() {
-                    capture(*next_ei_bridge,
-                           lm_request->peek_prev_output(next_group.moe_idx, *expert_input_param_idx),
-                           c,
-                           group_size);
-                    capture(*next_rs_bridge,
-                           lm_request->peek_prev_output(next_group.moe_idx, *router_scores_param_idx),
-                           c,
-                           group_size);
+                    if (!next_ei_zero_copy) {
+                        capture(*next_ei_bridge,
+                               lm_request->peek_prev_output(next_group.moe_idx, *expert_input_param_idx),
+                               c,
+                               group_size);
+                    }
+                    if (!next_rs_zero_copy) {
+                        capture(*next_rs_bridge,
+                               lm_request->peek_prev_output(next_group.moe_idx, *router_scores_param_idx),
+                               c,
+                               group_size);
+                    }
                     // Next layer's downstream (fused into ITS OWN post-MoE dispatch, one L
                     // iteration from now) needs its own non-MoE inputs (cos/sin/hidden_state)
                     // from whatever THIS span's occurrences (this layer's own attention/router,
                     // just dispatched above) produced for chunk `c` - snapshot them now, while
                     // fresh, same as ei/rs above (see the inject side of this a few layer
-                    // iterations later, above the next infer_range() call).
-                    const auto next_downstream_idx = next_group.moe_idx + 1;
-                    if (next_downstream_idx < next_group.seg_end) {
-                        const auto num_params = lm_request->num_params(next_downstream_idx);
-                        for (std::size_t p = 0; p < num_params; ++p) {
-                            const auto producer = lm_request->producer_of(next_downstream_idx, p);
-                            if (!producer || producer->first < group.moe_idx || producer->first >= group.seg_end) {
-                                continue;  // global input, or not produced by the span just dispatched
-                            }
-                            auto* bridge = lm_request->bridge_for_link(next_downstream_idx, p);
-                            OPENVINO_ASSERT(bridge,
-                                            "NPUW: next layer's downstream input is not fed from a "
-                                            "funcall-folded producer");
-                            capture(*bridge, lm_request->peek_prev_output(next_downstream_idx, p), c, group_size);
+                    // iterations later, above the next infer_range() call). Links already bound
+                    // zero-copy pre-dispatch (see next_downstream_zero_copy above) are skipped.
+                    for (std::size_t i = 0; i < next_downstream_links.size(); ++i) {
+                        if (next_downstream_zero_copy[i]) {
+                            continue;
                         }
+                        const auto& link = next_downstream_links[i];
+                        capture(*link.bridge, lm_request->peek_prev_output(link.consumer_idx, link.param_idx), c, group_size);
                     }
                     });
 

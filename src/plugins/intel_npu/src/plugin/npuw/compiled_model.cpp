@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 #include <memory>
 #include <set>
 #include <string>
@@ -779,6 +780,16 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                 }
             }
 
+            // Fix tensor names for MoE downstream model. This clone was made at partition time
+            // (before this loop ever ran) from the ORIGINAL, not-yet-fixed model, so it never
+            // got a fill_empty_tensor_names() pass - do it here too (the layer-major bridge
+            // pre-pass below resolves this port's name straight from _model_to_compile itself,
+            // not from m_compiled_submodels[real_id].model, so no cross-object name sync needed).
+            if (auto* moe_downstream =
+                    ov::npuw::moe::get_compiled_downstream(m_compiled_submodels[real_id].pipeline.context)) {
+                fix_tensor_names(moe_downstream->_model_to_compile);
+            }
+
             // Fix tensor names for main model (if not replaced by special models above)
             fix_tensor_names(m_compiled_submodels[real_id].model);
         }
@@ -791,6 +802,153 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
         dump_subgraph_composition(orderedSubgraphs);
     }
 #endif
+
+    // Extend NPU_ENABLE_STRIDES_FOR with every funcall-folded producer output/consumer input
+    // pair that LayerMajorInferRequest::register_bridges() bridges (Category A: any link whose
+    // producer is a funcall occurrence, not just MoE expert_input/router_scores), plus the MoE
+    // downstream submodel's expert-output input (a driver-only synthetic binding, not a graph
+    // edge - see the dedicated loop below), so the driver can bind a HiddenStateBridge's
+    // per-chunk ROI slot directly as the producer's own output (zero-copy capture,
+    // bind_producer_output()) and/or the consumer's own input (zero-copy inject/
+    // set_downstream_output_override(), same call made right before the consumer's own dispatch)
+    // instead of copy-based capture()/inject()/copy_to(). Must run here, before ANY submodel compiles: by the time a consumer's
+    // own compile_stage() runs, the producer - always compiled EARLIER in the sequential loop
+    // below - would already be done. Persistent for the whole session (no restore), unlike the
+    // pyramid/HFA blocks in compile_for_success() which mutate+restore around one nested compile
+    // call - that pattern doesn't fit here, see repo notes on this
+    // (layer-major-ei-rs-bridge-zerocopy-attempt.md).
+    // Gate the whole scan on the model actually being MoE-bearing (same proxy the original
+    // MoE-only pre-pass used): layer-major batching is the ONLY consumer of these sets (see
+    // LayerMajorInferRequest), and it's only ever constructed for models with compiled MoE
+    // experts - skip the scan (and the NPU_ENABLE_STRIDES_FOR compile-time side effect it
+    // causes) for every other model, which would otherwise pay this cost for no benefit.
+    bool any_submodel_has_moe = false;
+    for (std::size_t id = 0; id < orderedSubgraphs.size() && !any_submodel_has_moe; ++id) {
+        if (orderedSubgraphs[id]._optimized_out) {
+            continue;
+        }
+        if (ov::npuw::moe::get_compiled_experts(m_compiled_submodels[id].pipeline.context)) {
+            any_submodel_has_moe = true;
+        }
+    }
+    if (any_submodel_has_moe) {
+        std::set<std::pair<std::size_t, std::size_t>> producer_ports;
+        std::set<std::pair<std::size_t, std::size_t>> consumer_ports;
+        for (const auto& link : m_submodels_input_to_prev_output) {
+            const auto consumer_idx = link.first.first;
+            const auto consumer_param_idx = link.first.second;
+            const auto producer_idx = link.second.first;
+            const auto producer_port = link.second.second;
+            if (!m_compiled_submodels[producer_idx].replaced_by.has_value()) {
+                continue;  // matches register_bridges()'s Category A filter: producer must be a funcall
+            }
+            const auto producer_real_id = m_compiled_submodels[producer_idx].replaced_by.value();
+            const auto consumer_real_id = m_compiled_submodels[consumer_idx].replaced_by.value_or(consumer_idx);
+            producer_ports.insert({producer_real_id, producer_port});
+            consumer_ports.insert({consumer_real_id, consumer_param_idx});
+        }
+
+        // MoE downstream (post-expert combine) submodels' expert-output input isn't a normal
+        // graph edge (m_submodels_input_to_prev_output has no entry for it - MoEExecutor binds
+        // it directly via function_prologue_moe_input/set_downstream_output_override(), see
+        // moe_executor.cpp), so it's never discovered by the link scan above. Register it here
+        // too: the layer-major driver's batched-MoE-output accumulator (moe_output_bridge in
+        // llm_infer_request.cpp) needs this port strided-capable for the same reason ei/rs do -
+        // its per-chunk ROI slice is only contiguous when group_size==1.
+        for (std::size_t id = 0; id < orderedSubgraphs.size(); ++id) {
+            if (orderedSubgraphs[id]._optimized_out) {
+                continue;
+            }
+            if (const auto* moe_downstream =
+                    ov::npuw::moe::get_compiled_downstream(m_compiled_submodels[id].pipeline.context)) {
+                const auto real_id = m_compiled_submodels[id].replaced_by.value_or(id);
+                std::cout << "[STRIDE_DEBUG] found moe downstream at id=" << id << " real_id=" << real_id
+                          << " expert_output_param_idx=" << moe_downstream->expert_output_param_idx << std::endl;
+                consumer_ports.insert({real_id, moe_downstream->expert_output_param_idx});
+            }
+        }
+
+        if (!producer_ports.empty() || !consumer_ports.empty()) {
+            std::set<std::string> strided_names;
+            for (const auto& [producer_real_id, producer_port] : producer_ports) {
+                const auto& producer_model = m_compiled_submodels[producer_real_id].model;
+                if (!producer_model || producer_port >= producer_model->outputs().size()) {
+                    continue;
+                }
+                strided_names.insert(producer_model->outputs()[producer_port].get_any_name());
+            }
+            for (const auto& [consumer_real_id, consumer_param_idx] : consumer_ports) {
+                // MoE downstream's expert-output port is actually compiled from a separate,
+                // reshaped clone (_model_to_compile), not from .model - resolve the name from
+                // whichever object is truly compiled, so this can never desync from what the
+                // NPU compiler actually sees for this port.
+                std::shared_ptr<ov::Model> consumer_model = m_compiled_submodels[consumer_real_id].model;
+                if (const auto* moe_downstream = ov::npuw::moe::get_compiled_downstream(
+                        m_compiled_submodels[consumer_real_id].pipeline.context)) {
+                    if (moe_downstream->expert_output_param_idx == consumer_param_idx) {
+                        consumer_model = moe_downstream->_model_to_compile;
+                    }
+                }
+                if (!consumer_model || consumer_param_idx >= consumer_model->inputs().size()) {
+                    std::cout << "[STRIDE_DEBUG] SKIPPED consumer real_id=" << consumer_real_id
+                              << " param_idx=" << consumer_param_idx
+                              << " model_null=" << (consumer_model == nullptr)
+                              << " inputs_size=" << (consumer_model ? consumer_model->inputs().size() : 0)
+                              << std::endl;
+                    continue;
+                }
+                const auto& resolved_name = consumer_model->inputs()[consumer_param_idx].get_any_name();
+                std::cout << "[STRIDE_DEBUG] consumer real_id=" << consumer_real_id
+                          << " param_idx=" << consumer_param_idx << " name=" << resolved_name << std::endl;
+                strided_names.insert(resolved_name);
+            }
+
+            bool any_device_supports = false;
+            const auto& strides_key = ov::intel_npu::enable_strides_for.name();
+            for (const auto& device : m_dev_list) {
+                if (!ov::npuw::util::starts_with(device, "NPU")) {
+                    continue;
+                }
+                const auto supported_properties =
+                    get_npuw_plugin()->get_core()->get_property(device, ov::supported_properties);
+                if (std::find(supported_properties.begin(), supported_properties.end(), strides_key) ==
+                    supported_properties.end()) {
+                    continue;
+                }
+                any_device_supports = true;
+                const ov::Any existing_any =
+                    ov::npuw::util::at::_(m_meta_devices[device]).at_or(strides_key, std::string{});
+                std::string merged = existing_any.as<std::string>();
+                for (const auto& name : strided_names) {
+                    if (!merged.empty()) {
+                        merged += ",";
+                    }
+                    merged += name;
+                }
+                m_meta_devices[device][strides_key] = merged;
+                LOG_INFO("Enabled using tensor view for device: " << device
+                                                                   << " for layer-major bridge ports: " << merged);
+                std::cout << "[STRIDE_DEBUG] m_meta_devices[" << device << "][" << strides_key
+                          << "] = " << merged << std::endl;
+            }
+
+            // TEMPORARILY forced off (2026-09-27): disabling only moe_output_supports_strided
+            // in llm_infer_request.cpp did not restore correct output, so the whole strided-
+            // bridge mechanism (also used by ei/rs bridges and the fused-link cos/sin/
+            // hidden_state binds - see try_bind_strided/try_bind_strided_consumer) is disabled
+            // here to isolate whether the regression lives in this mechanism at all. Leaving
+            // both sets empty makes every supports_strided_producer_output()/
+            // supports_strided_consumer_input() call return false, so every bridge falls back
+            // to its old copy-based capture()/inject(). See repo notes
+            // (layer-major-ei-rs-bridge-zerocopy-attempt.md).
+            if (false && any_device_supports) {
+                std::cout << "[STRIDE_DEBUG] m_strided_producer_ports.size()=" << producer_ports.size()
+                          << " m_strided_consumer_ports.size()=" << consumer_ports.size() << std::endl;
+                m_strided_producer_ports = std::move(producer_ports);
+                m_strided_consumer_ports = std::move(consumer_ports);
+            }
+        }
+    }
 
     std::map<std::size_t, std::string> forced_sub_devices{};
     std::string fsd_opt = m_cfg.get<::intel_npu::NPUW_SUBMODEL_DEVICE>();
@@ -2403,6 +2561,15 @@ ov::SoPtr<ov::ICompiledModel> ov::npuw::CompiledModel::compile_submodel(const st
     // NOTE(dm): Not sure if it is required for the NPUW plugin, but likely it is
     // Make a device config COPY here!
     auto device_config = m_meta_devices[device];
+
+    {
+        const auto& strides_key = ov::intel_npu::enable_strides_for.name();
+        const auto it = device_config.find(strides_key);
+        std::cout << "[STRIDE_DEBUG] compile_submodel model=" << submodel->get_friendly_name()
+                  << " device=" << device << " " << strides_key << "="
+                  << (it != device_config.end() ? it->second.as<std::string>() : std::string{"<unset>"})
+                  << std::endl;
+    }
 
     if (ov::npuw::util::starts_with(device, "NPU") && m_cfg.get<::intel_npu::NPUW_UNFOLD_IREQS>()) {
         device_config["NPU_RUN_INFERENCES_SEQUENTIALLY"] = "YES";

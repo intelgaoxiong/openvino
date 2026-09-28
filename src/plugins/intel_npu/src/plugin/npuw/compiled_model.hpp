@@ -5,6 +5,8 @@
 #pragma once
 
 #include <optional>
+#include <set>
+#include <utility>
 
 #include "attention.hpp"
 #include "base_sync_infer_request.hpp"
@@ -253,6 +255,24 @@ private:
     DeviceProperties m_meta_devices;
 
     DevList m_dev_list;
+
+    // {producer real_id, producer output port idx} pairs for which NPU_ENABLE_STRIDES_FOR was
+    // successfully requested (device confirmed support) at compile time, so a funcall-folded
+    // producer feeding ANY consumer (not just MoE expert_input/router_scores - every Category A
+    // link LayerMajorInferRequest::register_bridges() bridges) can be bound directly as a
+    // HiddenStateBridge's per-chunk ROI slot (zero-copy) instead of copy-based capture() - see
+    // LayerMajorInferRequest::bridge_for_link() callers in llm_infer_request.cpp. Populated once
+    // in the constructor, before any submodel compiles; empty if no NPU device in m_dev_list
+    // reports support, in which case callers must fall back to the copy path.
+    std::set<std::pair<std::size_t, std::size_t>> m_strided_producer_ports;
+
+    // {consumer real_id, consumer input port idx} pairs for which NPU_ENABLE_STRIDES_FOR was
+    // successfully requested at compile time - the symmetric counterpart of
+    // m_strided_producer_ports. Binding a bridge slot directly as a CONSUMER's own input
+    // (replacing bridge_inject's copy_to()) requires the consumer's own set_tensor() to accept
+    // a non-contiguous tensor too, not just the producer's - see
+    // LayerMajorInferRequest::supports_strided_consumer_input().
+    std::set<std::pair<std::size_t, std::size_t>> m_strided_consumer_ports;
 
     struct execution_stats {
         float gflops{};

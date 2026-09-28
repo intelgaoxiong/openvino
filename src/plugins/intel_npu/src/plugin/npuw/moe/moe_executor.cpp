@@ -266,6 +266,18 @@ void MoEExecutor::set_downstream_output_override(const ov::SoPtr<ov::ITensor>& t
     m_downstream_output_override = tensor;
 }
 
+std::optional<size_t> MoEExecutor::expert_output_param_idx(size_t idx) const {
+    const auto& desc =
+        *static_cast<const ov::npuw::CompiledModel::CompiledModelDesc*>(m_accessor.get_submodel_desc(idx));
+    const auto real_idx = desc.replaced_by.value_or(idx);
+    const auto& real_desc =
+        *static_cast<const ov::npuw::CompiledModel::CompiledModelDesc*>(m_accessor.get_submodel_desc(real_idx));
+    if (const auto* moe_downstream = get_compiled_downstream(real_desc.pipeline.context)) {
+        return moe_downstream->expert_output_param_idx;
+    }
+    return std::nullopt;
+}
+
 void MoEExecutor::clear_downstream_output_override() {
     m_downstream_output_override = {};
 }
