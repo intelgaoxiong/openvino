@@ -854,6 +854,24 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
             consumer_ports.insert({consumer_real_id, consumer_param_idx});
         }
 
+        // Stage 3: MoE downstream's expert-output input has NO graph edge in
+        // m_submodels_input_to_prev_output (it's bound out-of-band via
+        // function_prologue_moe_input()/set_downstream_output_override(), invisible to that map) -
+        // register it here explicitly so LayerMajorInferRequest::supports_strided_consumer_input()
+        // can be queried for it too. Name resolution for this specific port happens later, in
+        // compile_for_success(), from moe_downstream->_model_to_compile (the model actually
+        // compiled for this real_id) - never from desc.model, same reasoning as the guard there.
+        for (std::size_t id = 0; id < orderedSubgraphs.size(); ++id) {
+            const std::size_t real_id = m_compiled_submodels[id].replaced_by.value_or(id);
+            if (real_id != id) {
+                continue;  // process each real function body once
+            }
+            if (const auto* moe_downstream =
+                    ov::npuw::moe::get_compiled_downstream(m_compiled_submodels[real_id].pipeline.context)) {
+                consumer_ports.insert({real_id, moe_downstream->expert_output_param_idx});
+            }
+        }
+
         if (!producer_ports.empty() || !consumer_ports.empty()) {
             bool any_device_supports = false;
             const auto& strides_key = ov::intel_npu::enable_strides_for.name();
@@ -2300,6 +2318,17 @@ bool ov::npuw::CompiledModel::compile_for_success(std::size_t id, const std::vec
             if (real_id == id && port < desc.model->inputs().size()) {
                 own_strided_names.insert(desc.model->inputs()[port].get_any_name());
             }
+        }
+    }
+
+    // Stage 3: MoE downstream's expert-output port IS compiled via compile_executor (skipped by
+    // the generic scan above), so resolve its name directly from the model that's actually
+    // compiled for this real_id (moe_downstream->_model_to_compile), not desc.model.
+    if (const auto* moe_downstream = ov::npuw::moe::get_compiled_downstream(desc.pipeline.context)) {
+        const auto& downstream_model = moe_downstream->_model_to_compile;
+        if (downstream_model && moe_downstream->expert_output_param_idx < downstream_model->inputs().size()) {
+            own_strided_names.insert(
+                downstream_model->inputs()[moe_downstream->expert_output_param_idx].get_any_name());
         }
     }
     std::map<std::string, std::string> saved_strides_by_device;

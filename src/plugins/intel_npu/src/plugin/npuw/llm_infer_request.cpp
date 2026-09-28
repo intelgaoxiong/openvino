@@ -1592,7 +1592,8 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
     // requires (see buffer_shape derivation in moe_resources.cpp) - a sub-range slice of it is
     // only contiguous when group_size==1 (slot(0) then spans the whole buffer). With
     // group_size>1 and num_active_experts>1, the slice is a strided, multi-block view that the
-    // NPU driver's set_tensor() rejects (tensor->is_continuous() check). Falls back to copying
+    // NPU driver's set_tensor() rejects unless the downstream's expert-output port was confirmed
+    // strided-capable at compile time (moe_output_supports_strided below) - falls back to copying
     // the slice into this single-chunk scratch tensor before binding it as the override.
     ov::SoPtr<ov::ITensor> moe_output_scratch;
 
@@ -1751,10 +1752,11 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 std::vector<bool> group0_fused_zero_copy(group0_fused_links.size());
                 for (std::size_t i = 0; i < group0_fused_links.size(); ++i) {
                     const auto& link = group0_fused_links[i];
-                    // Bisection: forced off (Stage 2a-ii) to isolate the collect_fused_links()
-                    // enumeration/loop refactor itself from the zero-copy bind action.
+                    // Re-enabled (2026-09-28): the Stage 2a regression is now believed fixed by
+                    // compile_for_success()'s compile_executor/per-submodel CSV-scoping guard
+                    // (see repo notes layer-major-ei-rs-bridge-zerocopy-attempt.md) - retesting.
                     group0_fused_zero_copy[i] =
-                        false && try_bind_strided(*link.bridge, link.producer_idx, link.producer_port, c, group_size);
+                        try_bind_strided(*link.bridge, link.producer_idx, link.producer_port, c, group_size);
                 }
 
                 // This span gets re-dispatched again (same [seg_start, moe_idx) idx range) by
@@ -1872,6 +1874,14 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                                                               nullptr);
             }
 
+            // Invariant across this L's group_size chunk loop below - resolved once, not per chunk.
+            const auto moe_downstream_idx = group.moe_idx + 1;
+            const auto moe_downstream_output_param_idx =
+                lm_request->moe_downstream_expert_output_param_idx(moe_downstream_idx);
+            const bool moe_output_supports_strided =
+                moe_downstream_output_param_idx.has_value() &&
+                lm_request->supports_strided_consumer_input(moe_downstream_idx, *moe_downstream_output_param_idx);
+
             for (uint32_t c = 0; c < group_size; ++c) {
                 // run_batched() bypasses the normal per-occurrence dispatch/dump path (see
                 // run_subrequest_for_success), so this occurrence's own input/output never hits
@@ -1885,7 +1895,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                 lm_request->dump_named_tensor(group.moe_idx, "output", moe_output_bridge.slot(c));
 
                 auto moe_output_slot = moe_output_bridge.slot(c);
-                if (!moe_output_slot->is_continuous()) {
+                if (!moe_output_slot->is_continuous() && !moe_output_supports_strided) {
                     moe_output_slot->copy_to(moe_output_scratch._ptr);
                     moe_output_slot = moe_output_scratch;
                 }
@@ -1997,10 +2007,9 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
                         next_downstream_zero_copy.resize(next_downstream_links.size());
                         for (std::size_t i = 0; i < next_downstream_links.size(); ++i) {
                             const auto& link = next_downstream_links[i];
-                            // Bisection: forced off (Stage 2a-i) to isolate group0_fused_links
-                            // from next_downstream_links as the cause of the 2a regression.
+                            // Re-enabled (2026-09-28): see group0_fused_zero_copy's comment above.
                             next_downstream_zero_copy[i] =
-                                false && try_bind_strided(*link.bridge, link.producer_idx, link.producer_port, c, group_size);
+                                try_bind_strided(*link.bridge, link.producer_idx, link.producer_port, c, group_size);
                         }
                     }
                 }

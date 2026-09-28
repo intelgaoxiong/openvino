@@ -121,6 +121,12 @@ public:
     // copy_to()) instead of the producer side doing the zero-copy write.
     bool supports_strided_consumer_input(std::size_t consumer_idx, std::size_t consumer_param_idx) const;
 
+    // Resolves idx's real function body and looks up its compiled-downstream pipeline state
+    // (out-of-band MoE bookkeeping - this port has no graph edge, see CompiledModel's layer-major
+    // bridge pre-pass). Returns the expert-output input's param_idx, or nullopt if idx isn't a
+    // compiled MoE downstream submodel.
+    std::optional<std::size_t> moe_downstream_expert_output_param_idx(std::size_t idx) const;
+
     // producer_idx's producer_port-th output port, resolved via its function body's compiled
     // model - unlike a submodel's ov::Model (which detach_memory() may release), this is
     // always available at runtime. Used to read a producer's static shape/type before it has

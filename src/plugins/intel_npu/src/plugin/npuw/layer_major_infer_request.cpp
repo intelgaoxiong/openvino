@@ -8,6 +8,7 @@
 #include <set>
 
 #include "compiled_model.hpp"
+#include "moe/moe_subgraph.hpp"
 
 ov::npuw::LayerMajorInferRequest::LayerMajorInferRequest(const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model)
     : JustInferRequest(compiled_model) {
@@ -171,6 +172,18 @@ bool ov::npuw::LayerMajorInferRequest::supports_strided_consumer_input(std::size
     const auto real_idx = comp_model_desc.replaced_by.value_or(consumer_idx);
     return m_npuw_model->m_strided_consumer_ports.count({real_idx, consumer_param_idx}) != 0;
 }
+
+std::optional<std::size_t> ov::npuw::LayerMajorInferRequest::moe_downstream_expert_output_param_idx(
+    std::size_t idx) const {
+    const auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
+    const auto real_idx = comp_model_desc.replaced_by.value_or(idx);
+    if (const auto* moe_downstream = ov::npuw::moe::get_compiled_downstream(
+            m_npuw_model->m_compiled_submodels[real_idx].pipeline.context)) {
+        return moe_downstream->expert_output_param_idx;
+    }
+    return std::nullopt;
+}
+
 
 const ov::Output<const ov::Node>& ov::npuw::LayerMajorInferRequest::producer_output_port(
     std::size_t producer_idx,
