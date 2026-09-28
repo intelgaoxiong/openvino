@@ -157,3 +157,37 @@ ov::npuw::HiddenStateBridge* ov::npuw::LayerMajorInferRequest::global_cache_for(
     }
     return nullptr;
 }
+
+bool ov::npuw::LayerMajorInferRequest::supports_strided_producer_output(std::size_t producer_idx,
+                                                                         std::size_t producer_port) const {
+    const auto& comp_model_desc = m_npuw_model->m_compiled_submodels[producer_idx];
+    const auto real_idx = comp_model_desc.replaced_by.value_or(producer_idx);
+    return m_npuw_model->m_strided_producer_ports.count({real_idx, producer_port}) != 0;
+}
+
+bool ov::npuw::LayerMajorInferRequest::supports_strided_consumer_input(std::size_t consumer_idx,
+                                                                        std::size_t consumer_param_idx) const {
+    const auto& comp_model_desc = m_npuw_model->m_compiled_submodels[consumer_idx];
+    const auto real_idx = comp_model_desc.replaced_by.value_or(consumer_idx);
+    return m_npuw_model->m_strided_consumer_ports.count({real_idx, consumer_param_idx}) != 0;
+}
+
+const ov::Output<const ov::Node>& ov::npuw::LayerMajorInferRequest::producer_output_port(
+    std::size_t producer_idx,
+    std::size_t producer_port) const {
+    const auto& comp_model_desc = m_npuw_model->m_compiled_submodels[producer_idx];
+    const auto real_idx = comp_model_desc.replaced_by.value_or(producer_idx);
+    return m_npuw_model->m_compiled_submodels[real_idx].compiled_model->outputs()[producer_port];
+}
+
+void ov::npuw::LayerMajorInferRequest::bind_producer_output(std::size_t producer_idx,
+                                                             std::size_t producer_port,
+                                                             const TensorPtr& tensor) {
+    m_funcall_result[LinkFrom{producer_idx, producer_port}] = tensor;
+}
+
+ov::SoPtr<ov::ITensor> ov::npuw::LayerMajorInferRequest::alloc_strided_mem(const ov::element::Type& type,
+                                                                           const ov::Shape& shape) const {
+    return allocMem(type, shape, "NPU");
+}
+

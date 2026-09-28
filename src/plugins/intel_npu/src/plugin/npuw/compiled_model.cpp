@@ -779,6 +779,19 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                 }
             }
 
+            // Fix tensor names for MoE downstream model. This clone was made at partition time
+            // (before this loop ever ran) from the ORIGINAL, not-yet-fixed model, so it never
+            // got a fill_empty_tensor_names() pass. Root cause of the earlier accuracy regression
+            // (CONFIRMED 2026-09-28 via [MOE_DOWNSTREAM_DEBUG] prints): it was never about THIS
+            // clone's own names colliding with each other - it's that compile_for_success()
+            // resolved NPU_ENABLE_STRIDES_FOR port names from desc.model (the ORIGINAL model for
+            // this real_id) while the actual compile targets this clone via compile_executor;
+            // see the fix scoped in compile_for_success() for the real story.
+            if (auto* moe_downstream =
+                    ov::npuw::moe::get_compiled_downstream(m_compiled_submodels[real_id].pipeline.context)) {
+                fix_tensor_names(moe_downstream->_model_to_compile);
+            }
+
             // Fix tensor names for main model (if not replaced by special models above)
             fix_tensor_names(m_compiled_submodels[real_id].model);
         }
@@ -791,6 +804,78 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
         dump_subgraph_composition(orderedSubgraphs);
     }
 #endif
+
+    // Identify every funcall-folded producer output that LayerMajorInferRequest::register_bridges()
+    // bridges (Category A: any link whose producer is a funcall occurrence), so the driver can bind
+    // a HiddenStateBridge's per-chunk ROI slot directly as the producer's own output (zero-copy
+    // capture, bind_producer_output()) instead of copy-based capture(). Must run here, before ANY
+    // submodel compiles: by the time a consumer's own compile_stage() runs, the producer - always
+    // compiled EARLIER in the sequential loop below - would already be done.
+    // NOTE: this only POPULATES m_strided_producer_ports/m_strided_consumer_ports (the runtime-side
+    // "is this link zero-copy eligible" bookkeeping). The actual NPU_ENABLE_STRIDES_FOR compiler
+    // property is deliberately NOT touched here - it is applied per-submodel, scoped to exactly the
+    // one real_id being compiled, inside compile_for_success() (mirroring the pyramid/HFA blocks
+    // there). A single device-global CSV merged once here would leak enablement to every OTHER
+    // submodel compiled on that device afterwards; two unrelated submodels can independently fall
+    // back to the same generic fill_empty_tensor_names() name (e.g. "npuw_in_tensor_0"), which was
+    // CONFIRMED (2026-09-28, see repo notes layer-major-ei-rs-bridge-zerocopy-attempt.md) to
+    // mis-mark an unrelated MoE downstream port as supportsStridedLayout=true and corrupt its data.
+    // STAGE 2b of the zero-copy bisection (producer-side, from Stage 1, plus consumer-side, see
+    // repo notes layer-major-ei-rs-bridge-zerocopy-attempt.md): the MoE downstream expert-output
+    // consumer port is deliberately NOT scanned/registered yet (Stage 3 only - it needs
+    // _model_to_compile-based name resolution, not m_compiled_submodels[...].model).
+    // Gate the whole scan on the model actually being MoE-bearing (layer-major batching is the
+    // only consumer of this set, and it's only ever constructed for models with compiled MoE
+    // experts) - skip the scan for every other model, which would otherwise pay this cost for no
+    // benefit.
+    bool any_submodel_has_moe = false;
+    for (std::size_t id = 0; id < orderedSubgraphs.size() && !any_submodel_has_moe; ++id) {
+        if (orderedSubgraphs[id]._optimized_out) {
+            continue;
+        }
+        if (ov::npuw::moe::get_compiled_experts(m_compiled_submodels[id].pipeline.context)) {
+            any_submodel_has_moe = true;
+        }
+    }
+    if (any_submodel_has_moe) {
+        std::set<std::pair<std::size_t, std::size_t>> producer_ports;
+        std::set<std::pair<std::size_t, std::size_t>> consumer_ports;
+        for (const auto& link : m_submodels_input_to_prev_output) {
+            const auto consumer_idx = link.first.first;
+            const auto consumer_param_idx = link.first.second;
+            const auto producer_idx = link.second.first;
+            const auto producer_port = link.second.second;
+            if (!m_compiled_submodels[producer_idx].replaced_by.has_value()) {
+                continue;  // matches register_bridges()'s Category A filter: producer must be a funcall
+            }
+            const auto producer_real_id = m_compiled_submodels[producer_idx].replaced_by.value();
+            const auto consumer_real_id = m_compiled_submodels[consumer_idx].replaced_by.value_or(consumer_idx);
+            producer_ports.insert({producer_real_id, producer_port});
+            consumer_ports.insert({consumer_real_id, consumer_param_idx});
+        }
+
+        if (!producer_ports.empty() || !consumer_ports.empty()) {
+            bool any_device_supports = false;
+            const auto& strides_key = ov::intel_npu::enable_strides_for.name();
+            for (const auto& device : m_dev_list) {
+                if (!ov::npuw::util::starts_with(device, "NPU")) {
+                    continue;
+                }
+                const auto supported_properties =
+                    get_npuw_plugin()->get_core()->get_property(device, ov::supported_properties);
+                if (std::find(supported_properties.begin(), supported_properties.end(), strides_key) !=
+                    supported_properties.end()) {
+                    any_device_supports = true;
+                    break;
+                }
+            }
+
+            if (any_device_supports) {
+                m_strided_producer_ports = std::move(producer_ports);
+                m_strided_consumer_ports = std::move(consumer_ports);
+            }
+        }
+    }
 
     std::map<std::size_t, std::string> forced_sub_devices{};
     std::string fsd_opt = m_cfg.get<::intel_npu::NPUW_SUBMODEL_DEVICE>();
@@ -2188,6 +2273,65 @@ bool ov::npuw::CompiledModel::compile_for_success(std::size_t id, const std::vec
         return false;
     }
 
+    // Scope NPU_ENABLE_STRIDES_FOR to exactly this submodel's own layer-major bridge port names
+    // (computed once in the constructor pre-pass into m_strided_producer_ports/consumer_ports),
+    // save/restore around this whole call - mirrors the pyramid/HFA blocks below. Two DIFFERENT
+    // submodels never share this CSV window, so an accidental same-fallback-name collision (e.g.
+    // two independently-unnamed ports both becoming "npuw_in_tensor_0") can no longer leak
+    // enablement across submodels.
+    //
+    // Guard: when this real_id has its own pipeline.compile_executor (MoE experts/downstream),
+    // desc.model is NEVER actually compiled - the executor substitutes a completely different
+    // model (e.g. moe_downstream's _model_to_compile). Resolving names from desc.model in that
+    // case would still apply the resulting CSV to the SUBSTITUTED model's compile call below,
+    // where an unrelated port can coincidentally carry the exact same fallback name (both models
+    // independently run fill_empty_tensor_names) and get wrongly marked as zero-copy eligible.
+    // CONFIRMED (2026-09-28): this is the actual root cause of the MoE downstream accuracy
+    // regression, reproducing even with NPUW_LLM_MOE_BATCH_CHUNKS=0 since it is purely a
+    // compile-time property leak, independent of which runtime driver executes afterwards.
+    std::set<std::string> own_strided_names;
+    if (desc.model && !desc.pipeline.compile_executor) {
+        for (const auto& [real_id, port] : m_strided_producer_ports) {
+            if (real_id == id && port < desc.model->outputs().size()) {
+                own_strided_names.insert(desc.model->outputs()[port].get_any_name());
+            }
+        }
+        for (const auto& [real_id, port] : m_strided_consumer_ports) {
+            if (real_id == id && port < desc.model->inputs().size()) {
+                own_strided_names.insert(desc.model->inputs()[port].get_any_name());
+            }
+        }
+    }
+    std::map<std::string, std::string> saved_strides_by_device;
+    if (!own_strided_names.empty()) {
+        const auto& strides_key = ov::intel_npu::enable_strides_for.name();
+        for (const auto& device : main_candidates) {
+            if (!ov::npuw::util::starts_with(device, "NPU")) {
+                continue;
+            }
+            const auto supported_properties =
+                get_npuw_plugin()->get_core()->get_property(device, ov::supported_properties);
+            if (std::find(supported_properties.begin(), supported_properties.end(), strides_key) ==
+                supported_properties.end()) {
+                continue;
+            }
+            const ov::Any existing_any =
+                ov::npuw::util::at::_(m_meta_devices[device]).at_or(strides_key, std::string{});
+            std::string existing = existing_any.as<std::string>();
+            saved_strides_by_device[device] = existing;
+            std::string merged = existing;
+            for (const auto& name : own_strided_names) {
+                if (!merged.empty()) {
+                    merged += ",";
+                }
+                merged += name;
+            }
+            m_meta_devices[device][strides_key] = merged;
+            LOG_INFO("Enabled using tensor view for device: " << device << " for layer-major bridge ports (Subgraph["
+                                                               << id << "]): " << merged);
+        }
+    }
+
     // Factory builder: returns a failsafe::CompiledModel::Factory for the given model+suffix.
     // Captures the model as weak_ptr so that detach_memory() can truly release it when
     // no runtime fallback is expected. If the model has been cleared and failover fires
@@ -2390,6 +2534,17 @@ bool ov::npuw::CompiledModel::compile_for_success(std::size_t id, const std::vec
             }
         }
     }  //  if (hfa)
+
+    if (!saved_strides_by_device.empty()) {
+        const auto& strides_key = ov::intel_npu::enable_strides_for.name();
+        for (const auto& [device, saved] : saved_strides_by_device) {
+            if (saved.empty()) {
+                m_meta_devices[device].erase(strides_key);
+            } else {
+                m_meta_devices[device][strides_key] = saved;
+            }
+        }
+    }
 
     return true;
 }
