@@ -108,42 +108,6 @@ public:
     // index-based overload above. Returns nullptr if the name isn't a top-level input.
     HiddenStateBridge* global_cache_for(const std::string& global_input_name);
 
-    // True if producer_idx's producer_port-th output was confirmed, at compile time, to
-    // support NPU_ENABLE_STRIDES_FOR (see CompiledModel's layer-major bridge pre-pass), i.e. it
-    // is safe to call bind_producer_output() for this link instead of a copy-based capture().
-    bool supports_strided_producer_output(std::size_t producer_idx, std::size_t producer_port) const;
-
-    // True if consumer_idx's consumer_param_idx-th input was confirmed, at compile time, to
-    // support NPU_ENABLE_STRIDES_FOR - the symmetric counterpart of
-    // supports_strided_producer_output(), needed to safely call bind_producer_output() right
-    // before the CONSUMER's own dispatch (replacing bridge_inject's copy_to()) instead of
-    // before the producer's.
-    bool supports_strided_consumer_input(std::size_t consumer_idx, std::size_t consumer_param_idx) const;
-
-    // producer_idx's producer_port-th output port, resolved via its function body's compiled
-    // model - unlike a submodel's ov::Model (which detach_memory() may release), this is
-    // always available at runtime. Used to read a producer's static shape/type before it has
-    // ever been dispatched, so a HiddenStateBridge can be configured ahead of the first
-    // bind_producer_output() call.
-    const ov::Output<const ov::Node>& producer_output_port(std::size_t producer_idx, std::size_t producer_port) const;
-
-    // Pre-binds producer_idx's producer_port-th output tensor to tensor, so the NEXT
-    // infer_range() call that dispatches producer_idx (a funcall occurrence) writes its
-    // result directly into tensor via function_prologue()'s existing m_funcall_result lookup,
-    // instead of the request's own default output allocation. Must be called BEFORE that
-    // infer_range() call, and only when supports_strided_producer_output() is true for the
-    // same link - otherwise the NPU may write into non-contiguous memory it wasn't compiled
-    // to support.
-    void bind_producer_output(std::size_t producer_idx, std::size_t producer_port, const TensorPtr& tensor);
-
-    // Allocates an NPU-resident tensor of the given type/shape, for use as a
-    // HiddenStateBridge's backing buffer when zero-copy producer binding is used (see
-    // bind_producer_output() above) - the NPU compiled model can only write into
-    // device-resident memory. Wraps the base class's protected allocMem() (which needs
-    // m_npuw_model's plugin to create the NPU remote context), since callers outside the
-    // infer-request hierarchy (llm_infer_request.cpp) cannot call it directly.
-    ov::SoPtr<ov::ITensor> alloc_strided_mem(const ov::element::Type& type, const ov::Shape& shape) const;
-
     // Toggles function-call pipelining (m_use_function_pipelining, protected in the base
     // class) for subsequent infer_range() calls. The driver must disable this immediately
     // before any infer_range() call that repeats a span it already dispatched earlier in the
