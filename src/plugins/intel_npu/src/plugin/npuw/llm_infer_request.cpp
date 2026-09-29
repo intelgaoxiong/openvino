@@ -1028,7 +1028,8 @@ void ov::npuw::LLMInferRequest::clear_chunk_prefill_kv_cache() {
 static void print_prefill_sublayer_timing_report(
     const std::vector<std::map<std::size_t, float>>& chunk_timings,
     const std::map<std::size_t, std::size_t>& call_counts,
-    const ov::npuw::IBaseInferRequest& req) {
+    const ov::npuw::IBaseInferRequest& req,
+    const char* title = "Prefill Sublayer Timing (ms, grouped by real subgraph)") {
     if (chunk_timings.empty())
         return;
 
@@ -1040,7 +1041,7 @@ static void print_prefill_sublayer_timing_report(
     const std::size_t num_chunks = chunk_timings.size();
     const int cw = 9;  // column width for each timing value
 
-    std::cerr << "\n=== Prefill Sublayer Timing (ms, grouped by real subgraph) ===\n";
+    std::cerr << "\n=== " << title << " ===\n";
     std::cerr << std::left << std::setw(6) << " real" << std::setw(7) << " device" << std::setw(7) << " calls";
     for (std::size_t c = 0; c < num_chunks; c++) {
         std::ostringstream hdr;
@@ -1242,6 +1243,16 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
     // Sublayer timing: collect per-chunk timing grouped by real subgraph index.
     const auto sublayer_counts = m_prefill_base_request->sublayer_call_counts();
     std::vector<std::map<std::size_t, float>> chunk_timings;
+    // Narrower breakdown: the portion of the above that unpack_closure() spent synchronously
+    // inside function_prologue() (only nonzero when pipelining was off for that dispatch - see
+    // get_sublayer_closure_timings()'s declaration comment). Chunk-major never disables
+    // pipelining mid-prefill, so this is expected to stay ~0 here; it exists mainly so this
+    // driver's numbers can be diffed against infer_chunked_prefill_layer_major()'s.
+    std::vector<std::map<std::size_t, float>> chunk_closure_timings;
+    // Narrower breakdown of the remainder: time spent in unsafe_run_this_prep_next() (actual
+    // NPU start_async()/wait() dispatch) - see get_sublayer_dispatch_timings()'s declaration
+    // comment.
+    std::vector<std::map<std::size_t, float>> chunk_dispatch_timings;
     m_prefill_base_request->enable_sublayer_timing();
 
     while (remaining_prompts > 0) {
@@ -1313,6 +1324,8 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
         });
 
         chunk_timings.push_back(m_prefill_base_request->get_sublayer_timings());
+        chunk_closure_timings.push_back(m_prefill_base_request->get_sublayer_closure_timings());
+        chunk_dispatch_timings.push_back(m_prefill_base_request->get_sublayer_dispatch_timings());
 
         m_llm_profile["1/prefill:3c.post_chunk"].record([&]() {
             // Accumulate Eagle3 last_hidden_state from this chunk
@@ -1361,6 +1374,14 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
 
     m_prefill_base_request->disable_sublayer_timing();
     print_prefill_sublayer_timing_report(chunk_timings, sublayer_counts, *m_prefill_base_request);
+    print_prefill_sublayer_timing_report(chunk_closure_timings,
+                                         sublayer_counts,
+                                         *m_prefill_base_request,
+                                         "Prefill Sublayer Timing - unpack_closure() only (ms)");
+    print_prefill_sublayer_timing_report(chunk_dispatch_timings,
+                                         sublayer_counts,
+                                         *m_prefill_base_request,
+                                         "Prefill Sublayer Timing - unsafe_run_this_prep_next() only (ms)");
 
     if (enable_prefix_caching) {
         prefix_caching_helper->print_cache_status();
@@ -2119,6 +2140,41 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill_layer_major(ov::SoPtr<ov::
     print_prefill_sublayer_timing_report({m_prefill_base_request->get_sublayer_timings()},
                                          sublayer_counts,
                                          *m_prefill_base_request);
+    // Narrower breakdown: how much of the total above is unpack_closure() running synchronously
+    // inside function_prologue() because pipelining was force-disabled for a repeated span (see
+    // will_repeat_this_span above and get_sublayer_closure_timings()'s declaration comment). A
+    // real_idx row here that is a large fraction of its own row in the table above means most of
+    // that regression is host-side closure re-upload, not slower NPU dispatch/wait.
+    print_prefill_sublayer_timing_report({m_prefill_base_request->get_sublayer_closure_timings()},
+                                         sublayer_counts,
+                                         *m_prefill_base_request,
+                                         "Prefill Sublayer Timing - unpack_closure() only (ms)");
+    // Second breakdown: actual NPU start_async()/wait() dispatch time - see
+    // get_sublayer_dispatch_timings()'s declaration comment. What's left after subtracting both
+    // breakdowns from the total above is function_prologue()'s param-bind loop plus
+    // bind_global_results()/behavior/dump overhead.
+    print_prefill_sublayer_timing_report({m_prefill_base_request->get_sublayer_dispatch_timings()},
+                                         sublayer_counts,
+                                         *m_prefill_base_request,
+                                         "Prefill Sublayer Timing - unsafe_run_this_prep_next() only (ms)");
+
+    // Memory footprint of this driver's own buffering, to help attribute any post-prefill
+    // slowdown (e.g. lm_head during generate) to memory/bandwidth pressure vs. a dispatch-time
+    // regression - see the "why does lm_head get slower" investigation this print was added for.
+    const auto bridge_bytes = lm_request->bridge_memory_bytes();
+    const auto global_cache_bytes = lm_request->global_cache_memory_bytes();
+    const auto moe_output_bytes = moe_output_bridge.byte_size();
+    const auto total_bytes = bridge_bytes + global_cache_bytes + moe_output_bytes;
+    const auto to_mb = [](std::size_t bytes) {
+        return static_cast<double>(bytes) / (1024.0 * 1024.0);
+    };
+    std::cerr << "\n=== Layer-major bridge memory usage ===\n"
+              << "  Category A bridges (hidden_state/expert_input/router_scores/downstream): "
+              << std::fixed << std::setprecision(1) << to_mb(bridge_bytes) << " MB\n"
+              << "  Category B global caches (attn_mask/position_ids/swa_mask): " << to_mb(global_cache_bytes)
+              << " MB\n"
+              << "  MoE output accumulator (moe_output_bridge): " << to_mb(moe_output_bytes) << " MB\n"
+              << "  Total: " << to_mb(total_bytes) << " MB\n\n";
 }
 
 void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input_ids,
@@ -2196,6 +2252,14 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
     print_prefill_sublayer_timing_report({m_prefill_base_request->get_sublayer_timings()},
                                          sublayer_counts,
                                          *m_prefill_base_request);
+    print_prefill_sublayer_timing_report({m_prefill_base_request->get_sublayer_closure_timings()},
+                                         sublayer_counts,
+                                         *m_prefill_base_request,
+                                         "Prefill Sublayer Timing - unpack_closure() only (ms)");
+    print_prefill_sublayer_timing_report({m_prefill_base_request->get_sublayer_dispatch_timings()},
+                                         sublayer_counts,
+                                         *m_prefill_base_request,
+                                         "Prefill Sublayer Timing - unsafe_run_this_prep_next() only (ms)");
 
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
     kvcache_desc.num_stored_tokens += static_cast<uint32_t>(input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM]);

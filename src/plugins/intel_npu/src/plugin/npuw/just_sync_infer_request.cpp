@@ -19,6 +19,7 @@
 #include "openvino/core/except.hpp"
 #include "openvino/core/parallel.hpp"
 #include "openvino/runtime/iasync_infer_request.hpp"
+#include "perf.hpp"
 #include "plugin.hpp"
 #include "pyramid_attention.hpp"
 #include "v1/elements/failsafe.hpp"
@@ -853,7 +854,13 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
     if (!is_pipelined(idx) && m_closure_update_required && !func_desc.forced_to_fcall) {
         LOG_DEBUG("Unpacking closures...");
         LOG_BLOCK();
-        unpack_closure(idx, m_subrequests[real_idx]);
+        if (m_sublayer_timing_enabled) {
+            m_sublayer_closure_ms[real_idx] += perf::ms_to_run([&]() {
+                unpack_closure(idx, m_subrequests[real_idx]);
+            });
+        } else {
+            unpack_closure(idx, m_subrequests[real_idx]);
+        }
     }
 
     // 3. Tell the function which results to produce (this time).
@@ -953,7 +960,13 @@ void ov::npuw::JustInferRequest::run_subrequest_for_success(std::size_t idx) {
 
     LOG_DEBUG("Trying to run subrequest[" << idx << "]...");
     LOG_BLOCK();
-    unsafe_run_this_prep_next(idx, next_prepared);
+    if (m_sublayer_timing_enabled) {
+        m_sublayer_dispatch_ms[real_idx] += perf::ms_to_run([&]() {
+            unsafe_run_this_prep_next(idx, next_prepared);
+        });
+    } else {
+        unsafe_run_this_prep_next(idx, next_prepared);
+    }
 
     LOG_DEBUG("Done: " << idx << "(exec subrequest)");
 

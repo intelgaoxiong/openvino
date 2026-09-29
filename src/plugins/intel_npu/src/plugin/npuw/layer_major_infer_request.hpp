@@ -160,6 +160,15 @@ public:
     // separately.
     bool set_function_pipelining(bool enable);
 
+    // Total bytes currently allocated across every Category A bridge (register_bridges()) - lets
+    // a driver gauge layer-major's peak buffer memory overhead (see design doc §4.4.2), e.g. to
+    // compare against chunk-major's much smaller per-chunk footprint.
+    std::size_t bridge_memory_bytes() const;
+
+    // Same as bridge_memory_bytes() above, for Category B global caches (attention_mask/
+    // position_ids/sliding_window_attention_mask).
+    std::size_t global_cache_memory_bytes() const;
+
 private:
     // One-time constructor walk that discovers which links/global-inputs need bridging (keys
     // only - no tensor memory is allocated here, see HiddenStateBridge::configure()).

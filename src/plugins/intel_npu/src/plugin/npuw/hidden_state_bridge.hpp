@@ -49,6 +49,10 @@ public:
     // The whole contiguous buffer spanning all chunks - what a batched MoE call consumes/produces.
     const util::TensorPtr& whole() const;
 
+    // Bytes currently backing this bridge, 0 if never configure()'d - lets a driver report its
+    // own peak buffer memory overhead without needing to know the buffer's shape/type itself.
+    std::size_t byte_size() const;
+
 private:
     util::TensorPtr m_buffer;
     uint32_t m_chunk_dim = 0;

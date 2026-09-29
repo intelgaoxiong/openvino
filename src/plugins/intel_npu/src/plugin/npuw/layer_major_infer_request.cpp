@@ -199,6 +199,22 @@ void ov::npuw::LayerMajorInferRequest::bind_producer_output(std::size_t producer
     m_funcall_result[LinkFrom{producer_idx, producer_port}] = tensor;
 }
 
+std::size_t ov::npuw::LayerMajorInferRequest::bridge_memory_bytes() const {
+    std::size_t total = 0u;
+    for (const auto& kv : m_bridges) {
+        total += kv.second.byte_size();
+    }
+    return total;
+}
+
+std::size_t ov::npuw::LayerMajorInferRequest::global_cache_memory_bytes() const {
+    std::size_t total = 0u;
+    for (const auto& kv : m_global_caches) {
+        total += kv.second.byte_size();
+    }
+    return total;
+}
+
 ov::SoPtr<ov::ITensor> ov::npuw::LayerMajorInferRequest::alloc_strided_mem(const ov::element::Type& type,
                                                                            const ov::Shape& shape) const {
     return allocMem(type, shape, "NPU");

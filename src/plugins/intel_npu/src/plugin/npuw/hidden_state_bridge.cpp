@@ -38,3 +38,7 @@ ov::npuw::util::TensorPtr ov::npuw::HiddenStateBridge::slot(std::size_t chunk_id
 const ov::npuw::util::TensorPtr& ov::npuw::HiddenStateBridge::whole() const {
     return m_buffer;
 }
+
+std::size_t ov::npuw::HiddenStateBridge::byte_size() const {
+    return m_buffer ? m_buffer->get_byte_size() : 0u;
+}

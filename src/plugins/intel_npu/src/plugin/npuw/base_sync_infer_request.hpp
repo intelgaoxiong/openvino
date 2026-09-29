@@ -124,6 +124,21 @@ public:
     std::string sublayer_device(std::size_t real_idx) const;
     std::map<std::size_t, std::size_t> sublayer_call_counts() const;
 
+    // Narrower breakdown of get_sublayer_timings(): the subset of that wall-clock time spent
+    // synchronously in unpack_closure() (function_prologue()'s own call, gated on
+    // !is_pipelined(idx) - see JustInferRequest::function_prologue()). Lets a caller tell apart
+    // "closure re-upload cost exposed because pipelining was off for this dispatch" from actual
+    // NPU dispatch+wait time, both folded into the same get_sublayer_timings() total otherwise.
+    const std::map<std::size_t, float>& get_sublayer_closure_timings() const;
+
+    // Second breakdown of get_sublayer_timings(): the subset spent in
+    // unsafe_run_this_prep_next() (the actual start_async()/wait() dispatch, plus - when
+    // pipelining is active for idx - the async prefetch bind/unpack of the NEXT occurrence run
+    // concurrently with this wait). What's left over in get_sublayer_timings() after subtracting
+    // both this and get_sublayer_closure_timings() is function_prologue()'s own parameter-binding
+    // loop (step 1) plus bind_global_results()/behavior prologue-epilogue/dump overhead.
+    const std::map<std::size_t, float>& get_sublayer_dispatch_timings() const;
+
 protected:
     int64_t m_history_size = 0;
 
@@ -266,6 +281,8 @@ protected:
     // so this incurs zero overhead outside of prefill timing sessions.
     bool m_sublayer_timing_enabled = false;
     std::map<std::size_t, float> m_sublayer_timings_ms;  // real_idx -> accumulated ms
+    std::map<std::size_t, float> m_sublayer_closure_ms;  // real_idx -> accumulated ms in unpack_closure()
+    std::map<std::size_t, float> m_sublayer_dispatch_ms;  // real_idx -> accumulated ms in unsafe_run_this_prep_next()
 
     bool needs_copy(std::size_t idx) const;
     bool needs_copy(std::size_t idx, std::size_t cidx) const;

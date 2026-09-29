@@ -229,6 +229,8 @@ std::string ov::npuw::IBaseInferRequest::profile_tag(std::size_t idx) const {
 void ov::npuw::IBaseInferRequest::enable_sublayer_timing() {
     m_sublayer_timing_enabled = true;
     m_sublayer_timings_ms.clear();
+    m_sublayer_closure_ms.clear();
+    m_sublayer_dispatch_ms.clear();
 }
 
 void ov::npuw::IBaseInferRequest::disable_sublayer_timing() {
@@ -237,6 +239,14 @@ void ov::npuw::IBaseInferRequest::disable_sublayer_timing() {
 
 const std::map<std::size_t, float>& ov::npuw::IBaseInferRequest::get_sublayer_timings() const {
     return m_sublayer_timings_ms;
+}
+
+const std::map<std::size_t, float>& ov::npuw::IBaseInferRequest::get_sublayer_closure_timings() const {
+    return m_sublayer_closure_ms;
+}
+
+const std::map<std::size_t, float>& ov::npuw::IBaseInferRequest::get_sublayer_dispatch_timings() const {
+    return m_sublayer_dispatch_ms;
 }
 
 std::string ov::npuw::IBaseInferRequest::sublayer_device(std::size_t real_idx) const {
@@ -256,6 +266,8 @@ void ov::npuw::IBaseInferRequest::infer() {
     prepare_for_infer();
     if (m_sublayer_timing_enabled) {
         m_sublayer_timings_ms.clear();
+        m_sublayer_closure_ms.clear();
+        m_sublayer_dispatch_ms.clear();
     }
     infer_range(0u, m_num_submodels);
 
