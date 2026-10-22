@@ -5,6 +5,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <variant>
 
 #include "openvino/op/constant.hpp"
@@ -75,6 +76,28 @@ public:
         ov::element::Type type;
     };
     Meta eval_meta() const;
+
+    // Identifies the physical buffer behind a plain Constant-backed tensor, regardless of its shape.
+    // Tensors with equal keys hold identical bytes and can differ only by a (contiguous) reshape.
+    struct AliasKey {
+        const void* ptr = nullptr;
+        ov::element::Type type;
+        std::size_t byte_size = 0;
+
+        bool operator==(const AliasKey& other) const {
+            return ptr == other.ptr && type == other.type && byte_size == other.byte_size;
+        }
+        struct Hash {
+            std::size_t operator()(const AliasKey& key) const {
+                std::size_t seed = std::hash<const void*>()(key.ptr) + 0x9e3779b9;
+                seed ^= key.type.hash() + 0x9e3779b9;
+                seed ^= std::hash<std::size_t>()(key.byte_size) + 0x9e3779b9;
+                return seed;
+            }
+        };
+    };
+    // Returns nullopt for tensors with transformations, detached tensors and imported (weightless) ones
+    std::optional<AliasKey> get_alias_key() const;
 
     void read_weight(const ov::npuw::s11n::WeightsContext& ctx);
     operator bool() const;

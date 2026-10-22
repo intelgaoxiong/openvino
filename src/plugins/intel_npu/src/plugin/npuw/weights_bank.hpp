@@ -61,6 +61,8 @@ private:
     struct DeviceBank {
         std::unordered_map<int64_t, StoredTensor> storage;
         std::unordered_map<LazyTensor, int64_t, LazyTensor::Hash> registered_tensors;
+        // Physical buffer -> uid of the tensor which owns the allocation
+        std::unordered_map<LazyTensor::AliasKey, int64_t, LazyTensor::AliasKey::Hash> aliases;
     };
     std::unordered_map<std::string, DeviceBank> m_device_banks;
 

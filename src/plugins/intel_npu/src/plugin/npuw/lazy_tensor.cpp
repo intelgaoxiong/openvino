@@ -476,6 +476,7 @@ struct LazyTensorImpl {
     ov::Tensor eval() const;
     LazyTensor::Meta eval_meta() const;
     std::size_t get_hash() const;
+    std::optional<LazyTensor::AliasKey> get_alias_key() const;
     void get_transformations(std::vector<LazyTensor::Transform>& vec) const;
 
     void detach();
@@ -726,6 +727,14 @@ std::size_t LazyTensorImpl::get_hash() const {
     return m_hash;
 }
 
+std::optional<LazyTensor::AliasKey> LazyTensorImpl::get_alias_key() const {
+    const auto* c = std::get_if<op::Const>(&m_transform);
+    if (c == nullptr || c->m_node == nullptr || c->m_cached_ptr == nullptr) {
+        return std::nullopt;
+    }
+    return LazyTensor::AliasKey{c->m_cached_ptr, c->m_cached_type, c->m_byte_size};
+}
+
 void LazyTensorImpl::get_transformations(std::vector<LazyTensor::Transform>& vec) const {
     vec.push_back(m_transform);
     std::visit(overloaded{
@@ -849,6 +858,13 @@ std::size_t LazyTensor::get_hash() const {
         return 0;
     }
     return m_impl->get_hash();
+}
+
+std::optional<LazyTensor::AliasKey> LazyTensor::get_alias_key() const {
+    if (!m_impl) {
+        return std::nullopt;
+    }
+    return m_impl->get_alias_key();
 }
 
 std::vector<LazyTensor::Transform> LazyTensor::get_transformations() const {

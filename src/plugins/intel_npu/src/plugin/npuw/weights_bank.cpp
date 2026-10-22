@@ -86,7 +86,19 @@ struct TensorToAllocate {
     LazyTensor::Meta meta;
     ov::Tensor allocated_tensor;
     int64_t uid;
+    std::optional<LazyTensor::AliasKey> alias;
+    int64_t alias_of = -1;  // uid owning the buffer this tensor is a view of
 };
+
+namespace {
+// Reshaped view of an already allocated buffer, keeps the owner alive
+ov::Tensor make_alias_view(const ov::Tensor& owner, const LazyTensor::Meta& meta) {
+    auto holder = std::make_shared<ov::Tensor>(owner);
+    auto view = ov::make_tensor(meta.type, meta.shape, owner.data());
+    NPUW_ASSERT(view->get_byte_size() == owner.get_byte_size());
+    return ov::make_tensor(ov::SoPtr<ov::ITensor>(view, holder));
+}
+}  // namespace
 
 void Bank::evaluate_and_allocate() {
     std::unique_lock guard(m_mutex);
@@ -141,29 +153,44 @@ void Bank::evaluate_and_allocate_on_device(Bank::DeviceBank& device_bank,
                                            const std::string& device) {
     // Note: not locking here. This is a private function, so Bank should handle the locks around it
     // as we lock in evaluate_and_allocate() now.
-    std::vector<TensorToAllocate> uids_to_allocated;
-    uids_to_allocated.reserve(uid_count);
+    std::vector<TensorToAllocate> candidates;
+    candidates.reserve(to_process.size());
 
     for (const auto& lt : to_process) {
         auto iter_device_registered = device_bank.registered_tensors.find(lt);
         NPUW_ASSERT(iter_device_registered != device_bank.registered_tensors.end() &&
                     "Tensor should be registered first!");
         auto uid = iter_device_registered->second;
-        uids_to_allocated.push_back({lt.eval_meta(), ov::Tensor(), uid});
+        candidates.push_back({lt.eval_meta(), ov::Tensor(), uid, lt.get_alias_key()});
     }
     // Sort by UIDs, lowest first
-    std::sort(uids_to_allocated.begin(),
-              uids_to_allocated.end(),
-              [](const TensorToAllocate& a, const TensorToAllocate& b) {
-                  return a.uid < b.uid;
-              });
+    std::sort(candidates.begin(), candidates.end(), [](const TensorToAllocate& a, const TensorToAllocate& b) {
+        return a.uid < b.uid;
+    });
+
+    // Tensors which only differ by shape from a known one (same physical buffer) are views, not new allocations
+    std::vector<TensorToAllocate> uids_to_allocated;
+    std::vector<TensorToAllocate> views;
+    uids_to_allocated.reserve(candidates.size());
+    for (auto&& cand : candidates) {
+        if (cand.alias) {
+            auto iter_alias = device_bank.aliases.find(*cand.alias);
+            if (iter_alias != device_bank.aliases.end()) {
+                cand.alias_of = iter_alias->second;
+                views.push_back(std::move(cand));
+                continue;
+            }
+            device_bank.aliases.emplace(*cand.alias, cand.uid);
+        }
+        uids_to_allocated.push_back(std::move(cand));
+    }
 
     // Allocate memory sequentially - in order of UID
     auto remote_ctx = m_core->get_default_context(device)._ptr;
     for (auto&& allocated : uids_to_allocated) {
         ov::SoPtr<ov::ITensor> remote_tensor =
             remote_ctx->create_host_tensor(allocated.meta.type, allocated.meta.shape);
-        allocated = {allocated.meta, ov::make_tensor(remote_tensor), allocated.uid};
+        allocated.allocated_tensor = ov::make_tensor(remote_tensor);
     }
 
     // Evaluate and copy into the device memory
@@ -180,6 +207,20 @@ void Bank::evaluate_and_allocate_on_device(Bank::DeviceBank& device_bank,
         // Note: this is the non-CPU path!
         const_cast<LazyTensor&>(stored_tensor.lt).detach();
     });
+
+    std::size_t aliased_bytes = 0u;
+    for (auto&& view : views) {
+        const auto& owner = device_bank.storage.at(view.alias_of).tensor;
+        NPUW_ASSERT(owner && "Owner of an aliased tensor should be allocated first!");
+        auto& stored_tensor = device_bank.storage.at(view.uid);
+        stored_tensor.tensor = make_alias_view(owner, view.meta);
+        aliased_bytes += owner.get_byte_size();
+        const_cast<LazyTensor&>(stored_tensor.lt).detach();
+    }
+    if (!views.empty()) {
+        LOG_INFO("WeightsBank: shared " << views.size() << " tensors with existing allocations on " << device
+                                        << ", saved " << aliased_bytes / 1024.0 / 1024.0 << " MiB");
+    }
 }
 
 bool Bank::is_remote(int64_t uid) const {
