@@ -4,6 +4,7 @@
 #include "llm_compiled_model.hpp"
 
 #include <algorithm>
+#include <iostream>
 
 #include "embedding/embedding_infer_request.hpp"
 #include "embedding/encoder_embedding_infer_request.hpp"
@@ -265,6 +266,11 @@ ov::AnyMap get_default_common_config(const std::optional<NPUDesc>& npudesc) {
 
         if (set_npu_tiles) {
             config["NPU_TILES"] = npudesc->max_tiles;
+            std::cout << "[DEBUG] default NPU_TILES = " << npudesc->max_tiles << " (arch=" << npudesc->arch << ")"
+                      << std::endl;
+        } else {
+            std::cout << "[DEBUG] default NPU_TILES not set (arch=" << npudesc->arch
+                      << ", max_tiles=" << npudesc->max_tiles << ")" << std::endl;
         }
 
         if (!arch_added_compilation_param.empty()) {
@@ -1203,6 +1209,12 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     apply_weights_bank_name(prefill_config, weights_bank_name);
     apply_weights_bank_name(generate_config, weights_bank_name);
 
+    for (const auto& [stage, stage_config] :
+         {std::make_pair("prefill", &prefill_config), std::make_pair("generate", &generate_config)}) {
+        const auto it = stage_config->find("NPU_TILES");
+        std::cout << "[DEBUG] final " << stage << " NPU_TILES = "
+                  << (it != stage_config->end() ? it->second.as<std::string>() : std::string("<not set>")) << std::endl;
+    }
     // Handle attention hints. FIXME: Maybe it makes sense to make those
     // mutually exclusive with the precise configuration sections as well
     const ov::AnyMap dyn_attn_opts = {
