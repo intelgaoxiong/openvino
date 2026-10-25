@@ -291,6 +291,13 @@ public:
     ConvToMatmul(Context::Ref ctx);
 };
 
+// MOECompressed: relayout closure scales from [E, N, G] to [E, G, N] on host
+class MoECompressedScaleGroupMajor : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("npuw::patterns::opt::MoECompressedScaleGroupMajor");
+    explicit MoECompressedScaleGroupMajor(Context::Ref ctx);
+};
+
 // UntangleConst
 void untangleConst(std::shared_ptr<ov::Model> model);
 

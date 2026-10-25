@@ -2465,6 +2465,15 @@ void Partitioner::optimize(const std::string& func_name) {
         }
     }
 
+    // Independent of NPUW_DQ: MoE scales are relaid out on host for the compiler's group-major kernel
+    if (cfg.get<::intel_npu::NPUW_MOE_SCALE_GM>()) {
+        ov::npuw::patterns::opt::Context ctx(f._model, f._param_offset);
+        ov::pass::GraphRewrite rewr;
+        rewr.add_matcher<ov::npuw::patterns::opt::MoECompressedScaleGroupMajor>(std::ref(ctx));
+        rewr.run_on_model(f._model);
+        do_permute(ctx);
+    }
+
     if (!cfg.get<::intel_npu::NPUW_DQ>()) {
         LOG_VERB("No optimizations will be done to  " << func_name << " in model " << model->get_friendly_name()
                                                       << "...");

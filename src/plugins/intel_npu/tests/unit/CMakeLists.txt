@@ -234,4 +234,5 @@ target_sources(${TARGET_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/make_tensor_slice_bounds_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/moe_topology_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/weights_bank_alias_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/npuw/moe_compressed_scale_group_major_test.cpp
 )
