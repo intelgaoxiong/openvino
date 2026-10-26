@@ -63,6 +63,13 @@ void Context::to_f16(const PPtr& orig_param) {
     orig_param->validate_and_infer_types();
 }
 
+void Context::to_f32(const PPtr& orig_param) {
+    closures_to_f32.insert(orig_param);
+
+    orig_param->set_element_type(ov::element::f32);
+    orig_param->validate_and_infer_types();
+}
+
 Context::PPtr Context::subtract_128(const PPtr& orig_param) {
     auto shifted_param = std::make_shared<ov::op::v0::Parameter>(ov::element::i8, orig_param->get_partial_shape());
     shifted_param->set_friendly_name(orig_param->get_friendly_name() + "_sub128");
@@ -2471,8 +2478,10 @@ ConvToMatmul::ConvToMatmul(Context::Ref ctx) {
 // TO:
 //     Param(S*) [E,G,N] -> Transpose{0,2,1} -------------> MOECompressed.input(4|7|10)
 //
+// With to_f32, f16 scales are also converted to f32 on host: Param(S*) [E,G,N] f32.
+//
 // Rank-4 scales [E,N,G,1] are skipped: LazyTensor permute is 3D only.
-MoECompressedScaleGroupMajor::MoECompressedScaleGroupMajor(Context::Ref ctx) {
+MoECompressedScaleGroupMajor::MoECompressedScaleGroupMajor(Context::Ref ctx, bool to_f32) {
     auto moe = opp::wrap_type<ov::op::internal::MOECompressed>();
 
     auto callback = [=](ov::pass::pattern::Matcher& m) {
@@ -2508,6 +2517,9 @@ MoECompressedScaleGroupMajor::MoECompressedScaleGroupMajor(Context::Ref ctx) {
         for (std::size_t i = 0; i < scales.size(); ++i) {
             const auto& param = scales[i];
             ctx.get().permute(param, {0, 2, 1});
+            if (to_f32 && param->get_element_type() == ov::element::f16) {
+                ctx.get().to_f32(param);
+            }
 
             auto order = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{3}, {0, 2, 1});
             auto transpose = std::make_shared<ov::op::v1::Transpose>(param, order);

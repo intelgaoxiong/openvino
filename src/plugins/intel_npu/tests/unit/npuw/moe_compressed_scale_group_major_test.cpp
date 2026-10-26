@@ -132,9 +132,9 @@ Graph make_graph(const Options& opts = {}) {
     return {model, moe, ov::ParameterVector(scales.begin(), scales.end()), base};
 }
 
-void run_pass(Graph& graph, Context& ctx) {
+void run_pass(Graph& graph, Context& ctx, bool to_f32 = false) {
     ov::pass::GraphRewrite rewr;
-    rewr.add_matcher<MoECompressedScaleGroupMajor>(std::ref(ctx));
+    rewr.add_matcher<MoECompressedScaleGroupMajor>(std::ref(ctx), to_f32);
     rewr.run_on_model(graph.model);
 }
 
@@ -200,6 +200,87 @@ TEST(MoECompressedScaleGroupMajorTest, RelayoutsF32Scales) {
     for (const auto& scale : graph.scales) {
         EXPECT_EQ(scale->get_element_type(), ov::element::f32);
         EXPECT_EQ(scale->get_shape(), (ov::Shape{kExperts, 4, kOutRows}));
+    }
+}
+
+TEST(MoECompressedScaleGroupMajorTest, ConvertsF16ScalesToF32WhenRequested) {
+    auto graph = make_graph();
+
+    Context ctx(graph.model, graph.param_base_idx);
+    run_pass(graph, ctx, /*to_f32=*/true);
+    ASSERT_NO_THROW(graph.model->validate_nodes_and_infer_types());
+
+    EXPECT_EQ(ctx.closures_to_permute.size(), 3u);
+    EXPECT_EQ(ctx.closures_to_f32.size(), 3u);
+    for (size_t i = 0; i < 3; ++i) {
+        const auto& scale = graph.scales[i];
+        EXPECT_EQ(ctx.closures_to_f32.count(scale), 1u);
+        EXPECT_EQ(scale->get_element_type(), ov::element::f32);
+        EXPECT_EQ(scale->get_shape(), (ov::Shape{kExperts, 4, kOutRows}));
+        // Parameter -> Transpose -> MOECompressed, nothing in between
+        auto transpose = ov::as_type_ptr<ov::op::v1::Transpose>(graph.moe->get_input_node_shared_ptr(kScaleInputs[i]));
+        ASSERT_NE(transpose, nullptr);
+        EXPECT_EQ(transpose->get_input_node_shared_ptr(0), scale);
+        EXPECT_EQ(graph.moe->get_input_element_type(kScaleInputs[i]), ov::element::f32);
+    }
+}
+
+TEST(MoECompressedScaleGroupMajorTest, F32ScalesNeedNoConversion) {
+    Options opts;
+    opts.scale_type = ov::element::f32;
+    auto graph = make_graph(opts);
+
+    Context ctx(graph.model, graph.param_base_idx);
+    run_pass(graph, ctx, /*to_f32=*/true);
+
+    EXPECT_EQ(ctx.closures_to_permute.size(), 3u);
+    EXPECT_TRUE(ctx.closures_to_f32.empty());
+}
+
+TEST(MoECompressedScaleGroupMajorTest, NoConversionByDefault) {
+    auto graph = make_graph();
+
+    Context ctx(graph.model, graph.param_base_idx);
+    run_pass(graph, ctx);
+
+    EXPECT_TRUE(ctx.closures_to_f32.empty());
+    for (const auto& scale : graph.scales) {
+        EXPECT_EQ(scale->get_element_type(), ov::element::f16);
+    }
+}
+
+// The partitioner builds permute(...).convert(f32) for these closures
+TEST(MoECompressedScaleGroupMajorTest, F32ClosureDataIsPermutedAndConverted) {
+    constexpr size_t G = 4;
+    std::vector<ov::float16> raw(kExperts * kOutRows * G);
+    for (size_t i = 0; i < raw.size(); ++i) {
+        raw[i] = ov::float16(static_cast<float>(i % 1024) * 0.125f);
+    }
+    auto source = std::make_shared<ov::op::v0::Constant>(ov::element::f16, ov::Shape{kExperts, kOutRows, G}, raw.data());
+
+    auto graph = make_graph();
+    Context ctx(graph.model, graph.param_base_idx);
+    run_pass(graph, ctx, /*to_f32=*/true);
+    ASSERT_EQ(ctx.closures_to_f32.count(graph.scales[0]), 1u);
+
+    auto lazy = ov::npuw::weights::LazyTensor(source)
+                    .permute(ctx.closures_to_permute.at(graph.scales[0]))
+                    .convert(ov::element::f32);
+    const auto meta = lazy.eval_meta();
+    EXPECT_EQ(meta.shape, graph.scales[0]->get_shape());
+    EXPECT_EQ(meta.type, graph.scales[0]->get_element_type());
+
+    const auto evaluated = lazy.eval();
+    ASSERT_EQ(evaluated.get_element_type(), ov::element::f32);
+    ASSERT_EQ(evaluated.get_shape(), (ov::Shape{kExperts, G, kOutRows}));
+    const auto* data = static_cast<const float*>(evaluated.data());
+    for (size_t e = 0; e < kExperts; ++e) {
+        for (size_t g = 0; g < G; ++g) {
+            for (size_t n = 0; n < kOutRows; ++n) {
+                ASSERT_EQ(data[(e * G + g) * kOutRows + n], static_cast<float>(raw[(e * kOutRows + n) * G + g]))
+                    << "e=" << e << " g=" << g << " n=" << n;
+            }
+        }
     }
 }
 
